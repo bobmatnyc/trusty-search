@@ -24,30 +24,48 @@ use tree_sitter::{Language, Node, Parser};
 use crate::entity::{extract_entities, RawEntity};
 
 /// Coarse classification of an AST chunk.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Default` is `Unknown` so chunks deserialized from older index versions
+/// (which lacked `chunk_type`) round-trip cleanly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChunkType {
+    #[default]
+    Unknown,
     Function,
     Method,
     Class,
+    Struct,
     Impl,
     Module,
     Trait,
     Enum,
+    Test,
+    Constant,
+    TypeAlias,
     Docstring,
+    /// Free-form code that doesn't fit a more specific category.
+    FreeCode,
+    /// Legacy alias for `FreeCode` — retained for backwards-compatible deserialization.
     Code,
 }
 
 impl ChunkType {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::Unknown => "Unknown",
             Self::Function => "Function",
             Self::Method => "Method",
             Self::Class => "Class",
+            Self::Struct => "Struct",
             Self::Impl => "Impl",
             Self::Module => "Module",
             Self::Trait => "Trait",
             Self::Enum => "Enum",
+            Self::Test => "Test",
+            Self::Constant => "Constant",
+            Self::TypeAlias => "TypeAlias",
             Self::Docstring => "Docstring",
+            Self::FreeCode => "FreeCode",
             Self::Code => "Code",
         }
     }
