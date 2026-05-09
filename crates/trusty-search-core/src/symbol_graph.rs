@@ -17,8 +17,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use serde::{Deserialize, Serialize};
+
+use crate::entity::EdgeKind;
 
 /// A node in the symbol graph. One node per defining symbol (function or method).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,7 +42,7 @@ pub struct SymbolNode {
 /// `calls` fields per chunk, so the graph just stitches them together.
 #[derive(Debug, Default)]
 pub struct SymbolGraph {
-    graph: DiGraph<SymbolNode, ()>,
+    graph: DiGraph<SymbolNode, EdgeKind>,
     /// Symbol name → node index. Holds the *first* definition seen if a symbol
     /// is defined twice (rare; e.g. `cfg`-gated duplicates).
     by_symbol: HashMap<String, NodeIndex>,
@@ -96,7 +99,7 @@ impl SymbolGraph {
             for callee in calls {
                 if let Some(to) = g.resolve_callee(callee) {
                     if from != to {
-                        g.graph.add_edge(from, to, ());
+                        g.graph.add_edge(from, to, EdgeKind::CallsFunction);
                     }
                 }
             }
@@ -167,7 +170,16 @@ impl SymbolGraph {
             if depth >= hops {
                 continue;
             }
-            for nb in self.graph.neighbors_directed(node, dir) {
+            // Only walk call-graph edges; other `EdgeKind`s belong to entity
+            // expansion paths (Phase A/B/C) and shouldn't pollute callers/callees.
+            for edge in self.graph.edges_directed(node, dir) {
+                if edge.weight() != &EdgeKind::CallsFunction {
+                    continue;
+                }
+                let nb = match dir {
+                    Direction::Outgoing => edge.target(),
+                    Direction::Incoming => edge.source(),
+                };
                 if visited.insert(nb) {
                     let n = &self.graph[nb];
                     out.push((n.symbol.clone(), n.chunk_id.clone()));
