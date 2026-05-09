@@ -217,6 +217,24 @@ impl McpServer {
                 )
                 .await
             }
+            "search_similar" => {
+                // Code-to-code similarity (issue #31). Index defaults to "default"
+                // so simple call sites don't need to specify it.
+                let index_id = args
+                    .get("index")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
+                let file = require_str(args, "file")?;
+                let mut body = serde_json::json!({ "file": file });
+                if let Some(func) = args.get("function").and_then(Value::as_str) {
+                    body["function"] = Value::String(func.to_string());
+                }
+                if let Some(k) = args.get("top_k").and_then(Value::as_u64) {
+                    body["top_k"] = Value::from(k);
+                }
+                self.post(&format!("/indexes/{index_id}/search_similar"), &body)
+                    .await
+            }
             "search_health" => self.get("/health").await,
             _ => Err(DispatchError::UnknownTool),
         }
@@ -348,6 +366,20 @@ pub fn tool_descriptors() -> Value {
             }
         },
         {
+            "name": "search_similar",
+            "description": "Find chunks semantically similar to a given file/function via HNSW (issue #31)",
+            "inputSchema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                    "file":     { "type": "string" },
+                    "function": { "type": "string" },
+                    "top_k":    { "type": "number" },
+                    "index":    { "type": "string" }
+                }
+            }
+        },
+        {
             "name": "search_health",
             "description": "Probe daemon liveness and version",
             "inputSchema": { "type": "object", "properties": {} }
@@ -400,12 +432,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_all_six() {
+    async fn tools_list_returns_all_seven() {
         let server = McpServer::new("http://127.0.0.1:1");
         let resp = server.dispatch(req("tools/list", Value::Null)).await;
         let result = resp.result.expect("expected result");
         let tools = result.get("tools").and_then(Value::as_array).expect("array");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
     }
 
     #[tokio::test]
