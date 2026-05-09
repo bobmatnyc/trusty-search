@@ -152,6 +152,60 @@ impl SymbolGraph {
         self.bfs_neighbors(symbol, hops, Direction::Outgoing)
     }
 
+    /// BFS up to `hops` levels, walking only edges whose `EdgeKind` is in
+    /// `edge_kinds`. Returns `(symbol, chunk_id, edge_kind)` triples for each
+    /// neighbour discovered (excluding `symbol` itself).
+    ///
+    /// Used by intent-gated KG expansion (issue #18) so each query intent
+    /// traverses the subset of edge types most likely to surface relevant
+    /// adjacent code (`Implements`/`UsesType` for definitions, `CallsFunction`
+    /// for usage, `RaisesError` for bug-debt, …).
+    pub fn neighbors_by_edge(
+        &self,
+        symbol: &str,
+        edge_kinds: &[EdgeKind],
+        hops: usize,
+    ) -> Vec<(String, String, EdgeKind)> {
+        let Some(&start) = self.by_symbol.get(symbol) else {
+            return Vec::new();
+        };
+        if hops == 0 || edge_kinds.is_empty() {
+            return Vec::new();
+        }
+        let allowed: HashSet<&EdgeKind> = edge_kinds.iter().collect();
+
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        visited.insert(start);
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        queue.push_back((start, 0));
+        let mut out: Vec<(String, String, EdgeKind)> = Vec::new();
+
+        while let Some((node, depth)) = queue.pop_front() {
+            if depth >= hops {
+                continue;
+            }
+            // Walk both directions: caller→callee and callee→caller relations
+            // are both useful for KG expansion.
+            for dir in [Direction::Outgoing, Direction::Incoming] {
+                for edge in self.graph.edges_directed(node, dir) {
+                    if !allowed.contains(edge.weight()) {
+                        continue;
+                    }
+                    let nb = match dir {
+                        Direction::Outgoing => edge.target(),
+                        Direction::Incoming => edge.source(),
+                    };
+                    if visited.insert(nb) {
+                        let n = &self.graph[nb];
+                        out.push((n.symbol.clone(), n.chunk_id.clone(), edge.weight().clone()));
+                        queue.push_back((nb, depth + 1));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn bfs_neighbors(&self, symbol: &str, hops: usize, dir: Direction) -> Vec<(String, String)> {
         let Some(&start) = self.by_symbol.get(symbol) else {
             return Vec::new();
@@ -339,6 +393,55 @@ mod tests {
         let g = SymbolGraph::build_from_chunks(&chunks);
         assert_eq!(g.symbol_for_chunk("a:1"), Some("alpha"));
         assert_eq!(g.symbol_for_chunk("missing"), None);
+    }
+
+    #[test]
+    fn test_neighbors_by_edge_filters_by_kind() {
+        // Build a graph with two edge kinds. neighbors_by_edge must only
+        // return neighbours reachable via the requested kinds.
+        let mut g = SymbolGraph::new();
+        let a = g.graph.add_node(SymbolNode {
+            symbol: "a".into(),
+            chunk_id: "a:1".into(),
+            file: "a.rs".into(),
+        });
+        let b = g.graph.add_node(SymbolNode {
+            symbol: "b".into(),
+            chunk_id: "b:1".into(),
+            file: "b.rs".into(),
+        });
+        let c = g.graph.add_node(SymbolNode {
+            symbol: "c".into(),
+            chunk_id: "c:1".into(),
+            file: "c.rs".into(),
+        });
+        g.by_symbol.insert("a".into(), a);
+        g.by_symbol.insert("b".into(), b);
+        g.by_symbol.insert("c".into(), c);
+        g.graph.add_edge(a, b, EdgeKind::CallsFunction);
+        g.graph.add_edge(a, c, EdgeKind::Implements);
+
+        let calls = g.neighbors_by_edge("a", &[EdgeKind::CallsFunction], 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "b");
+
+        let impls = g.neighbors_by_edge("a", &[EdgeKind::Implements], 1);
+        assert_eq!(impls.len(), 1);
+        assert_eq!(impls[0].0, "c");
+
+        let both = g.neighbors_by_edge(
+            "a",
+            &[EdgeKind::CallsFunction, EdgeKind::Implements],
+            1,
+        );
+        assert_eq!(both.len(), 2);
+
+        // Empty edge set returns nothing.
+        assert!(g.neighbors_by_edge("a", &[], 1).is_empty());
+        // Zero hops returns nothing.
+        assert!(g
+            .neighbors_by_edge("a", &[EdgeKind::CallsFunction], 0)
+            .is_empty());
     }
 
     #[test]
