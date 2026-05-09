@@ -82,6 +82,11 @@ pub struct CodeChunk {
     /// Nesting depth of this chunk in the file's AST (0 = top-level).
     #[serde(default)]
     pub chunk_depth: u8,
+
+    // Issue #30 — git blame metadata for temporal decay scoring. Optional so
+    // non-git workflows and older serialized payloads round-trip cleanly.
+    #[serde(default)]
+    pub blame: Option<crate::blame::ChunkBlame>,
 }
 
 /// Halstead-proxy complexity score: unique alphanumeric identifiers (operands)
@@ -725,6 +730,7 @@ impl CodeIndexer {
                 inherits_from: raw.inherits_from.clone(),
                 complexity_score: compute_complexity(&raw.content),
                 chunk_depth,
+                blame: None,
             });
         }
         Ok(out)
