@@ -27,9 +27,9 @@ use tokio::sync::RwLock;
 
 use crate::bm25::Bm25Index;
 use crate::chunker::{chunk_ast, ChunkType, RawChunk};
-use crate::classifier::QueryClassifier;
+use crate::classifier::{QueryClassifier, QueryIntent};
 use crate::embed::Embedder;
-use crate::entity::RawEntity;
+use crate::entity::{EdgeKind, RawEntity};
 use crate::search::rrf::{rrf_fuse, RRF_K};
 use crate::store::VectorStore;
 use crate::symbol_graph::SymbolGraph;
@@ -38,8 +38,12 @@ use crate::symbol_graph::SymbolGraph;
 const QUERY_CACHE_CAPACITY: usize = 256;
 /// Oversample factor for the HNSW lane before RRF fusion.
 const HNSW_OVERSAMPLE: usize = 4;
-/// Score multiplier applied to chunks brought in via KG expansion. The trigger
-/// chunk's RRF score is multiplied by this factor (per the spec in CLAUDE.md).
+/// Legacy default score multiplier applied to chunks brought in via KG
+/// expansion. Retained for backwards-compat documentation: the live pipeline
+/// now uses [`EdgeKind::score_multiplier`] (issue #18) so each edge type
+/// contributes its own weight. Tests still reference this constant when
+/// validating the `CallsFunction` baseline.
+#[allow(dead_code)]
 const KG_EXPAND_SCORE_FACTOR: f32 = 0.7;
 /// Default BFS depth for KG expansion (1 hop = direct callers/callees only).
 const KG_EXPAND_HOPS: usize = 1;
@@ -394,18 +398,58 @@ impl CodeIndexer {
         Ok(hits.into_iter().map(|h| (h.chunk_id, h.score)).collect())
     }
 
-    /// KG expansion: for each seed `(chunk_id, score)`, look up the defining
-    /// symbol, fetch its 1-hop callers + callees from the `SymbolGraph`, and
-    /// return adjacent `(chunk_id, score * KG_EXPAND_SCORE_FACTOR)` pairs.
+    /// Edge-kinds traversed for each query intent (issue #18).
     ///
-    /// Deduplicates: a chunk that is already a seed is never re-emitted, and a
-    /// chunk reachable from multiple seeds keeps the highest derived score.
-    async fn kg_expand(&self, seeds: &[(String, f32)]) -> Vec<(String, f32)> {
+    /// Each intent picks a small set of `EdgeKind`s most likely to surface
+    /// adjacent code that's actually relevant to the question being asked.
+    /// Score for each neighbour = `seed_score * edge_kind.score_multiplier()`.
+    fn edge_kinds_for_intent(intent: QueryIntent) -> Vec<EdgeKind> {
+        match intent {
+            QueryIntent::Definition => vec![
+                EdgeKind::Implements,
+                EdgeKind::Aliases,
+                EdgeKind::UsesType,
+            ],
+            QueryIntent::Usage => vec![
+                EdgeKind::CallsFunction,
+                EdgeKind::CalledByFunction,
+                EdgeKind::TestedBy,
+                EdgeKind::CoOccursInTest,
+            ],
+            QueryIntent::Conceptual => {
+                vec![EdgeKind::ReferencesConcept, EdgeKind::Documents]
+            }
+            QueryIntent::BugDebt => vec![
+                EdgeKind::RaisesError,
+                EdgeKind::ErrorDescribes,
+                EdgeKind::Configures,
+            ],
+            QueryIntent::Unknown => vec![
+                EdgeKind::CallsFunction,
+                EdgeKind::CalledByFunction,
+            ],
+        }
+    }
+
+    /// Intent-gated KG expansion (issue #18). For each seed
+    /// `(chunk_id, score)`:
+    /// 1. Look up the defining symbol of the seed chunk.
+    /// 2. BFS its `EdgeKind`-filtered neighbourhood (intent-specific edges).
+    /// 3. Score each neighbour as `seed_score * edge_kind.score_multiplier()`.
+    ///
+    /// Deduplicates: a chunk already in the seed set is never re-emitted; a
+    /// chunk reachable through multiple seed/edge paths keeps its best score.
+    async fn kg_expand(
+        &self,
+        seeds: &[(String, f32)],
+        intent: QueryIntent,
+    ) -> Vec<(String, f32)> {
         let graph = self.symbol_graph().await;
         if graph.node_count() == 0 || seeds.is_empty() {
             return Vec::new();
         }
 
+        let edge_kinds = Self::edge_kinds_for_intent(intent);
         let seed_ids: std::collections::HashSet<&String> =
             seeds.iter().map(|(id, _)| id).collect();
         let mut best: HashMap<String, f32> = HashMap::new();
@@ -414,15 +458,13 @@ impl CodeIndexer {
             let Some(symbol) = graph.symbol_for_chunk(seed_id) else {
                 continue;
             };
-            let derived = seed_score * KG_EXPAND_SCORE_FACTOR;
-            for (_, neighbour_id) in graph
-                .callers_of(symbol, KG_EXPAND_HOPS)
-                .into_iter()
-                .chain(graph.callees_of(symbol, KG_EXPAND_HOPS))
+            for (_, neighbour_id, edge_kind) in
+                graph.neighbors_by_edge(symbol, &edge_kinds, KG_EXPAND_HOPS)
             {
                 if seed_ids.contains(&neighbour_id) {
                     continue;
                 }
+                let derived = seed_score * edge_kind.score_multiplier();
                 best.entry(neighbour_id)
                     .and_modify(|s| {
                         if derived > *s {
@@ -493,7 +535,7 @@ impl CodeIndexer {
         //    `expand_graph` wasn't disabled by the caller.
         let mut all = fused.clone();
         let kg_ids: std::collections::HashSet<String> = if use_kg_first && query.expand_graph {
-            let expanded = self.kg_expand(&fused).await;
+            let expanded = self.kg_expand(&fused, intent.clone()).await;
             let ids: std::collections::HashSet<String> =
                 expanded.iter().map(|(id, _)| id.clone()).collect();
             all.extend(expanded);
