@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3656,7 +3656,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3690,7 +3690,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search-mcp"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -3703,7 +3703,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search-service"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
