@@ -3734,6 +3734,7 @@ dependencies = [
  "dotenvy",
  "fs4",
  "indicatif 0.17.11",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",
