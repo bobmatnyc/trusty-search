@@ -21,6 +21,7 @@ use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
+use crate::chunker::ChunkType;
 use crate::entity::EdgeKind;
 
 /// A node in the symbol graph. One node per defining symbol (function or method).
@@ -34,6 +35,20 @@ pub struct SymbolNode {
     /// Source file path (for debugging / display).
     pub file: String,
 }
+
+/// Tuple shape consumed by [`SymbolGraph::build_from_chunks`].
+///
+/// Fields, in order: `(chunk_id, file, function_name, calls, inherits_from,
+/// chunk_type)`. Aliased so the public signature stays clippy-clean (large
+/// inline tuple types trip `clippy::type_complexity`).
+pub type ChunkTuple = (
+    String,
+    String,
+    Option<String>,
+    Vec<String>,
+    Vec<String>,
+    ChunkType,
+);
 
 /// A petgraph-backed directed call graph: edge `A → B` means "A calls B".
 ///
@@ -58,18 +73,26 @@ impl SymbolGraph {
 
     /// Build a graph from the chunk corpus.
     ///
-    /// Each tuple is `(chunk_id, file, function_name, calls)`:
+    /// Each tuple is
+    /// `(chunk_id, file, function_name, calls, inherits_from, chunk_type)`:
     /// - `function_name`: `None` for non-callable chunks (structs, modules, …);
     ///   such chunks contribute no node.
     /// - `calls`: simple-name callees (the chunker reduces `obj.method` and
-    ///   `foo::bar` to the trailing identifier). We add an edge per call only
-    ///   if the callee symbol is also defined in the corpus, so the graph stays
-    ///   closed over local code (no edges pointing into the void).
-    pub fn build_from_chunks(chunks: &[(String, String, Option<String>, Vec<String>)]) -> Self {
+    ///   `foo::bar` to the trailing identifier). We add a `CallsFunction` edge
+    ///   per call only if the callee symbol is also defined in the corpus, so
+    ///   the graph stays closed over local code (no edges pointing into the
+    ///   void).
+    /// - `inherits_from`: parent type names. For each parent that's defined in
+    ///   the corpus, emit an `Implements` edge from the child symbol → parent.
+    /// - `chunk_type`: container chunks (`Impl`, `Class`, `Struct`, `Module`)
+    ///   emit `ModuleContains` edges to every other defining symbol that lives
+    ///   in the same file. Coarse but cheap; nesting-depth refinement can come
+    ///   later.
+    pub fn build_from_chunks(chunks: &[ChunkTuple]) -> Self {
         let mut g = Self::new();
 
         // Pass 1: register all defining symbols.
-        for (chunk_id, file, name, _calls) in chunks {
+        for (chunk_id, file, name, _calls, _inh, _ct) in chunks {
             let Some(name) = name else { continue };
             if name.is_empty() {
                 continue;
@@ -88,10 +111,11 @@ impl SymbolGraph {
             g.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
         }
 
-        // Pass 2: add edges. For each call, also try the simple-name suffix of
-        // a qualified caller's symbol, so `Foo::bar` calling `baz` resolves
-        // even when only `baz` is in the index.
-        for (_chunk_id, _file, name, calls) in chunks {
+        // Pass 2: add CallsFunction + Implements edges. For each call, also
+        // try the simple-name suffix of a qualified caller's symbol, so
+        // `Foo::bar` calling `baz` resolves even when only `baz` is in the
+        // index.
+        for (_chunk_id, _file, name, calls, inherits_from, _ct) in chunks {
             let Some(name) = name else { continue };
             let Some(&from) = g.by_symbol.get(name) else {
                 continue;
@@ -101,6 +125,68 @@ impl SymbolGraph {
                     if from != to {
                         g.graph.add_edge(from, to, EdgeKind::CallsFunction);
                     }
+                }
+            }
+            // Issue #33: INHERITS / Implements edges from `inherits_from`.
+            for parent in inherits_from {
+                if let Some(to) = g.resolve_callee(parent) {
+                    if from != to {
+                        g.graph.add_edge(from, to, EdgeKind::Implements);
+                    }
+                }
+            }
+        }
+
+        // Pass 3: ModuleContains edges from container chunks (Impl / Class /
+        // Struct / Module) to other defining symbols in the same file.
+        // `by_file` is built lazily here so we only pay when there's at least
+        // one container in the corpus.
+        let has_container = chunks.iter().any(|(_, _, name, _, _, ct)| {
+            name.is_some()
+                && matches!(
+                    ct,
+                    ChunkType::Impl
+                        | ChunkType::Class
+                        | ChunkType::Struct
+                        | ChunkType::Module
+                )
+        });
+        if has_container {
+            // file → list of (symbol, NodeIndex) for everything defined there.
+            let mut by_file: HashMap<&str, Vec<(&str, NodeIndex)>> = HashMap::new();
+            for (_chunk_id, file, name, _calls, _inh, _ct) in chunks {
+                if let Some(name) = name {
+                    if let Some(&idx) = g.by_symbol.get(name) {
+                        by_file
+                            .entry(file.as_str())
+                            .or_default()
+                            .push((name.as_str(), idx));
+                    }
+                }
+            }
+            for (_chunk_id, file, name, _calls, _inh, ct) in chunks {
+                if !matches!(
+                    ct,
+                    ChunkType::Impl
+                        | ChunkType::Class
+                        | ChunkType::Struct
+                        | ChunkType::Module
+                ) {
+                    continue;
+                }
+                let Some(name) = name else { continue };
+                let Some(&from) = g.by_symbol.get(name) else {
+                    continue;
+                };
+                let Some(siblings) = by_file.get(file.as_str()) else {
+                    continue;
+                };
+                for (sib_name, sib_idx) in siblings {
+                    if *sib_idx == from || *sib_name == name.as_str() {
+                        continue;
+                    }
+                    g.graph
+                        .add_edge(from, *sib_idx, EdgeKind::ModuleContains);
                 }
             }
         }
@@ -249,17 +335,25 @@ impl SymbolGraph {
 mod tests {
     use super::*;
 
-    fn chunk(
+    fn chunk(id: &str, file: &str, name: Option<&str>, calls: &[&str]) -> ChunkTuple {
+        chunk_full(id, file, name, calls, &[], ChunkType::Function)
+    }
+
+    fn chunk_full(
         id: &str,
         file: &str,
         name: Option<&str>,
         calls: &[&str],
-    ) -> (String, String, Option<String>, Vec<String>) {
+        inherits_from: &[&str],
+        chunk_type: ChunkType,
+    ) -> ChunkTuple {
         (
             id.to_string(),
             file.to_string(),
             name.map(String::from),
             calls.iter().map(|s| s.to_string()).collect(),
+            inherits_from.iter().map(|s| s.to_string()).collect(),
+            chunk_type,
         )
     }
 
@@ -442,6 +536,128 @@ mod tests {
         assert!(g
             .neighbors_by_edge("a", &[EdgeKind::CallsFunction], 0)
             .is_empty());
+    }
+
+    #[test]
+    fn test_calls_function_edges_present_in_graph() {
+        // Issue #33: a chunk whose `calls` field lists `bar` must produce a
+        // `CallsFunction` edge from the caller's symbol to bar.
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("alpha"), &["bar"]),
+            chunk("b:1", "a.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let calls = g.neighbors_by_edge("alpha", &[EdgeKind::CallsFunction], 1);
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one CallsFunction neighbour, got {calls:?}"
+        );
+        assert_eq!(calls[0].0, "bar");
+        assert!(matches!(calls[0].2, EdgeKind::CallsFunction));
+    }
+
+    #[test]
+    fn test_inherits_from_emits_implements_edges() {
+        // Issue #33: a chunk's `inherits_from` field should produce
+        // `Implements` edges to each parent that's defined in the corpus.
+        let chunks = vec![
+            chunk_full(
+                "c:1",
+                "c.rs",
+                Some("Child"),
+                &[],
+                &["Parent"],
+                ChunkType::Class,
+            ),
+            chunk_full("p:1", "p.rs", Some("Parent"), &[], &[], ChunkType::Class),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let impls = g.neighbors_by_edge("Child", &[EdgeKind::Implements], 1);
+        assert_eq!(impls.len(), 1, "expected one Implements edge: {impls:?}");
+        assert_eq!(impls[0].0, "Parent");
+    }
+
+    #[test]
+    fn test_module_contains_edges_from_container_chunks() {
+        // Issue #33: a container chunk (Impl/Class/Struct/Module) should emit
+        // `ModuleContains` edges to other defining symbols in the same file.
+        let chunks = vec![
+            chunk_full(
+                "i:1",
+                "f.rs",
+                Some("FooImpl"),
+                &[],
+                &[],
+                ChunkType::Impl,
+            ),
+            chunk_full(
+                "m:1",
+                "f.rs",
+                Some("method_a"),
+                &[],
+                &[],
+                ChunkType::Method,
+            ),
+            chunk_full(
+                "m:2",
+                "f.rs",
+                Some("method_b"),
+                &[],
+                &[],
+                ChunkType::Method,
+            ),
+            // A symbol in a different file should NOT be contained.
+            chunk_full(
+                "o:1",
+                "other.rs",
+                Some("outside"),
+                &[],
+                &[],
+                ChunkType::Function,
+            ),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let contained = g.neighbors_by_edge("FooImpl", &[EdgeKind::ModuleContains], 1);
+        let names: HashSet<&str> = contained.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains("method_a"), "got {names:?}");
+        assert!(names.contains("method_b"), "got {names:?}");
+        assert!(!names.contains("outside"), "cross-file leak: {names:?}");
+    }
+
+    #[test]
+    fn test_neighbors_by_edge_only_returns_filtered_kinds() {
+        // Issue #33: a graph with mixed edge kinds — filtering by one kind
+        // must not surface neighbours reachable only through other kinds.
+        let chunks = vec![
+            chunk_full(
+                "a:1",
+                "a.rs",
+                Some("Alpha"),
+                &["beta"],
+                &["BaseAlpha"],
+                ChunkType::Class,
+            ),
+            chunk("b:1", "a.rs", Some("beta"), &[]),
+            chunk_full(
+                "ba:1",
+                "a.rs",
+                Some("BaseAlpha"),
+                &[],
+                &[],
+                ChunkType::Class,
+            ),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+
+        let calls = g.neighbors_by_edge("Alpha", &[EdgeKind::CallsFunction], 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "beta");
+        assert!(calls.iter().all(|(_, _, k)| k == &EdgeKind::CallsFunction));
+
+        let impls = g.neighbors_by_edge("Alpha", &[EdgeKind::Implements], 1);
+        assert!(impls.iter().any(|(n, _, _)| n == "BaseAlpha"));
+        assert!(impls.iter().all(|(_, _, k)| k == &EdgeKind::Implements));
     }
 
     #[test]
