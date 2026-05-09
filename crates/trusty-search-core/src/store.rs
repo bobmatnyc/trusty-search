@@ -8,6 +8,7 @@ pub struct VectorHit {
 }
 
 #[async_trait]
+#[allow(clippy::len_without_is_empty)]
 pub trait VectorStore: Send + Sync {
     async fn upsert(&self, id: &str, embedding: Vec<f32>) -> Result<()>;
     async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>>;
