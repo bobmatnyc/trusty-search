@@ -38,3 +38,9 @@ walkdir = "2"
 sha2 = "0.10"
 rayon = "1"
 petgraph = "0.6"
+
+[features]
+default = []
+# Exposes test doubles (e.g. `MockEmbedder`) outside `cfg(test)` so other
+# crates in the workspace — and downstream integration tests — can reuse them.
+test-support = []

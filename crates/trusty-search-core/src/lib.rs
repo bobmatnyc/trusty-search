@@ -4,6 +4,7 @@ pub mod classifier;
 pub mod embed;
 pub mod indexer;
 pub mod registry;
+pub mod search;
 pub mod store;
 
 pub use classifier::{QueryClassifier, QueryIntent};

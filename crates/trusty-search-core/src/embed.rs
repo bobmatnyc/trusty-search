@@ -143,6 +143,54 @@ impl Embedder for FastEmbedder {
     }
 }
 
+/// Test-only deterministic embedder. Hashes the input bytes into a fixed-dim
+/// pseudo-vector. Not for production use — there is no semantic structure here,
+/// only deterministic output so integration tests can exercise the pipeline
+/// without paying the ONNX model-download / inference cost.
+#[cfg(any(test, feature = "test-support"))]
+pub struct MockEmbedder {
+    dim: usize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl MockEmbedder {
+    pub fn new(dim: usize) -> Self {
+        Self { dim }
+    }
+
+    fn hash_to_vec(&self, text: &str) -> Vec<f32> {
+        // Tiny deterministic hash → vector. Distributes byte indices into the
+        // dim slots, so distinct strings produce distinct (but cosine-comparable)
+        // vectors. Adequate for "rank by similarity" assertions.
+        let mut v = vec![0.0_f32; self.dim];
+        for (i, b) in text.bytes().enumerate() {
+            let slot = (i + b as usize) % self.dim;
+            v[slot] += (b as f32) / 255.0;
+        }
+        // Always-include the first byte so empty/short strings still differ.
+        if let Some(first) = text.bytes().next() {
+            v[0] += first as f32 / 255.0;
+        }
+        v
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl Embedder for MockEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(self.hash_to_vec(text))
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| self.hash_to_vec(t)).collect())
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

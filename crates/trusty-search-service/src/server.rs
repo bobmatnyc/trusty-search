@@ -7,7 +7,11 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use trusty_search_core::{indexer::SearchQuery, registry::{IndexId, IndexRegistry}};
+use trusty_search_core::{
+    classifier::QueryClassifier,
+    indexer::SearchQuery,
+    registry::{IndexId, IndexRegistry},
+};
 
 #[derive(Clone)]
 pub struct SearchAppState {
@@ -52,9 +56,19 @@ async fn search_handler(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let index_id = IndexId::new(id);
     let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let intent = QueryClassifier::classify(&query.text);
+    let started = std::time::Instant::now();
     let indexer = handle.indexer.read().await;
-    let results = indexer.search(&query).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::to_value(results).unwrap_or(serde_json::Value::Array(vec![]))))
+    let results = indexer
+        .search(&query)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    Ok(Json(serde_json::json!({
+        "results": results,
+        "intent": format!("{:?}", intent),
+        "latency_ms": latency_ms,
+    })))
 }
 
 async fn index_status_handler(
