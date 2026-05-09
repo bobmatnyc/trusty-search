@@ -29,16 +29,24 @@ pub enum EntityType {
     ModulePath,
     /// Error/panic call sites: `bail!`, `anyhow!`, `panic!`, `unwrap`.
     ErrorVariant,
+    /// Identifiers referenced from `#[test]` function bodies.
+    TestRelation,
+    /// Doc-comment derived concept (NLP phrase / keyword).
+    DocConcept,
     /// Attribute annotations (`#[derive(...)]`, `#[cfg(...)]`).
     Annotation,
     /// String literals longer than 10 characters.
     LiteralString,
-    /// Identifiers referenced from `#[test]` function bodies.
-    TestRelation,
     /// `type Foo = Bar` aliases.
     TypeAlias,
+    /// Top-level `const`/`static` symbol.
+    ConstantSymbol,
     /// Top-level `use` of a non-stdlib, non-self/super/crate path.
     ExternalCrate,
+    /// Cluster of co-occurring concepts (Phase C).
+    ConceptCluster,
+    /// Free-form natural-language phrase pulled from docs/comments.
+    NaturalLanguagePhrase,
 }
 
 impl EntityType {
@@ -48,13 +56,76 @@ impl EntityType {
             Self::TraitBound => "TraitBound",
             Self::ModulePath => "ModulePath",
             Self::ErrorVariant => "ErrorVariant",
+            Self::TestRelation => "TestRelation",
+            Self::DocConcept => "DocConcept",
             Self::Annotation => "Annotation",
             Self::LiteralString => "LiteralString",
-            Self::TestRelation => "TestRelation",
             Self::TypeAlias => "TypeAlias",
+            Self::ConstantSymbol => "ConstantSymbol",
             Self::ExternalCrate => "ExternalCrate",
+            Self::ConceptCluster => "ConceptCluster",
+            Self::NaturalLanguagePhrase => "NaturalLanguagePhrase",
         }
     }
+}
+
+/// Edge kinds for the `SymbolGraph` knowledge graph.
+///
+/// Phase A = structural (tree-sitter derived)
+/// Phase B = test-relation
+/// Phase C = doc/concept
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum EdgeKind {
+    // Call graph
+    /// Caller → callee.
+    CallsFunction,
+    /// Callee → caller (reverse index of `CallsFunction`).
+    CalledByFunction,
+    // Phase A — structural
+    Implements,
+    UsesType,
+    Derives,
+    ModuleContains,
+    ReExports,
+    RaisesError,
+    Configures,
+    // Phase B — test relations
+    TestedBy,
+    TestUsesFixture,
+    CoOccursInTest,
+    // Phase C — docs / concepts
+    Documents,
+    ReferencesConcept,
+    Aliases,
+    ErrorDescribes,
+}
+
+impl EdgeKind {
+    /// Score multiplier for KG expansion. Higher = more relevant when ranking
+    /// neighbours discovered by walking this edge.
+    pub fn score_multiplier(&self) -> f32 {
+        match self {
+            EdgeKind::Implements => 0.85,
+            EdgeKind::UsesType => 0.75,
+            EdgeKind::TestedBy => 0.80,
+            EdgeKind::Documents => 0.65,
+            EdgeKind::ReferencesConcept => 0.60,
+            // Remaining edges use the legacy flat KG-expansion multiplier.
+            _ => 0.70,
+        }
+    }
+}
+
+/// redb table name constants for entity storage.
+pub mod tables {
+    /// `entity_id (str) -> RawEntity (bincode/json)`
+    pub const ENTITIES: &str = "entities";
+    /// `(from_entity_id, edge_kind, to_entity_id) -> ()`
+    pub const ENTITY_EDGES: &str = "entity_edges";
+    /// `chunk_id -> Vec<entity_id>`
+    pub const CHUNK_ENTITIES: &str = "chunk_entities";
+    /// `entity_id -> Vec<chunk_id>` (reverse index of `CHUNK_ENTITIES`)
+    pub const ENTITY_CHUNKS: &str = "entity_chunks";
 }
 
 /// One extracted entity, anchored to a byte span and source line.
