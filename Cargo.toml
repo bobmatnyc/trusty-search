@@ -17,7 +17,10 @@ dashmap = "5"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+colored = "2"
+indicatif = "0.17"
 dotenvy = "0.15"
 
 [package]
@@ -38,6 +41,9 @@ trusty-search-service = { path = "crates/trusty-search-service" }
 trusty-search-mcp = { path = "crates/trusty-search-mcp" }
 tokio = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
+colored = { workspace = true }
+indicatif = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
