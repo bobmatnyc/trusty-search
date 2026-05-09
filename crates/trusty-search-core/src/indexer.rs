@@ -26,9 +26,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::bm25::Bm25Index;
-use crate::chunker::RawChunk;
+use crate::chunker::{chunk_ast, RawChunk};
 use crate::classifier::QueryClassifier;
 use crate::embed::Embedder;
+use crate::entity::RawEntity;
 use crate::search::rrf::{rrf_fuse, RRF_K};
 use crate::store::VectorStore;
 
@@ -103,6 +104,9 @@ pub struct CodeIndexer {
     /// In-memory chunk corpus. Will be backed by redb once #4/#6 land.
     chunks: Arc<RwLock<HashMap<String, RawChunk>>>,
 
+    /// Per-file entities extracted by `chunk_ast`. Keyed by file path.
+    entities: Arc<RwLock<HashMap<String, Vec<RawEntity>>>>,
+
     /// LRU cache of query → embedding, keyed by `hash_query`. Skips the embedder
     /// entirely on repeated queries — the daemon's "zero cold-start" promise.
     query_cache: Arc<Mutex<LruCache<u64, Vec<f32>>>>,
@@ -121,6 +125,7 @@ impl CodeIndexer {
             embedder: None,
             store: None,
             chunks: Arc::new(RwLock::new(HashMap::new())),
+            entities: Arc::new(RwLock::new(HashMap::new())),
             query_cache: Arc::new(Mutex::new(LruCache::new(cap))),
         }
     }
@@ -165,6 +170,25 @@ impl CodeIndexer {
 
         self.chunks.write().await.insert(id, chunk);
         Ok(())
+    }
+
+    /// Parse a file with `chunk_ast`, store every chunk in the corpus, and
+    /// retain the per-file entity list for later KG/entity-search phases.
+    pub async fn index_file(&self, file_path: &str, content: &str) -> Result<()> {
+        let (chunks, entities) = chunk_ast(file_path, content);
+        for chunk in chunks {
+            self.add_chunk(chunk).await?;
+        }
+        self.entities
+            .write()
+            .await
+            .insert(file_path.to_string(), entities);
+        Ok(())
+    }
+
+    /// Read-only access to the entity list for a file (None if never indexed).
+    pub async fn entities_for(&self, file_path: &str) -> Option<Vec<RawEntity>> {
+        self.entities.read().await.get(file_path).cloned()
     }
 
     /// Remove a chunk from the corpus and its vector from the HNSW store.
@@ -374,6 +398,14 @@ mod tests {
             content: content.to_string(),
             function_name: None,
             language: Some("rust".to_string()),
+            chunk_type: crate::chunker::ChunkType::Code,
+            calls: Vec::new(),
+            inherits_from: Vec::new(),
+            chunk_depth: 0,
+            parent_chunk_id: None,
+            child_chunk_ids: Vec::new(),
+            nlp_keywords: Vec::new(),
+            nlp_code_refs: Vec::new(),
         }
     }
 
