@@ -551,8 +551,31 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(2);
             }
+            // Open the canonical facts store next to the daemon lockfile.
+            // Why: facts persist across daemon restarts and are scoped per-machine
+            // (single install). Falling back to `None` keeps the daemon usable if
+            // the data dir is read-only — `/facts` endpoints will return 503.
+            let facts = match dirs::data_local_dir() {
+                Some(d) => {
+                    let dir = d.join("trusty-search");
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        tracing::warn!("could not create facts dir {}: {e}", dir.display());
+                        None
+                    } else {
+                        match trusty_search_core::FactStore::open(&dir.join("facts.redb")) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                tracing::warn!("could not open facts store: {e}");
+                                None
+                            }
+                        }
+                    }
+                }
+                None => None,
+            };
             let state = trusty_search_service::SearchAppState {
                 registry: trusty_search_core::registry::IndexRegistry::new(),
+                facts,
             };
             match trusty_search_service::run_daemon(state, port).await {
                 Ok(()) => {}
