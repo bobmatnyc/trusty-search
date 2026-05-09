@@ -3726,10 +3726,13 @@ name = "trusty-search"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "clap_complete",
  "colored",
+ "dirs 5.0.1",
  "dotenvy",
+ "fs4",
  "indicatif 0.17.11",
  "serde_json",
  "tokio",
@@ -3780,6 +3783,9 @@ name = "trusty-search-mcp"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "axum",
+ "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

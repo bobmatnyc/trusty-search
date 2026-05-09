@@ -234,6 +234,37 @@ impl CodeIndexer {
         self.entities.read().await.get(file_path).cloned()
     }
 
+    /// Remove every chunk belonging to a file, plus its entity list.
+    ///
+    /// Why: `index-file` re-indexes a file in place, but file deletion (and
+    /// `FileWatcher` rename/remove events) needs to drop all of a file's
+    /// chunks at once. Returns the number of chunks removed.
+    pub async fn remove_file(&self, file_path: &str) -> Result<usize> {
+        let ids: Vec<String> = {
+            let chunks = self.chunks.read().await;
+            chunks
+                .values()
+                .filter(|c| c.file == file_path)
+                .map(|c| c.id.clone())
+                .collect()
+        };
+        let removed = ids.len();
+        for id in &ids {
+            if let Some(store) = &self.store {
+                store.remove(id).await.ok();
+            }
+        }
+        {
+            let mut chunks = self.chunks.write().await;
+            for id in &ids {
+                chunks.remove(id);
+            }
+        }
+        self.entities.write().await.remove(file_path);
+        self.rebuild_symbol_graph().await;
+        Ok(removed)
+    }
+
     /// Remove a chunk from the corpus and its vector from the HNSW store.
     pub async fn remove_chunk(&self, chunk_id: &str) -> Result<()> {
         if let Some(store) = &self.store {

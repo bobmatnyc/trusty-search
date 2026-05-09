@@ -292,6 +292,27 @@ fn print_index_header(index_id: &str, warned: bool) {
     }
 }
 
+/// Resolve the daemon's base URL from the port file written by
+/// `trusty-search daemon`. Falls back to `7878` when the file is missing,
+/// so `serve` works out-of-the-box if the user starts the daemon on its
+/// default port.
+///
+/// Why: stdio MCP servers are spawned by Claude Code and have no way to
+/// learn the daemon port other than this file.
+/// What: returns `http://127.0.0.1:{port}` (no trailing slash).
+fn daemon_base_url() -> String {
+    let port = daemon_port_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(7878);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Path to `~/.local/share/trusty-search/daemon.port` (or platform equivalent).
+fn daemon_port_path() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("trusty-search").join("daemon.port"))
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -515,16 +536,26 @@ async fn main() -> Result<()> {
         }
 
         Commands::Serve { http } => {
-            println!(
-                "{} Starting MCP {} server…",
-                "◉".green(),
-                if http.is_some() { "HTTP/SSE" } else { "stdio" }
-            );
-            println!(
-                "{}",
-                "  MCP server not yet implemented — see issue #7".yellow()
-            );
-            std::future::pending::<()>().await;
+            let daemon_url = daemon_base_url();
+            let server = trusty_search_mcp::McpServer::new(daemon_url.clone());
+            if let Some(addr) = http {
+                eprintln!(
+                    "{} MCP HTTP/SSE on {} → daemon {}",
+                    "◉".green(),
+                    addr.cyan(),
+                    daemon_url.dimmed()
+                );
+                let listener = tokio::net::TcpListener::bind(&addr).await?;
+                let app = trusty_search_mcp::sse::router(server);
+                axum::serve(listener, app).await?;
+            } else {
+                eprintln!(
+                    "{} MCP stdio → daemon {}",
+                    "◉".green(),
+                    daemon_url.dimmed()
+                );
+                trusty_search_mcp::stdio::run(server).await?;
+            }
         }
 
         Commands::Completions { shell } => {
