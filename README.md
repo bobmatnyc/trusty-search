@@ -1,5 +1,7 @@
 # trusty-search
 
+[![CI](https://github.com/bobmatnyc/trusty-search/actions/workflows/ci.yml/badge.svg)](https://github.com/bobmatnyc/trusty-search/actions/workflows/ci.yml)
+
 Machine-wide, blazingly fast hybrid code search service.
 
 - **Single install per machine** (not per-project), one daemon serves all your projects
