@@ -32,7 +32,7 @@ use crate::embed::Embedder;
 use crate::entity::{EdgeKind, RawEntity};
 use crate::search::rrf::{rrf_fuse, RRF_K};
 use crate::store::VectorStore;
-use crate::symbol_graph::SymbolGraph;
+use crate::symbol_graph::{ChunkTuple, SymbolGraph};
 
 /// LRU capacity (entries) for the per-indexer query embedding cache.
 const QUERY_CACHE_CAPACITY: usize = 256;
@@ -198,7 +198,7 @@ impl CodeIndexer {
     /// favour simplicity over incremental maintenance.
     async fn rebuild_symbol_graph(&self) {
         let chunks = self.chunks.read().await;
-        let tuples: Vec<(String, String, Option<String>, Vec<String>)> = chunks
+        let tuples: Vec<ChunkTuple> = chunks
             .values()
             .map(|c| {
                 (
@@ -206,6 +206,8 @@ impl CodeIndexer {
                     c.file.clone(),
                     c.function_name.clone(),
                     c.calls.clone(),
+                    c.inherits_from.clone(),
+                    c.chunk_type.clone(),
                 )
             })
             .collect();
