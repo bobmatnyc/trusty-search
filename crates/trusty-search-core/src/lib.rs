@@ -12,7 +12,7 @@ pub mod symbol_graph;
 pub use chunker::{chunk_ast, chunk_text, ChunkType, RawChunk};
 pub use classifier::{QueryClassifier, QueryIntent};
 pub use embed::{Embedder, FastEmbedder};
-pub use entity::{extract_entities, EntityType, RawEntity};
+pub use entity::{extract_entities, EdgeKind, EntityExtractor, EntityType, RawEntity};
 pub use indexer::{CodeChunk, CodeIndexer};
 pub use registry::{IndexHandle, IndexId, IndexRegistry};
 pub use symbol_graph::{SymbolGraph, SymbolNode};

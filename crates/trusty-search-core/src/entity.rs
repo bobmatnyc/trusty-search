@@ -167,6 +167,25 @@ fn node_text(node: Node<'_>, src: &[u8]) -> String {
         .to_string()
 }
 
+/// Marker type providing a typed entry point to entity extraction (issue #17).
+///
+/// Wraps `extract_entities`; semantics are identical. Keeps the public API
+/// stable while letting callers prefer a struct-based handle.
+pub struct EntityExtractor;
+
+impl EntityExtractor {
+    /// Extract Phase A structural entities from a tree-sitter parse tree.
+    ///
+    /// Runs alongside chunking (same `Tree` is reused, so this adds zero
+    /// extra parse cost). Target: <5ms for a 500-line Rust file.
+    ///
+    /// `lang` should be one of `rust`, `python`, `javascript`, `typescript`,
+    /// `go`, `java`, `c`, `cpp`. Unknown languages return an empty vector.
+    pub fn extract(tree: &Tree, src: &[u8], file: &str, lang: &str) -> Vec<RawEntity> {
+        extract_entities(tree, src, file, lang)
+    }
+}
+
 /// Public entry point: walk `tree` and emit entities for `lang`.
 pub fn extract_entities(tree: &Tree, src: &[u8], file: &str, lang: &str) -> Vec<RawEntity> {
     match lang {
@@ -362,4 +381,44 @@ fn function_has_test_attr(node: Node<'_>, src: &[u8]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse_rust(src: &str) -> tree_sitter::Tree {
+        let mut p = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        p.set_language(&lang).expect("set rust language");
+        p.parse(src, None).expect("parse")
+    }
+
+    /// Issue #17: a Rust snippet exercising NamedType, ModulePath, and
+    /// TestRelation entity kinds round-trips through `EntityExtractor::extract`.
+    #[test]
+    fn test_extractor_emits_named_type_modulepath_and_test_relation() {
+        let src = "use std::sync::Arc;\n\
+                   struct MyType { v: u32 }\n\
+                   #[test]\n\
+                   fn it_works() { let _ = Arc::new(MyType { v: 1 }); }\n";
+        let tree = parse_rust(src);
+        let ents = EntityExtractor::extract(&tree, src.as_bytes(), "x.rs", "rust");
+
+        assert!(
+            ents.iter()
+                .any(|e| matches!(e.entity_type, EntityType::NamedType) && e.text == "MyType"),
+            "expected NamedType=MyType in {ents:?}"
+        );
+        assert!(
+            ents.iter().any(|e| matches!(e.entity_type, EntityType::ModulePath)),
+            "expected at least one ModulePath in {ents:?}"
+        );
+        assert!(
+            ents.iter()
+                .any(|e| matches!(e.entity_type, EntityType::TestRelation)),
+            "expected TestRelation identifiers from #[test] fn body in {ents:?}"
+        );
+    }
 }

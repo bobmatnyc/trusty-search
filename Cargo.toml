@@ -25,7 +25,7 @@ dotenvy = "0.15"
 
 [package]
 name = "trusty-search"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
