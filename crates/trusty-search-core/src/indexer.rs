@@ -32,11 +32,17 @@ use crate::embed::Embedder;
 use crate::entity::RawEntity;
 use crate::search::rrf::{rrf_fuse, RRF_K};
 use crate::store::VectorStore;
+use crate::symbol_graph::SymbolGraph;
 
 /// LRU capacity (entries) for the per-indexer query embedding cache.
 const QUERY_CACHE_CAPACITY: usize = 256;
 /// Oversample factor for the HNSW lane before RRF fusion.
 const HNSW_OVERSAMPLE: usize = 4;
+/// Score multiplier applied to chunks brought in via KG expansion. The trigger
+/// chunk's RRF score is multiplied by this factor (per the spec in CLAUDE.md).
+const KG_EXPAND_SCORE_FACTOR: f32 = 0.7;
+/// Default BFS depth for KG expansion (1 hop = direct callers/callees only).
+const KG_EXPAND_HOPS: usize = 1;
 
 /// A search result returned to callers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +116,10 @@ pub struct CodeIndexer {
     /// LRU cache of query → embedding, keyed by `hash_query`. Skips the embedder
     /// entirely on repeated queries — the daemon's "zero cold-start" promise.
     query_cache: Arc<Mutex<LruCache<u64, Vec<f32>>>>,
+
+    /// Call graph derived from the chunk corpus. Rebuilt cheaply after each
+    /// corpus mutation; reads via `Arc::clone` are lock-free.
+    symbol_graph: Arc<RwLock<Arc<SymbolGraph>>>,
 }
 
 impl CodeIndexer {
@@ -127,7 +137,36 @@ impl CodeIndexer {
             chunks: Arc::new(RwLock::new(HashMap::new())),
             entities: Arc::new(RwLock::new(HashMap::new())),
             query_cache: Arc::new(Mutex::new(LruCache::new(cap))),
+            symbol_graph: Arc::new(RwLock::new(Arc::new(SymbolGraph::new()))),
         }
+    }
+
+    /// Snapshot the current symbol graph. Cheap (`Arc::clone`); intended for
+    /// read-only KG queries from concurrent search handlers.
+    pub async fn symbol_graph(&self) -> Arc<SymbolGraph> {
+        Arc::clone(&*self.symbol_graph.read().await)
+    }
+
+    /// Rebuild the symbol graph from the current corpus. Called after any
+    /// mutation (`add_chunk`, `remove_chunk`, `index_file`). Rebuilding is
+    /// O(N + E) over chunks/calls and the corpus is small + in-memory, so we
+    /// favour simplicity over incremental maintenance.
+    async fn rebuild_symbol_graph(&self) {
+        let chunks = self.chunks.read().await;
+        let tuples: Vec<(String, String, Option<String>, Vec<String>)> = chunks
+            .values()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.file.clone(),
+                    c.function_name.clone(),
+                    c.calls.clone(),
+                )
+            })
+            .collect();
+        drop(chunks);
+        let new_graph = Arc::new(SymbolGraph::build_from_chunks(&tuples));
+        *self.symbol_graph.write().await = new_graph;
     }
 
     /// Attach the embedder and vector store so the full hybrid pipeline can run.
@@ -169,6 +208,7 @@ impl CodeIndexer {
         }
 
         self.chunks.write().await.insert(id, chunk);
+        self.rebuild_symbol_graph().await;
         Ok(())
     }
 
@@ -183,6 +223,9 @@ impl CodeIndexer {
             .write()
             .await
             .insert(file_path.to_string(), entities);
+        // `add_chunk` already rebuilds, but we also rebuild once more here so a
+        // partial failure mid-file doesn't leave a stale graph; this is cheap.
+        self.rebuild_symbol_graph().await;
         Ok(())
     }
 
@@ -197,6 +240,7 @@ impl CodeIndexer {
             store.remove(chunk_id).await.ok();
         }
         self.chunks.write().await.remove(chunk_id);
+        self.rebuild_symbol_graph().await;
         Ok(())
     }
 
@@ -278,10 +322,53 @@ impl CodeIndexer {
         Ok(hits.into_iter().map(|h| (h.chunk_id, h.score)).collect())
     }
 
-    /// Stub for KG (callers_of / callees_of) expansion. Will be filled in by #5.
-    async fn kg_expand(&self, _seeds: &[(String, f32)]) -> Vec<(String, f32)> {
-        tracing::trace!("KG expansion stub — awaiting #5");
-        Vec::new()
+    /// KG expansion: for each seed `(chunk_id, score)`, look up the defining
+    /// symbol, fetch its 1-hop callers + callees from the `SymbolGraph`, and
+    /// return adjacent `(chunk_id, score * KG_EXPAND_SCORE_FACTOR)` pairs.
+    ///
+    /// Deduplicates: a chunk that is already a seed is never re-emitted, and a
+    /// chunk reachable from multiple seeds keeps the highest derived score.
+    async fn kg_expand(&self, seeds: &[(String, f32)]) -> Vec<(String, f32)> {
+        let graph = self.symbol_graph().await;
+        if graph.node_count() == 0 || seeds.is_empty() {
+            return Vec::new();
+        }
+
+        let seed_ids: std::collections::HashSet<&String> =
+            seeds.iter().map(|(id, _)| id).collect();
+        let mut best: HashMap<String, f32> = HashMap::new();
+
+        for (seed_id, seed_score) in seeds {
+            let Some(symbol) = graph.symbol_for_chunk(seed_id) else {
+                continue;
+            };
+            let derived = seed_score * KG_EXPAND_SCORE_FACTOR;
+            for (_, neighbour_id) in graph
+                .callers_of(symbol, KG_EXPAND_HOPS)
+                .into_iter()
+                .chain(graph.callees_of(symbol, KG_EXPAND_HOPS))
+            {
+                if seed_ids.contains(&neighbour_id) {
+                    continue;
+                }
+                best.entry(neighbour_id)
+                    .and_modify(|s| {
+                        if derived > *s {
+                            *s = derived;
+                        }
+                    })
+                    .or_insert(derived);
+            }
+        }
+
+        let mut out: Vec<(String, f32)> = best.into_iter().collect();
+        // Stable order: score desc, then id asc.
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
     }
 
     /// Hybrid search: classify intent → route weights → HNSW + BM25 → RRF → KG.
@@ -330,12 +417,18 @@ impl CodeIndexer {
             query.top_k,
         );
 
-        // 4) KG expand (stub).
+        // 4) KG expand. Only runs when intent routing requested it AND
+        //    `expand_graph` wasn't disabled by the caller.
         let mut all = fused.clone();
-        if use_kg_first {
+        let kg_ids: std::collections::HashSet<String> = if use_kg_first && query.expand_graph {
             let expanded = self.kg_expand(&fused).await;
+            let ids: std::collections::HashSet<String> =
+                expanded.iter().map(|(id, _)| id.clone()).collect();
             all.extend(expanded);
-        }
+            ids
+        } else {
+            std::collections::HashSet::new()
+        };
 
         // 5) Per-result match_reason lookup tables.
         let in_hnsw: std::collections::HashSet<&String> =
@@ -353,11 +446,17 @@ impl CodeIndexer {
             };
             let in_v = in_hnsw.contains(&id);
             let in_b = in_bm25.contains(&id);
-            let match_reason = match (in_v, in_b) {
-                (true, true) => "hybrid",
-                (true, false) => "vector",
-                (false, true) => "bm25",
-                (false, false) => "kg", // came in via KG expansion only
+            let in_kg = kg_ids.contains(&id);
+            // Per CLAUDE.md: KG-derived results carry "hybrid+kg". Direct hits
+            // (BM25 and/or vector) take precedence — KG expansion deduplicates
+            // against the seed set, so the "in_kg" arm only fires for chunks
+            // whose sole path into the result set was the call graph.
+            let match_reason = match (in_v, in_b, in_kg) {
+                (true, true, _) => "hybrid",
+                (true, false, _) => "vector",
+                (false, true, _) => "bm25",
+                (false, false, true) => "hybrid+kg",
+                (false, false, false) => "fallback",
             }
             .to_string();
 
@@ -535,6 +634,162 @@ mod tests {
         };
         let r = idx.search(&q).await.unwrap();
         assert!(!r.iter().any(|c| c.id == "a:1:1"));
+    }
+
+    #[tokio::test]
+    async fn test_kg_expansion_marks_neighbours_with_hybrid_kg() {
+        // Build a corpus where "login_handler" calls "authenticate".
+        // Query for "authenticate" with Usage intent so KG expansion fires;
+        // login_handler should appear via KG with match_reason "hybrid+kg".
+        //
+        // Use BM25-only mode (no embedder) so the vector lane can't pull
+        // login_handler in as a near-neighbour and dilute the test signal.
+        let idx = CodeIndexer::new("kg-test", "/tmp/test");
+        // Caller's *body* deliberately omits the literal token "authenticate"
+        // so BM25 / vector lanes won't surface it directly — its only path into
+        // the result set is via KG expansion from the authenticate chunk.
+        idx.add_chunk(RawChunk {
+            id: "h:1".to_string(),
+            file: "h.rs".to_string(),
+            start_line: 1,
+            end_line: 3,
+            content: "fn login_handler() { /* dispatch to verifier */ }".to_string(),
+            function_name: Some("login_handler".to_string()),
+            language: Some("rust".to_string()),
+            chunk_type: crate::chunker::ChunkType::Function,
+            calls: vec!["authenticate".to_string()],
+            inherits_from: Vec::new(),
+            chunk_depth: 0,
+            parent_chunk_id: None,
+            child_chunk_ids: Vec::new(),
+            nlp_keywords: Vec::new(),
+            nlp_code_refs: Vec::new(),
+        })
+        .await
+        .unwrap();
+        idx.add_chunk(RawChunk {
+            id: "a:1".to_string(),
+            file: "a.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content: "fn authenticate() {}".to_string(),
+            function_name: Some("authenticate".to_string()),
+            language: Some("rust".to_string()),
+            chunk_type: crate::chunker::ChunkType::Function,
+            calls: Vec::new(),
+            inherits_from: Vec::new(),
+            chunk_depth: 0,
+            parent_chunk_id: None,
+            child_chunk_ids: Vec::new(),
+            nlp_keywords: Vec::new(),
+            nlp_code_refs: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        // "callers of authenticate" → Usage intent → use_kg_first=true
+        let q = SearchQuery {
+            text: "callers of authenticate".to_string(),
+            top_k: 10,
+            expand_graph: true,
+            compact: false,
+        };
+        let results = idx.search(&q).await.unwrap();
+        let login = results
+            .iter()
+            .find(|c| c.id == "h:1")
+            .expect("login_handler should surface via KG expansion");
+        assert_eq!(
+            login.match_reason, "hybrid+kg",
+            "KG-expanded chunks must carry hybrid+kg marker, got {}",
+            login.match_reason
+        );
+
+        // Verify the 0.7× score factor: login_handler's score should be
+        // exactly 0.7 × the trigger chunk's RRF score (within fp tolerance),
+        // unless it was also a direct hit (then RRF would have ranked it).
+        let trigger = results
+            .iter()
+            .find(|c| c.id == "a:1")
+            .expect("authenticate must appear directly");
+        let expected = trigger.score * KG_EXPAND_SCORE_FACTOR;
+        assert!(
+            (login.score - expected).abs() < 1e-5,
+            "expected KG score = 0.7 * {} = {}, got {}",
+            trigger.score,
+            expected,
+            login.score
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kg_expansion_disabled_by_expand_graph_false() {
+        let idx = make_indexer();
+        idx.add_chunk(RawChunk {
+            id: "h:1".to_string(),
+            file: "h.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content: "fn caller() { target(); }".to_string(),
+            function_name: Some("caller".to_string()),
+            language: Some("rust".to_string()),
+            chunk_type: crate::chunker::ChunkType::Function,
+            calls: vec!["target".to_string()],
+            inherits_from: Vec::new(),
+            chunk_depth: 0,
+            parent_chunk_id: None,
+            child_chunk_ids: Vec::new(),
+            nlp_keywords: Vec::new(),
+            nlp_code_refs: Vec::new(),
+        })
+        .await
+        .unwrap();
+        idx.add_chunk(RawChunk {
+            id: "t:1".to_string(),
+            file: "t.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content: "fn target() {}".to_string(),
+            function_name: Some("target".to_string()),
+            language: Some("rust".to_string()),
+            chunk_type: crate::chunker::ChunkType::Function,
+            calls: Vec::new(),
+            inherits_from: Vec::new(),
+            chunk_depth: 0,
+            parent_chunk_id: None,
+            child_chunk_ids: Vec::new(),
+            nlp_keywords: Vec::new(),
+            nlp_code_refs: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let q = SearchQuery {
+            text: "callers of target".to_string(),
+            top_k: 10,
+            expand_graph: false,
+            compact: false,
+        };
+        let results = idx.search(&q).await.unwrap();
+        assert!(
+            !results.iter().any(|c| c.match_reason.contains("kg")),
+            "expand_graph=false must suppress KG expansion, got {results:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_symbol_graph_rebuilds_after_indexing() {
+        let idx = make_indexer();
+        assert_eq!(idx.symbol_graph().await.node_count(), 0);
+        idx.index_file("a.rs", "fn alpha() { beta(); }\nfn beta() {}\n")
+            .await
+            .unwrap();
+        let g = idx.symbol_graph().await;
+        assert!(g.node_count() >= 2, "graph should hold alpha + beta");
+        assert!(
+            !g.callees_of("alpha", 1).is_empty(),
+            "alpha should have a callee edge to beta"
+        );
     }
 
     #[test]
