@@ -158,6 +158,12 @@ pub struct CodeIndexer {
     /// Per-file entities extracted by `chunk_ast`. Keyed by file path.
     entities: Arc<RwLock<HashMap<String, Vec<RawEntity>>>>,
 
+    /// Cached chunk embeddings, keyed by `chunk_id`. Populated whenever an
+    /// embedder is wired (`add_chunk` writes here). Used by the MMR diversity
+    /// pass (#28) which needs vectors for already-ranked chunks without paying
+    /// a re-embed or HNSW round-trip per candidate.
+    chunk_embeddings: Arc<RwLock<HashMap<String, Vec<f32>>>>,
+
     /// LRU cache of query → embedding, keyed by `hash_query`. Skips the embedder
     /// entirely on repeated queries — the daemon's "zero cold-start" promise.
     query_cache: Arc<Mutex<LruCache<u64, Vec<f32>>>>,
@@ -181,6 +187,7 @@ impl CodeIndexer {
             store: None,
             chunks: Arc::new(RwLock::new(HashMap::new())),
             entities: Arc::new(RwLock::new(HashMap::new())),
+            chunk_embeddings: Arc::new(RwLock::new(HashMap::new())),
             query_cache: Arc::new(Mutex::new(LruCache::new(cap))),
             symbol_graph: Arc::new(RwLock::new(Arc::new(SymbolGraph::new()))),
         }
@@ -249,9 +256,15 @@ impl CodeIndexer {
                 .await
                 .context("embed chunk content")?;
             store
-                .upsert(&id, vec)
+                .upsert(&id, vec.clone())
                 .await
                 .context("upsert chunk vector")?;
+            // Cache for MMR diversity (#28). Cheap O(1) write under the corpus
+            // mutation path so the search hot loop never has to re-embed.
+            self.chunk_embeddings
+                .write()
+                .await
+                .insert(id.clone(), vec);
         }
 
         self.chunks.write().await.insert(id, chunk);
@@ -366,6 +379,12 @@ impl CodeIndexer {
                 chunks.remove(id);
             }
         }
+        {
+            let mut emb = self.chunk_embeddings.write().await;
+            for id in &ids {
+                emb.remove(id);
+            }
+        }
         self.entities.write().await.remove(file_path);
         self.rebuild_symbol_graph().await;
         Ok(removed)
@@ -377,6 +396,7 @@ impl CodeIndexer {
             store.remove(chunk_id).await.ok();
         }
         self.chunks.write().await.remove(chunk_id);
+        self.chunk_embeddings.write().await.remove(chunk_id);
         self.rebuild_symbol_graph().await;
         Ok(())
     }
@@ -611,7 +631,7 @@ impl CodeIndexer {
         }
 
         // 3) RRF.
-        let fused = rrf_fuse(
+        let fused_raw = rrf_fuse(
             &hnsw_results,
             &bm25_results,
             alpha,
@@ -619,6 +639,24 @@ impl CodeIndexer {
             RRF_K,
             query.top_k,
         );
+
+        // 3b) MMR diversity pass (#28). Re-rank the fused list so adjacent
+        //     near-duplicates don't crowd the top-k. λ=0.5 balances relevance
+        //     vs diversity. If no chunk embeddings are cached (BM25-only mode),
+        //     MMR degenerates to the input order — graceful fallback.
+        let fused = {
+            let emb_map = self.chunk_embeddings.read().await;
+            if emb_map.is_empty() {
+                fused_raw
+            } else {
+                crate::mmr::mmr_rerank(
+                    fused_raw,
+                    &emb_map,
+                    crate::mmr::DEFAULT_LAMBDA,
+                    query.top_k,
+                )
+            }
+        };
 
         // 4) KG expand. Only runs when intent routing requested it AND
         //    `expand_graph` wasn't disabled by the caller.
