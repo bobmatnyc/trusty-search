@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::bm25::Bm25Index;
-use crate::chunker::{chunk_ast, RawChunk};
+use crate::chunker::{chunk_ast, ChunkType, RawChunk};
 use crate::classifier::QueryClassifier;
 use crate::embed::Embedder;
 use crate::entity::RawEntity;
@@ -59,6 +59,47 @@ pub struct CodeChunk {
     pub compact_snippet: Option<String>,
     /// How this result was found: "hybrid", "hybrid+kg", "bm25", "vector", "fallback:ripgrep"
     pub match_reason: String,
+
+    // Issue #29 — structural metadata propagated from RawChunk / entity extractor.
+    /// Structural kind of this chunk (Function, Struct, Trait, …). Defaults to
+    /// `Unknown` so older serialized payloads round-trip cleanly.
+    #[serde(default)]
+    pub chunk_type: ChunkType,
+    /// Function/method names called within this chunk's body.
+    #[serde(default)]
+    pub calls: Vec<String>,
+    /// Parent type names this chunk's type inherits from / implements.
+    #[serde(default)]
+    pub inherits_from: Vec<String>,
+    /// Halstead-proxy complexity: unique operator + operand count over `content`.
+    /// Zero when not computable.
+    #[serde(default)]
+    pub complexity_score: u32,
+    /// Nesting depth of this chunk in the file's AST (0 = top-level).
+    #[serde(default)]
+    pub chunk_depth: u8,
+}
+
+/// Halstead-proxy complexity score: unique alphanumeric identifiers (operands)
+/// plus unique single-char operator symbols. Cheap, no AST required.
+fn compute_complexity(content: &str) -> u32 {
+    use std::collections::HashSet;
+    let mut operands: HashSet<&str> = HashSet::new();
+    for tok in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if !tok.is_empty() {
+            operands.insert(tok);
+        }
+    }
+    let mut operators: HashSet<char> = HashSet::new();
+    for c in content.chars() {
+        if matches!(
+            c,
+            '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '&' | '|' | '!' | '^' | '?' | ':'
+        ) {
+            operators.insert(c);
+        }
+    }
+    (operands.len() + operators.len()) as u32
 }
 
 /// Query parameters for hybrid search.
@@ -497,6 +538,9 @@ impl CodeIndexer {
                 None
             };
 
+            // chunk_depth on RawChunk is usize; clamp into u8 (deeply nested
+            // ASTs beyond 255 are vanishingly rare and don't help routing).
+            let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
             out.push(CodeChunk {
                 id: raw.id.clone(),
                 file: raw.file.clone(),
@@ -507,6 +551,11 @@ impl CodeIndexer {
                 score,
                 compact_snippet,
                 match_reason,
+                chunk_type: raw.chunk_type.clone(),
+                calls: raw.calls.clone(),
+                inherits_from: raw.inherits_from.clone(),
+                complexity_score: compute_complexity(&raw.content),
+                chunk_depth,
             });
         }
         Ok(out)
