@@ -1,0 +1,340 @@
+//! `SymbolGraph`: petgraph-backed call graph derived from the chunk corpus.
+//!
+//! Why: query intent like "who calls `authenticate`?" or "what does `process_request`
+//! delegate to?" can't be answered well by BM25/HNSW alone. A directed call graph
+//! (caller → callee) lets the search pipeline expand around a hit, surfacing
+//! adjacent code at a discounted score (KG-expansion = 0.7 × trigger RRF score).
+//!
+//! What: a `petgraph::DiGraph<SymbolNode, ()>` keyed by symbol name (the
+//! `function_name` recorded on each `RawChunk` — qualified for Rust methods, e.g.
+//! `Foo::bar`). Edges point from caller symbol to callee symbol. The graph is
+//! cheap to rebuild from the corpus and is held in `Arc<SymbolGraph>` so search
+//! handlers can read concurrently without locking.
+//!
+//! Test: see the `tests` module — covers basic build, `callers_of`, `callees_of`,
+//! 1-hop and 2-hop traversal, qualified-method names, and unknown-symbol queries.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::Direction;
+use serde::{Deserialize, Serialize};
+
+/// A node in the symbol graph. One node per defining symbol (function or method).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolNode {
+    /// Defining symbol name. For Rust methods this is qualified (`Foo::bar`);
+    /// for free functions it's the bare name.
+    pub symbol: String,
+    /// `RawChunk.id` of the chunk that defines this symbol.
+    pub chunk_id: String,
+    /// Source file path (for debugging / display).
+    pub file: String,
+}
+
+/// A petgraph-backed directed call graph: edge `A → B` means "A calls B".
+///
+/// Built from a slice of `(chunk_id, file, function_name, calls)` tuples; the
+/// chunker (`chunk_ast`) is responsible for populating the `function_name` and
+/// `calls` fields per chunk, so the graph just stitches them together.
+#[derive(Debug, Default)]
+pub struct SymbolGraph {
+    graph: DiGraph<SymbolNode, ()>,
+    /// Symbol name → node index. Holds the *first* definition seen if a symbol
+    /// is defined twice (rare; e.g. `cfg`-gated duplicates).
+    by_symbol: HashMap<String, NodeIndex>,
+    /// chunk_id → symbol name, so callers can resolve a search hit to its node.
+    chunk_to_symbol: HashMap<String, String>,
+}
+
+impl SymbolGraph {
+    /// Construct an empty graph.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a graph from the chunk corpus.
+    ///
+    /// Each tuple is `(chunk_id, file, function_name, calls)`:
+    /// - `function_name`: `None` for non-callable chunks (structs, modules, …);
+    ///   such chunks contribute no node.
+    /// - `calls`: simple-name callees (the chunker reduces `obj.method` and
+    ///   `foo::bar` to the trailing identifier). We add an edge per call only
+    ///   if the callee symbol is also defined in the corpus, so the graph stays
+    ///   closed over local code (no edges pointing into the void).
+    pub fn build_from_chunks(chunks: &[(String, String, Option<String>, Vec<String>)]) -> Self {
+        let mut g = Self::new();
+
+        // Pass 1: register all defining symbols.
+        for (chunk_id, file, name, _calls) in chunks {
+            let Some(name) = name else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            // First-write-wins so chunk_to_symbol stays stable.
+            if g.by_symbol.contains_key(name) {
+                g.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
+                continue;
+            }
+            let idx = g.graph.add_node(SymbolNode {
+                symbol: name.clone(),
+                chunk_id: chunk_id.clone(),
+                file: file.clone(),
+            });
+            g.by_symbol.insert(name.clone(), idx);
+            g.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
+        }
+
+        // Pass 2: add edges. For each call, also try the simple-name suffix of
+        // a qualified caller's symbol, so `Foo::bar` calling `baz` resolves
+        // even when only `baz` is in the index.
+        for (_chunk_id, _file, name, calls) in chunks {
+            let Some(name) = name else { continue };
+            let Some(&from) = g.by_symbol.get(name) else {
+                continue;
+            };
+            for callee in calls {
+                if let Some(to) = g.resolve_callee(callee) {
+                    if from != to {
+                        g.graph.add_edge(from, to, ());
+                    }
+                }
+            }
+        }
+
+        g
+    }
+
+    /// Resolve a callee name (already simple-name via the chunker) to a node.
+    /// Falls back to suffix match against qualified symbols so `bar` finds
+    /// `Foo::bar` when only the qualified version is in the index.
+    fn resolve_callee(&self, callee: &str) -> Option<NodeIndex> {
+        if let Some(&idx) = self.by_symbol.get(callee) {
+            return Some(idx);
+        }
+        // Suffix scan: prefer the first qualified match. Linear, but the graph
+        // is small relative to the chunk corpus and resolution happens once
+        // per call edge at build time.
+        let needle = format!("::{callee}");
+        self.by_symbol
+            .iter()
+            .find(|(sym, _)| sym.ends_with(&needle))
+            .map(|(_, &idx)| idx)
+    }
+
+    /// Number of symbol nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.graph.node_count()
+    }
+
+    /// Number of call edges in the graph.
+    pub fn edge_count(&self) -> usize {
+        self.graph.edge_count()
+    }
+
+    /// Look up the defining symbol for a chunk_id, if any.
+    pub fn symbol_for_chunk(&self, chunk_id: &str) -> Option<&str> {
+        self.chunk_to_symbol.get(chunk_id).map(|s| s.as_str())
+    }
+
+    /// BFS up to `hops` levels: symbols that (transitively) call `symbol`.
+    /// Returns `Vec<(symbol, chunk_id)>` excluding `symbol` itself.
+    pub fn callers_of(&self, symbol: &str, hops: usize) -> Vec<(String, String)> {
+        self.bfs_neighbors(symbol, hops, Direction::Incoming)
+    }
+
+    /// BFS up to `hops` levels: symbols (transitively) called by `symbol`.
+    /// Returns `Vec<(symbol, chunk_id)>` excluding `symbol` itself.
+    pub fn callees_of(&self, symbol: &str, hops: usize) -> Vec<(String, String)> {
+        self.bfs_neighbors(symbol, hops, Direction::Outgoing)
+    }
+
+    fn bfs_neighbors(&self, symbol: &str, hops: usize, dir: Direction) -> Vec<(String, String)> {
+        let Some(&start) = self.by_symbol.get(symbol) else {
+            return Vec::new();
+        };
+        if hops == 0 {
+            return Vec::new();
+        }
+
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        visited.insert(start);
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        queue.push_back((start, 0));
+        let mut out: Vec<(String, String)> = Vec::new();
+
+        while let Some((node, depth)) = queue.pop_front() {
+            if depth >= hops {
+                continue;
+            }
+            for nb in self.graph.neighbors_directed(node, dir) {
+                if visited.insert(nb) {
+                    let n = &self.graph[nb];
+                    out.push((n.symbol.clone(), n.chunk_id.clone()));
+                    queue.push_back((nb, depth + 1));
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(
+        id: &str,
+        file: &str,
+        name: Option<&str>,
+        calls: &[&str],
+    ) -> (String, String, Option<String>, Vec<String>) {
+        (
+            id.to_string(),
+            file.to_string(),
+            name.map(String::from),
+            calls.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn test_build_simple_graph() {
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("main"), &["foo", "bar"]),
+            chunk("a:2", "a.rs", Some("foo"), &["bar"]),
+            chunk("a:3", "a.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.node_count(), 3);
+        // main→foo, main→bar, foo→bar = 3 edges
+        assert_eq!(g.edge_count(), 3);
+    }
+
+    #[test]
+    fn test_callers_of_one_hop() {
+        let chunks = vec![
+            chunk("m:1", "m.rs", Some("main"), &["authenticate"]),
+            chunk("h:1", "h.rs", Some("login_handler"), &["authenticate"]),
+            chunk("a:1", "a.rs", Some("authenticate"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let mut callers = g.callers_of("authenticate", 1);
+        callers.sort();
+        assert_eq!(
+            callers,
+            vec![
+                ("login_handler".to_string(), "h:1".to_string()),
+                ("main".to_string(), "m:1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_callees_of_one_hop() {
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("authenticate"), &["hash_password", "lookup_user"]),
+            chunk("p:1", "p.rs", Some("hash_password"), &[]),
+            chunk("u:1", "u.rs", Some("lookup_user"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let mut callees = g.callees_of("authenticate", 1);
+        callees.sort();
+        assert_eq!(
+            callees,
+            vec![
+                ("hash_password".to_string(), "p:1".to_string()),
+                ("lookup_user".to_string(), "u:1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_two_hop_traversal() {
+        // a → b → c
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("a"), &["b"]),
+            chunk("b:1", "b.rs", Some("b"), &["c"]),
+            chunk("c:1", "c.rs", Some("c"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let one_hop = g.callees_of("a", 1);
+        assert_eq!(one_hop.len(), 1);
+        assert_eq!(one_hop[0].0, "b");
+
+        let two_hop = g.callees_of("a", 2);
+        let names: Vec<&str> = two_hop.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+    }
+
+    #[test]
+    fn test_unknown_symbol_returns_empty() {
+        let chunks = vec![chunk("a:1", "a.rs", Some("a"), &[])];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert!(g.callers_of("nonexistent", 1).is_empty());
+        assert!(g.callees_of("nonexistent", 1).is_empty());
+    }
+
+    #[test]
+    fn test_qualified_method_resolves_simple_callee() {
+        // `Foo::bar` calls `baz`; only `Foo::bar` and `baz` are in the corpus.
+        let chunks = vec![
+            chunk("f:1", "f.rs", Some("Foo::bar"), &["baz"]),
+            chunk("b:1", "b.rs", Some("baz"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let callers = g.callers_of("baz", 1);
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].0, "Foo::bar");
+    }
+
+    #[test]
+    fn test_simple_callee_resolves_to_qualified_definition() {
+        // Caller writes `bar()`; only `Foo::bar` is defined.
+        let chunks = vec![
+            chunk("c:1", "c.rs", Some("caller"), &["bar"]),
+            chunk("f:1", "f.rs", Some("Foo::bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let callees = g.callees_of("caller", 1);
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].0, "Foo::bar");
+    }
+
+    #[test]
+    fn test_chunk_with_no_function_name_is_skipped() {
+        let chunks = vec![
+            chunk("s:1", "s.rs", None, &[]),
+            chunk("f:1", "f.rs", Some("f"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.node_count(), 1);
+    }
+
+    #[test]
+    fn test_zero_hops_returns_empty() {
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("a"), &["b"]),
+            chunk("b:1", "b.rs", Some("b"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert!(g.callees_of("a", 0).is_empty());
+    }
+
+    #[test]
+    fn test_symbol_for_chunk() {
+        let chunks = vec![chunk("a:1", "a.rs", Some("alpha"), &[])];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.symbol_for_chunk("a:1"), Some("alpha"));
+        assert_eq!(g.symbol_for_chunk("missing"), None);
+    }
+
+    #[test]
+    fn test_self_call_does_not_create_self_loop() {
+        // Recursive function: `f` calls `f`. We skip self-edges so KG expansion
+        // doesn't surface the trigger chunk as its own neighbor.
+        let chunks = vec![chunk("f:1", "f.rs", Some("f"), &["f"])];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        assert_eq!(g.edge_count(), 0);
+    }
+}

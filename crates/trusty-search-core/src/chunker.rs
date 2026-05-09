@@ -784,7 +784,7 @@ fn fuse() {}
         let f = chunks.iter().find(|c| c.function_name.as_deref() == Some("fuse")).unwrap();
         assert!(f.nlp_keywords.iter().any(|k| k == "RRF"), "keywords={:?}", f.nlp_keywords);
         assert!(
-            f.nlp_keywords.iter().any(|k| k == "Implements" || k == "Implements"),
+            f.nlp_keywords.iter().any(|k| k == "Implements"),
             "keywords={:?}",
             f.nlp_keywords
         );
