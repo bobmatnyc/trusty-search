@@ -19,16 +19,17 @@
 //! in-process registry and exercises each endpoint.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use trusty_search_core::{
     classifier::QueryClassifier,
+    facts::{FactRecord, FactStore},
     indexer::{CodeIndexer, SearchQuery},
     registry::{IndexHandle, IndexId, IndexRegistry},
 };
@@ -37,6 +38,10 @@ use trusty_search_core::{
 #[derive(Clone)]
 pub struct SearchAppState {
     pub registry: IndexRegistry,
+    /// Optional canonical facts store. `None` disables the `/facts` endpoints
+    /// (they return 503 when unavailable) — useful for tests that don't need
+    /// persistence.
+    pub facts: Option<FactStore>,
 }
 
 #[derive(Serialize)]
@@ -79,7 +84,84 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/:id/index-file", post(index_file_handler))
         .route("/indexes/:id/remove-file", post(remove_file_handler))
         .route("/indexes/:id/reindex", post(reindex_handler))
+        .route("/facts", get(list_facts_handler).post(upsert_fact_handler))
+        .route("/facts/:id", delete(delete_fact_handler))
         .with_state(Arc::new(state))
+}
+
+#[derive(Deserialize)]
+pub struct FactQueryParams {
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
+    pub object: Option<String>,
+}
+
+/// Inbound payload for upserting a fact. `id` and `created_at` are derived
+/// server-side; callers don't need to compute the hash.
+#[derive(Deserialize)]
+pub struct UpsertFactRequest {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub index_id: String,
+    #[serde(default = "default_confidence")]
+    pub confidence: f32,
+    #[serde(default)]
+    pub provenance: Vec<String>,
+}
+
+fn default_confidence() -> f32 {
+    1.0
+}
+
+async fn list_facts_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Query(params): Query<FactQueryParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Some(store) = &state.facts else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let hits = store
+        .query(
+            params.subject.as_deref(),
+            params.predicate.as_deref(),
+            params.object.as_deref(),
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({
+        "facts": hits,
+        "count": hits.len(),
+    })))
+}
+
+async fn upsert_fact_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Json(req): Json<UpsertFactRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Some(store) = &state.facts else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut fact = FactRecord::new(req.subject, req.predicate, req.object, req.index_id)
+        .with_confidence(req.confidence);
+    fact.provenance = req.provenance;
+    let id = fact.id;
+    store
+        .upsert(fact)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "id": id, "upserted": true })))
+}
+
+async fn delete_fact_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<u64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Some(store) = &state.facts else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let removed = store
+        .delete(id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "id": id, "removed": removed })))
 }
 
 async fn health_handler() -> Json<HealthResponse> {

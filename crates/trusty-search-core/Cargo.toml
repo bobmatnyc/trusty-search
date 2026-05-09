@@ -40,6 +40,9 @@ sha2 = "0.10"
 rayon = "1"
 petgraph = "0.6"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = []
 # Exposes test doubles (e.g. `MockEmbedder`) outside `cfg(test)` so other
