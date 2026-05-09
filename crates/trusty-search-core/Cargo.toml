@@ -1,0 +1,40 @@
+[package]
+name = "trusty-search-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+
+# Storage
+usearch = "2.25"
+redb = "2.6"
+fastembed = "5"
+
+# Code parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+
+# Indexing
+regex = "1"
+lru = "0.12"
+walkdir = "2"
+sha2 = "0.10"
+rayon = "1"
+petgraph = "0.6"
