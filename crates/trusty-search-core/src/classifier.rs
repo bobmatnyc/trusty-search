@@ -29,6 +29,12 @@ static DEFINITION_RE: OnceLock<Regex> = OnceLock::new();
 static USAGE_RE: OnceLock<Regex> = OnceLock::new();
 static CONCEPTUAL_RE: OnceLock<Regex> = OnceLock::new();
 static BUG_DEBT_RE: OnceLock<Regex> = OnceLock::new();
+// Entity-relationship keyword patterns (issue #21). Matched alongside the
+// existing intent regexes; a hit overrides the default to bias the query
+// toward the routing best-suited for that entity relationship.
+static ENTITY_DEF_RE: OnceLock<Regex> = OnceLock::new();
+static ENTITY_USAGE_RE: OnceLock<Regex> = OnceLock::new();
+static ENTITY_BUG_RE: OnceLock<Regex> = OnceLock::new();
 
 impl QueryClassifier {
     pub fn classify(query: &str) -> QueryIntent {
@@ -44,6 +50,22 @@ impl QueryClassifier {
         let bug_re = BUG_DEBT_RE.get_or_init(|| {
             Regex::new(r"(?i)\b(TODO|FIXME|HACK|panic!|unwrap\(\)|bug|error|crash|fail)\b").unwrap()
         });
+        // Entity-relationship keyword regexes (issue #21).
+        let entity_def_re = ENTITY_DEF_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(implements|derives from|aliased as)\b").unwrap()
+        });
+        let entity_usage_re = ENTITY_USAGE_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(tested by|co-occurs)\b").unwrap()
+        });
+        let entity_bug_re = ENTITY_BUG_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(raises|documented by)\b").unwrap()
+        });
+
+        // Entity-keyword hits take precedence over the generic patterns when
+        // the user explicitly asks an entity-relationship question.
+        if entity_usage_re.is_match(query) { return QueryIntent::Usage; }
+        if entity_def_re.is_match(query) { return QueryIntent::Definition; }
+        if entity_bug_re.is_match(query) { return QueryIntent::BugDebt; }
 
         if usage_re.is_match(query) { return QueryIntent::Usage; }
         if def_re.is_match(query) { return QueryIntent::Definition; }
@@ -84,5 +106,61 @@ mod tests {
     #[test]
     fn test_usage_beats_definition() {
         assert_eq!(QueryClassifier::classify("callers of fn search_hybrid"), QueryIntent::Usage);
+    }
+
+    #[test]
+    fn test_entity_implements_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("which types implements Embedder"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_entity_derives_from_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("structs that derives from Default"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_entity_aliased_as_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("Result aliased as anyhow::Result"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_entity_tested_by_is_usage() {
+        assert_eq!(
+            QueryClassifier::classify("authenticate tested by login_test"),
+            QueryIntent::Usage
+        );
+    }
+
+    #[test]
+    fn test_entity_co_occurs_is_usage() {
+        assert_eq!(
+            QueryClassifier::classify("symbols that co-occurs in test fixtures"),
+            QueryIntent::Usage
+        );
+    }
+
+    #[test]
+    fn test_entity_raises_is_bug_debt() {
+        assert_eq!(
+            QueryClassifier::classify("functions that raises ConfigError"),
+            QueryIntent::BugDebt
+        );
+    }
+
+    #[test]
+    fn test_entity_documented_by_is_bug_debt() {
+        assert_eq!(
+            QueryClassifier::classify("ParseError documented by docs/errors.md"),
+            QueryIntent::BugDebt
+        );
     }
 }
