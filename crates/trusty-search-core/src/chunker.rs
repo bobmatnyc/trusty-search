@@ -91,6 +91,12 @@ pub struct RawChunk {
     pub child_chunk_ids: Vec<String>,
     pub nlp_keywords: Vec<String>,
     pub nlp_code_refs: Vec<String>,
+
+    /// Entity-derived virtual terms appended to this chunk's BM25 document
+    /// at index time (issue #19). Not displayed to users; used only to give
+    /// BM25 extra surface area to match symbolic queries against.
+    #[serde(default)]
+    pub virtual_terms: Vec<String>,
 }
 
 impl RawChunk {
@@ -112,6 +118,7 @@ impl RawChunk {
             child_chunk_ids: Vec::new(),
             nlp_keywords: Vec::new(),
             nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
         }
     }
 }
@@ -541,6 +548,7 @@ fn walk_for_chunks(
             child_chunk_ids: Vec::new(),
             nlp_keywords,
             nlp_code_refs,
+            virtual_terms: Vec::new(),
         });
 
         // Descend into impl/class/module to capture their methods/inner items,
@@ -607,6 +615,7 @@ fn split_oversized(chunks: Vec<RawChunk>) -> Vec<RawChunk> {
                 child_chunk_ids: Vec::new(),
                 nlp_keywords: Vec::new(),
                 nlp_code_refs: Vec::new(),
+                virtual_terms: Vec::new(),
             });
             if end == lines.len() {
                 break;

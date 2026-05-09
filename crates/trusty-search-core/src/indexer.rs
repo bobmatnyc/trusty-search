@@ -260,7 +260,25 @@ impl CodeIndexer {
     /// Parse a file with `chunk_ast`, store every chunk in the corpus, and
     /// retain the per-file entity list for later KG/entity-search phases.
     pub async fn index_file(&self, file_path: &str, content: &str) -> Result<()> {
-        let (chunks, entities) = chunk_ast(file_path, content);
+        let (mut chunks, entities) = chunk_ast(file_path, content);
+
+        // Issue #19: populate virtual_terms per chunk from entities whose source
+        // line falls inside the chunk's [start_line, end_line] range. We dedupe
+        // by entity text so heavy literal repeats don't dominate IDF.
+        for chunk in chunks.iter_mut() {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut terms: Vec<String> = Vec::new();
+            for ent in &entities {
+                if ent.line >= chunk.start_line
+                    && ent.line <= chunk.end_line
+                    && seen.insert(ent.text.as_str())
+                {
+                    terms.push(ent.text.clone());
+                }
+            }
+            chunk.virtual_terms = terms;
+        }
+
         for chunk in chunks {
             self.add_chunk(chunk).await?;
         }
@@ -366,7 +384,23 @@ impl CodeIndexer {
 
         let mut bm25 = Bm25Index::new();
         for (doc_id, (_, chunk)) in entries.iter().enumerate() {
-            bm25.add_document(doc_id, &chunk.content);
+            // Issue #19: append entity-derived virtual_terms so symbolic queries
+            // ("authenticate", "Arc", "ParseError") can match the chunk via BM25
+            // even when those terms don't appear literally in the body.
+            if chunk.virtual_terms.is_empty() {
+                bm25.add_document(doc_id, &chunk.content);
+            } else {
+                let mut doc = String::with_capacity(
+                    chunk.content.len()
+                        + chunk.virtual_terms.iter().map(|t| t.len() + 1).sum::<usize>(),
+                );
+                doc.push_str(&chunk.content);
+                for t in &chunk.virtual_terms {
+                    doc.push(' ');
+                    doc.push_str(t);
+                }
+                bm25.add_document(doc_id, &doc);
+            }
         }
 
         let mut scored: Vec<(String, f32)> = entries
@@ -627,6 +661,7 @@ mod tests {
             child_chunk_ids: Vec::new(),
             nlp_keywords: Vec::new(),
             nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
         }
     }
 
@@ -786,6 +821,7 @@ mod tests {
             child_chunk_ids: Vec::new(),
             nlp_keywords: Vec::new(),
             nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
         })
         .await
         .unwrap();
@@ -805,6 +841,7 @@ mod tests {
             child_chunk_ids: Vec::new(),
             nlp_keywords: Vec::new(),
             nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
         })
         .await
         .unwrap();
@@ -863,6 +900,7 @@ mod tests {
             child_chunk_ids: Vec::new(),
             nlp_keywords: Vec::new(),
             nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
         })
         .await
         .unwrap();
@@ -882,6 +920,7 @@ mod tests {
             child_chunk_ids: Vec::new(),
             nlp_keywords: Vec::new(),
             nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
         })
         .await
         .unwrap();
@@ -911,6 +950,29 @@ mod tests {
         assert!(
             !g.callees_of("alpha", 1).is_empty(),
             "alpha should have a callee edge to beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_terms_populated_from_entities() {
+        // Issue #19: chunks should pick up entity text as virtual_terms so
+        // BM25 matches symbolic queries that don't appear literally in the body.
+        let idx = make_indexer();
+        idx.index_file(
+            "v.rs",
+            "use std::sync::Arc;\nfn f() { let _x: Arc<String> = Arc::new(String::new()); }\n",
+        )
+        .await
+        .unwrap();
+        let chunks = idx.chunks.read().await;
+        let f_chunk = chunks
+            .values()
+            .find(|c| c.function_name.as_deref() == Some("f"))
+            .expect("f chunk");
+        assert!(
+            f_chunk.virtual_terms.iter().any(|t| t == "Arc"),
+            "expected 'Arc' in virtual_terms, got {:?}",
+            f_chunk.virtual_terms
         );
     }
 
