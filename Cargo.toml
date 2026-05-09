@@ -53,3 +53,7 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 dirs = "5"
 fs4 = { version = "0.8", features = ["sync"] }
+
+[dev-dependencies]
+walkdir = "2"
+tokio = { workspace = true }
