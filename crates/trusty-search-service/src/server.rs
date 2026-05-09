@@ -80,6 +80,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/health", get(health_handler))
         .route("/indexes", get(list_indexes_handler).post(create_index_handler))
         .route("/indexes/:id/search", post(search_handler))
+        .route("/indexes/:id/search_similar", post(search_similar_handler))
         .route("/indexes/:id/status", get(index_status_handler))
         .route("/indexes/:id/index-file", post(index_file_handler))
         .route("/indexes/:id/remove-file", post(remove_file_handler))
@@ -219,6 +220,50 @@ async fn search_handler(
     Ok(Json(serde_json::json!({
         "results": results,
         "intent": format!("{:?}", intent),
+        "latency_ms": latency_ms,
+    })))
+}
+
+/// Body for `POST /indexes/:id/search_similar`.
+///
+/// Why: code-to-code similarity (issue #31). The caller knows the *file +
+/// optional function name* of the chunk they want to find neighbours of, not
+/// its synthetic chunk id.
+#[derive(Deserialize)]
+pub struct SearchSimilarRequest {
+    pub file: String,
+    #[serde(default)]
+    pub function: Option<String>,
+    #[serde(default = "default_similar_top_k")]
+    pub top_k: usize,
+}
+
+fn default_similar_top_k() -> usize {
+    10
+}
+
+async fn search_similar_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SearchSimilarRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let started = std::time::Instant::now();
+    let indexer = handle.indexer.read().await;
+    let chunk_id = indexer
+        .find_chunk_id(&req.file, req.function.as_deref())
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let embedding = indexer.get_embedding(&chunk_id).ok_or(StatusCode::NOT_FOUND)?;
+    let results = indexer
+        .similar_by_embedding(&embedding, req.top_k, Some(&chunk_id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    Ok(Json(serde_json::json!({
+        "results": results,
+        "seed_chunk_id": chunk_id,
         "latency_ms": latency_ms,
     })))
 }

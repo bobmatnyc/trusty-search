@@ -240,6 +240,88 @@ impl CodeIndexer {
         self
     }
 
+    /// Retrieve a cached chunk embedding by `chunk_id`.
+    ///
+    /// Why: code-to-code similarity search (issue #31) needs the seed chunk's
+    /// embedding to query the HNSW lane without re-embedding its source. We
+    /// already populate `chunk_embeddings` on `add_chunk`, so this is an O(1)
+    /// lookup. Returns `None` when the chunk doesn't exist or was indexed in
+    /// BM25-only mode (no embedder wired).
+    pub fn get_embedding(&self, chunk_id: &str) -> Option<Vec<f32>> {
+        self.chunk_embeddings
+            .try_read()
+            .ok()
+            .and_then(|g| g.get(chunk_id).cloned())
+    }
+
+    /// Find a chunk whose `file` ends with `file_suffix` and (optionally) whose
+    /// `function_name` equals `function`. When `function` is `None`, returns
+    /// the lowest-line-numbered chunk in the matching file. Returns the chunk
+    /// id, or `None` when nothing matches.
+    pub async fn find_chunk_id(
+        &self,
+        file_suffix: &str,
+        function: Option<&str>,
+    ) -> Option<String> {
+        let chunks = self.chunks.read().await;
+        let matching: Vec<&RawChunk> = chunks
+            .values()
+            .filter(|c| c.file.ends_with(file_suffix))
+            .filter(|c| match function {
+                Some(f) => c.function_name.as_deref() == Some(f),
+                None => true,
+            })
+            .collect();
+        // Pick the earliest chunk in the file for stability.
+        matching
+            .into_iter()
+            .min_by_key(|c| c.start_line)
+            .map(|c| c.id.clone())
+    }
+
+    /// Run an HNSW-only similarity search against a precomputed embedding,
+    /// excluding `exclude_id` (typically the seed chunk). Returns up to
+    /// `top_k` `CodeChunk`s with `match_reason = "vector"`.
+    pub async fn similar_by_embedding(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<CodeChunk>> {
+        let want = top_k.saturating_add(1).max(top_k);
+        let hits = self.vector_search(embedding, want).await?;
+        let chunks = self.chunks.read().await;
+        let mut out = Vec::with_capacity(top_k);
+        for (id, score) in hits {
+            if Some(id.as_str()) == exclude_id {
+                continue;
+            }
+            let Some(raw) = chunks.get(&id) else { continue };
+            let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
+            out.push(CodeChunk {
+                id: raw.id.clone(),
+                file: raw.file.clone(),
+                start_line: raw.start_line,
+                end_line: raw.end_line,
+                content: raw.content.clone(),
+                function_name: raw.function_name.clone(),
+                score,
+                compact_snippet: Some(build_compact_snippet(&raw.content)),
+                match_reason: "vector".to_string(),
+                chunk_type: raw.chunk_type.clone(),
+                calls: raw.calls.clone(),
+                inherits_from: raw.inherits_from.clone(),
+                complexity_score: compute_complexity(&raw.content),
+                chunk_depth,
+                blame: None,
+            });
+            if out.len() >= top_k {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Number of chunks currently held in the corpus.
     pub fn chunk_count(&self) -> usize {
         // blocking_read is fine on a tokio worker thread for a quick stat probe;
@@ -1158,6 +1240,35 @@ mod tests {
             "expected 'Arc' in virtual_terms, got {:?}",
             f_chunk.virtual_terms
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_embedding_returns_some_after_indexing() {
+        let idx = make_indexer();
+        idx.add_chunk(raw("a:1:1", "a.rs", "fn alpha() {}"))
+            .await
+            .unwrap();
+        let emb = idx.get_embedding("a:1:1");
+        assert!(emb.is_some(), "expected embedding cached after add_chunk");
+        assert!(idx.get_embedding("nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_similar_by_embedding_excludes_seed() {
+        let idx = make_indexer();
+        idx.add_chunk(raw("a:1:1", "a.rs", "fn alpha() {}"))
+            .await
+            .unwrap();
+        idx.add_chunk(raw("b:1:1", "b.rs", "fn beta() {}"))
+            .await
+            .unwrap();
+        let emb = idx.get_embedding("a:1:1").unwrap();
+        let results = idx
+            .similar_by_embedding(&emb, 5, Some("a:1:1"))
+            .await
+            .unwrap();
+        assert!(results.iter().all(|c| c.id != "a:1:1"));
+        assert!(results.iter().all(|c| c.match_reason == "vector"));
     }
 
     #[test]
