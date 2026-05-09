@@ -510,28 +510,64 @@ async fn main() -> Result<()> {
         }
 
         Commands::Health => {
-            if cli.json {
-                println!(r#"{{"status":"not_implemented"}}"#);
-            } else {
-                println!("{} Checking daemon…", "◉".cyan());
-                println!(
-                    "{}",
-                    "  Health check not yet implemented — see issue #8".yellow()
-                );
+            let url = format!("{}/health", daemon_base_url());
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value =
+                        resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+                    if cli.json {
+                        println!("{}", body);
+                    } else {
+                        println!(
+                            "{} daemon ok at {} (version {})",
+                            "✓".green(),
+                            daemon_base_url().cyan(),
+                            body.get("version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                        );
+                    }
+                }
+                Ok(resp) => {
+                    eprintln!("{} daemon returned {}", "✗".red(), resp.status());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} could not reach daemon at {}: {e}",
+                        "✗".red(),
+                        daemon_base_url()
+                    );
+                    std::process::exit(1);
+                }
             }
         }
 
         Commands::Daemon { port, stop } => {
             if stop {
-                println!("{} Stopping daemon…", "◉".red());
-                println!(
-                    "{}",
-                    "  Daemon stop not yet implemented — see issue #8".yellow()
+                eprintln!(
+                    "{} `daemon --stop` is not implemented — send SIGTERM/SIGINT instead",
+                    "·".dimmed()
                 );
-            } else {
-                println!("{} Starting daemon on port {}…", "◉".green(), port);
-                println!("{}", "  Daemon not yet implemented — see issue #8".yellow());
-                std::future::pending::<()>().await;
+                std::process::exit(2);
+            }
+            let state = trusty_search_service::SearchAppState {
+                registry: trusty_search_core::registry::IndexRegistry::new(),
+            };
+            match trusty_search_service::run_daemon(state, port).await {
+                Ok(()) => {}
+                Err(trusty_search_service::DaemonError::AlreadyRunning(p)) => {
+                    eprintln!(
+                        "{} another trusty-search daemon is already running (lock at {})",
+                        "✗".red(),
+                        p.display()
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("{} daemon failed: {e}", "✗".red());
+                    std::process::exit(1);
+                }
             }
         }
 
