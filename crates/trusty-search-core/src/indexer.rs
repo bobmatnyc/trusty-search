@@ -29,7 +29,7 @@ use crate::bm25::Bm25Index;
 use crate::chunker::{chunk_ast, ChunkType, RawChunk};
 use crate::classifier::{QueryClassifier, QueryIntent};
 use crate::embed::Embedder;
-use crate::entity::{EdgeKind, RawEntity};
+use crate::entity::{EdgeKind, EntityType, RawEntity};
 use crate::search::rrf::{rrf_fuse, RRF_K};
 use crate::store::VectorStore;
 use crate::symbol_graph::{ChunkTuple, SymbolGraph};
@@ -299,6 +299,47 @@ impl CodeIndexer {
         self.entities.read().await.get(file_path).cloned()
     }
 
+    /// Issue #20: exact-name entity lookup. Scans the in-memory entity index
+    /// for an entry whose text matches `query` (case-insensitive, trimmed) and
+    /// returns the chunk_id of a chunk in that entity's file whose source line
+    /// range contains the entity. Returns the first match found — fine for
+    /// rank-1 BM25 injection where we just need a strong anchor.
+    ///
+    /// Restricted to `NamedType` and `ModulePath` entities — these are the
+    /// taxonomy members that behave like symbol names. Other entity types
+    /// (string literals, annotations, error variants) are noisier and should
+    /// not anchor an exact-match boost.
+    async fn entity_exact_match(&self, query: &str) -> Option<String> {
+        let needle = query.trim();
+        if needle.is_empty() || needle.contains(' ') {
+            // Multi-word queries are not symbol names; skip the exact-match path.
+            return None;
+        }
+        let entities = self.entities.read().await;
+        let chunks = self.chunks.read().await;
+        for (file, ents) in entities.iter() {
+            for ent in ents {
+                if !matches!(
+                    ent.entity_type,
+                    EntityType::NamedType | EntityType::ModulePath
+                ) {
+                    continue;
+                }
+                if ent.text.eq_ignore_ascii_case(needle) {
+                    // Find a chunk in `file` whose [start_line, end_line] contains ent.line.
+                    if let Some(c) = chunks
+                        .values()
+                        .filter(|c| c.file == *file)
+                        .find(|c| ent.line >= c.start_line && ent.line <= c.end_line)
+                    {
+                        return Some(c.id.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Remove every chunk belonging to a file, plus its entity list.
     ///
     /// Why: `index-file` re-indexes a file in place, but file deletion (and
@@ -555,7 +596,19 @@ impl CodeIndexer {
             Some(v) => self.vector_search(v, want_hnsw).await?,
             None => Vec::new(),
         };
-        let bm25_results = bm25_fut.await?;
+        let mut bm25_results = bm25_fut.await?;
+
+        // Issue #20: when intent is Definition or Unknown (a likely symbol
+        // lookup), check the entity index for an exact-name match and inject
+        // it as the rank-1 BM25 hit so the RRF lane sees a strong signal even
+        // if the literal token didn't tokenize (e.g. an underscore-heavy name).
+        if matches!(intent, QueryIntent::Definition | QueryIntent::Unknown) {
+            if let Some(hit) = self.entity_exact_match(&query.text).await {
+                let injected_score = beta * 1.5;
+                bm25_results.retain(|(id, _)| id != &hit);
+                bm25_results.insert(0, (hit, injected_score));
+            }
+        }
 
         // 3) RRF.
         let fused = rrf_fuse(
@@ -953,6 +1006,91 @@ mod tests {
             !g.callees_of("alpha", 1).is_empty(),
             "alpha should have a callee edge to beta"
         );
+    }
+
+    #[tokio::test]
+    async fn test_entity_exact_match_finds_chunk() {
+        // Issue #20: an exact-name entity hit should resolve to a chunk in the
+        // entity's file whose line range contains the entity. We use a struct
+        // declaration so the AST emits a NamedType that matches the query.
+        let idx = make_indexer();
+        idx.index_file("e.rs", "pub struct MyType { x: u32 }\nfn f() {}\n")
+            .await
+            .unwrap();
+        let hit = idx.entity_exact_match("MyType").await;
+        assert!(hit.is_some(), "expected entity_exact_match to find MyType");
+        let hit_id = hit.unwrap();
+        let chunks = idx.chunks.read().await;
+        assert!(
+            chunks.get(&hit_id).map(|c| c.file == "e.rs").unwrap_or(false),
+            "matched chunk should live in e.rs",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entity_exact_match_struct_ranks_first() {
+        // Issue #20: indexing a Rust snippet with `struct FooBar` and querying
+        // "FooBar" must surface that chunk at rank 1 via the synthetic BM25
+        // injection. We use BM25-only mode so the vector lane can't dilute
+        // the signal with a near-neighbour.
+        let idx = CodeIndexer::new("ent-rank-1", "/tmp/test");
+        idx.index_file(
+            "src/types.rs",
+            "pub struct FooBar { pub x: u32 }\n\nfn unrelated() { let _ = 1; }\n",
+        )
+        .await
+        .unwrap();
+        idx.index_file("src/other.rs", "fn other_thing() {}\n")
+            .await
+            .unwrap();
+
+        let q = SearchQuery {
+            text: "FooBar".to_string(),
+            top_k: 5,
+            expand_graph: false,
+            compact: false,
+        };
+        let results = idx.search(&q).await.expect("search");
+        assert!(!results.is_empty(), "search must return at least one hit");
+        assert_eq!(
+            results[0].file, "src/types.rs",
+            "FooBar's defining file must rank first; got {:?}",
+            results.iter().map(|r| &r.file).collect::<Vec<_>>(),
+        );
+        assert!(
+            results[0].content.contains("FooBar"),
+            "rank-1 chunk must contain the FooBar definition; got {:?}",
+            results[0].content,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entity_exact_match_skips_non_symbol_entities() {
+        // Issue #20: only NamedType and ModulePath entities should anchor
+        // exact-name boosts. A LiteralString like "this is a long literal"
+        // appearing in a file must not be returned as an entity match.
+        let idx = make_indexer();
+        idx.index_file(
+            "lit.rs",
+            "fn f() { let _ = \"this is a long literal\"; }\n",
+        )
+        .await
+        .unwrap();
+        // Single-word literal subset that exists as a string token but is
+        // neither a NamedType nor a ModulePath — must miss.
+        assert!(
+            idx.entity_exact_match("literal").await.is_none(),
+            "non-symbol entity types must not satisfy entity_exact_match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entity_exact_match_skips_multiword_query() {
+        let idx = make_indexer();
+        idx.index_file("e.rs", "use std::sync::Arc;\nfn f() {}\n")
+            .await
+            .unwrap();
+        assert!(idx.entity_exact_match("Arc thing").await.is_none());
     }
 
     #[tokio::test]
