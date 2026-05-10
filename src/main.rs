@@ -313,6 +313,227 @@ fn daemon_port_path() -> Option<std::path::PathBuf> {
     dirs::data_local_dir().map(|d| d.join("trusty-search").join("daemon.port"))
 }
 
+/// Index a single file via the daemon's `/indexes/:id/index-file` endpoint.
+async fn index_single_file(
+    client: &reqwest::Client,
+    base: &str,
+    index_id: &str,
+    file: &std::path::Path,
+) -> Result<()> {
+    let content = tokio::fs::read_to_string(file)
+        .await
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let url = format!("{}/indexes/{}/index-file", base, index_id);
+    let body = serde_json::json!({
+        "path": file.display().to_string(),
+        "content": content,
+    });
+    let resp = client.post(&url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("daemon returned {} for {}", resp.status(), url);
+    }
+    Ok(())
+}
+
+/// Handle `trusty-search add <path>`: a single file goes to `index-file`;
+/// a directory walks `walk_source_files` and indexes every match.
+async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
+    let base = daemon_base_url();
+    let client = reqwest::Client::new();
+
+    if path.is_dir() {
+        let walk = trusty_search_service::walker::walk_source_files(path);
+        println!(
+            "{} [{}] indexing {} files under {}",
+            "→".cyan(),
+            index_id,
+            walk.files.len(),
+            path.display()
+        );
+        let mut ok = 0usize;
+        let mut err = 0usize;
+        for f in &walk.files {
+            match index_single_file(&client, &base, index_id, f).await {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    eprintln!("  {} {}: {e}", "⚠".yellow(), f.display());
+                    err += 1;
+                }
+            }
+        }
+        println!(
+            "{} indexed {} files ({} errors)",
+            "✓".green(),
+            ok,
+            err
+        );
+        Ok(())
+    } else {
+        index_single_file(&client, &base, index_id, path).await?;
+        println!("{} [{}] {}", "→".cyan(), index_id, path.display());
+        Ok(())
+    }
+}
+
+/// Drive a reindex: POST /reindex, then connect to the SSE stream and render
+/// progress.
+async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+
+    let base = daemon_base_url();
+    let client = reqwest::Client::new();
+
+    let kickoff_url = format!("{}/indexes/{}/reindex", base, index_id);
+    let kickoff_body = serde_json::json!({ "root_path": root_path });
+    let kickoff = client
+        .post(&kickoff_url)
+        .json(&kickoff_body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("could not reach daemon at {base}: {e}"))?;
+
+    if kickoff.status() == reqwest::StatusCode::NOT_FOUND {
+        eprintln!(
+            "{} index '{}' is not registered on the daemon — run `trusty-search init` first",
+            "✗".red(),
+            index_id
+        );
+        std::process::exit(1);
+    }
+    if !kickoff.status().is_success() {
+        anyhow::bail!("daemon returned {} for reindex kickoff", kickoff.status());
+    }
+
+    let kickoff_body: serde_json::Value =
+        kickoff.json().await.unwrap_or_else(|_| serde_json::json!({}));
+    let stream_path = kickoff_body
+        .get("stream_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("/indexes/{}/reindex/stream", index_id));
+    let stream_url = format!("{}{}", base, stream_path);
+
+    let resp = client
+        .get(&stream_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("could not connect to SSE stream {stream_url}: {e}"))?;
+    if !resp.status().is_success() {
+        eprintln!(
+            "{} reindex stream returned {} — daemon may be an older version that doesn't support /reindex/stream",
+            "✗".red(),
+            resp.status()
+        );
+        std::process::exit(1);
+    }
+    let mut resp = resp;
+
+    let mut buf = String::new();
+    let mut done = false;
+    while !done {
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("\n{} stream read error: {e}", "⚠".yellow());
+                break;
+            }
+        };
+        let text = match std::str::from_utf8(&chunk) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        buf.push_str(text);
+
+        // SSE events are separated by blank lines. Process each complete one.
+        while let Some(idx) = buf.find("\n\n") {
+            let event_block: String = buf.drain(..idx + 2).collect();
+            for line in event_block.lines() {
+                let Some(json_str) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
+                    continue;
+                };
+                let evt: serde_json::Value = match serde_json::from_str(json_str.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match evt.get("event").and_then(|v| v.as_str()) {
+                    Some("start") => {
+                        let total = evt
+                            .get("total_files")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        println!(
+                            "{} Reindexing {} files in '{}'…",
+                            "⟳".cyan(),
+                            total,
+                            index_id
+                        );
+                    }
+                    Some("progress") => {
+                        let indexed = evt
+                            .get("indexed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let total = evt
+                            .get("total_files")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1)
+                            .max(1) as usize;
+                        let file = evt.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                        let pct = (indexed * 100) / total;
+                        let trimmed: String = if file.len() > 50 {
+                            let start = file.len() - 50;
+                            format!("…{}", &file[start..])
+                        } else {
+                            file.to_string()
+                        };
+                        print!("\r  [{:>3}%] {}/{} — {:<60}", pct, indexed, total, trimmed);
+                        let _ = std::io::stdout().flush();
+                    }
+                    Some("complete") => {
+                        let indexed = evt
+                            .get("indexed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let chunks = evt
+                            .get("total_chunks")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let ms = evt
+                            .get("elapsed_ms")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let errors = evt
+                            .get("errors")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        println!(
+                            "\n{} Done: {} files, {} chunks in {}ms ({} errors)",
+                            "✓".green(),
+                            indexed,
+                            chunks,
+                            ms,
+                            errors
+                        );
+                        done = true;
+                    }
+                    Some("error") => {
+                        let msg = evt
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let file = evt.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                        eprintln!("\n{}  {}: {}", "⚠".yellow(), file, msg);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -441,21 +662,29 @@ async fn main() -> Result<()> {
         Commands::Add { file } => {
             let (index_id, warned) = resolve_index(&cli.index);
             print_index_header(&index_id, warned);
-            println!("{} [{}] {}", "→".cyan(), index_id, file.display());
-            println!(
-                "{}",
-                "  File add not yet implemented — see issue #3".yellow()
-            );
+            add_path(&index_id, &file).await?;
         }
 
         Commands::Remove { file } => {
             let (index_id, warned) = resolve_index(&cli.index);
             print_index_header(&index_id, warned);
-            println!("{} [{}] {}", "−".red(), index_id, file.display());
-            println!(
-                "{}",
-                "  File remove not yet implemented — see issue #3".yellow()
-            );
+            let base = daemon_base_url();
+            let url = format!("{}/indexes/{}/remove-file", base, index_id);
+            let client = reqwest::Client::new();
+            let body = serde_json::json!({ "path": file.display().to_string() });
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    println!("{} [{}] removed {}", "−".red(), index_id, file.display());
+                }
+                Ok(resp) => {
+                    eprintln!("{} daemon returned {} for {}", "✗".red(), resp.status(), url);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Reindex { path } => {
@@ -465,27 +694,44 @@ async fn main() -> Result<()> {
                 let cwd = std::env::current_dir().unwrap_or_default();
                 detect_project(&cwd).root_path
             });
-            println!(
-                "{} Reindexing {} as '{}'…",
-                "⟳".cyan(),
-                reindex_path.display(),
-                index_id
-            );
-            println!(
-                "{}",
-                "  Reindex not yet implemented — see issue #3".yellow()
-            );
+            run_reindex(&index_id, &reindex_path).await?;
         }
 
         Commands::List => {
-            if cli.json {
-                println!(r#"{{"indexes":[],"note":"not_implemented"}}"#);
-            } else {
-                println!("{}", "Registered indexes:".bold());
-                println!(
-                    "{}",
-                    "  List endpoint not yet implemented — see issue #8".yellow()
-                );
+            let base = daemon_base_url();
+            let url = format!("{}/indexes", base);
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value =
+                        resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+                    if cli.json {
+                        println!("{}", body);
+                    } else {
+                        println!("{}", "Registered indexes:".bold());
+                        let empty: Vec<serde_json::Value> = Vec::new();
+                        let arr = body
+                            .get("indexes")
+                            .and_then(|v| v.as_array())
+                            .unwrap_or(&empty);
+                        if arr.is_empty() {
+                            println!("  {}", "(none)".dimmed());
+                        } else {
+                            for v in arr {
+                                if let Some(s) = v.as_str() {
+                                    println!("  • {}", s);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    eprintln!("{} daemon returned {}", "✗".red(), resp.status());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -573,10 +819,10 @@ async fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let state = trusty_search_service::SearchAppState {
-                registry: trusty_search_core::registry::IndexRegistry::new(),
+            let state = trusty_search_service::SearchAppState::new(
+                trusty_search_core::registry::IndexRegistry::new(),
                 facts,
-            };
+            );
             match trusty_search_service::run_daemon(state, port).await {
                 Ok(()) => {}
                 Err(trusty_search_service::DaemonError::AlreadyRunning(p)) => {
