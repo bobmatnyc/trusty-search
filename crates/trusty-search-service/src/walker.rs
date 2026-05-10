@@ -56,6 +56,14 @@ pub const SKIP_DIRS: &[&str] = &[
     // IDE / metadata
     ".idea",
     ".vscode",
+    // AI tooling / agent metadata — high-density prose that outranks source code in BM25
+    ".claude",
+    ".claude-mpm",
+    ".open-mpm",
+    ".cursor",
+    ".aider",
+    ".continue",
+    ".obsidian",
 ];
 
 /// File extensions that are always binary or non-parseable. These are skipped
