@@ -37,6 +37,12 @@ pub async fn run(server: McpServer) -> Result<()> {
                 format!("invalid JSON-RPC: {e}"),
             ),
         };
+        // Notifications (e.g. `notifications/initialized`) carry no id and
+        // require no reply. Skip emission entirely so we don't desync the
+        // client's request/response pairing.
+        if response.suppress {
+            continue;
+        }
         let serialized = serde_json::to_string(&response)?;
         stdout.write_all(serialized.as_bytes()).await?;
         stdout.write_all(b"\n").await?;

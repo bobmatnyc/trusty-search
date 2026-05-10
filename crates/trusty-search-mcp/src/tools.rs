@@ -54,6 +54,10 @@ pub struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    /// Internal: when true, the stdio loop should drop this response (used
+    /// for JSON-RPC notifications which are id-less and require no reply).
+    #[serde(skip)]
+    pub suppress: bool,
 }
 
 /// JSON-RPC 2.0 error object.
@@ -72,6 +76,7 @@ impl Response {
             id,
             result: Some(result),
             error: None,
+            suppress: false,
         }
     }
 
@@ -85,6 +90,18 @@ impl Response {
                 message: message.into(),
                 data: None,
             }),
+            suppress: false,
+        }
+    }
+
+    /// Sentinel for notifications (no `id`, no reply emitted).
+    pub fn suppressed() -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id: Value::Null,
+            result: None,
+            error: None,
+            suppress: true,
         }
     }
 }
@@ -123,9 +140,13 @@ impl McpServer {
     /// response. Always returns a `Response`; transport / daemon failures are
     /// reported as `INTERNAL_ERROR` rather than panicking.
     pub async fn dispatch(&self, req: Request) -> Response {
+        let is_notification = req.id.is_none();
         let id = req.id.clone().unwrap_or(Value::Null);
 
         if req.jsonrpc != "2.0" {
+            if is_notification {
+                return Response::suppressed();
+            }
             return Response::err(
                 id,
                 error_codes::INVALID_REQUEST,
@@ -133,9 +154,33 @@ impl McpServer {
             );
         }
 
+        // MCP lifecycle methods. `initialize` exchanges capabilities;
+        // `notifications/initialized` confirms the client finished setup
+        // and is silenced (per JSON-RPC 2.0 notification semantics — no
+        // `id`, no reply).
+        match req.method.as_str() {
+            "initialize" => {
+                return Response::ok(
+                    id,
+                    serde_json::json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": {
+                            "name": "trusty-search",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        }
+                    }),
+                );
+            }
+            "notifications/initialized" | "initialized" => {
+                return Response::suppressed();
+            }
+            _ => {}
+        }
+
         // MCP "tools/call" wraps tool name + arguments. We also accept the
         // bare method name for ergonomics (`search_code` directly).
-        let (tool, arguments) = match req.method.as_str() {
+        let (tool, arguments, via_tools_call) = match req.method.as_str() {
             "tools/call" => {
                 let name = req
                     .params
@@ -148,7 +193,7 @@ impl McpServer {
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
                 match name {
-                    Some(n) => (n, args),
+                    Some(n) => (n, args, true),
                     None => {
                         return Response::err(
                             id,
@@ -161,19 +206,42 @@ impl McpServer {
             "tools/list" => {
                 return Response::ok(id, serde_json::json!({ "tools": tool_descriptors() }));
             }
-            other => (other.to_string(), req.params.clone()),
+            other => (other.to_string(), req.params.clone(), false),
         };
 
-        match self.call_tool(&tool, &arguments).await {
-            Ok(value) => Response::ok(id, wrap_text_content(&value)),
-            Err(DispatchError::UnknownTool) => {
-                Response::err(id, error_codes::METHOD_NOT_FOUND, format!("unknown tool: {tool}"))
+        let outcome = self.call_tool(&tool, &arguments).await;
+
+        if via_tools_call {
+            // Per MCP spec, tool execution failures are reported in-band as
+            // `{content: [...], isError: true}` rather than JSON-RPC errors —
+            // the protocol-level error space is reserved for malformed
+            // requests / unknown tools.
+            match outcome {
+                Ok(value) => Response::ok(id, wrap_tool_result(&value, false)),
+                Err(DispatchError::UnknownTool) => Response::err(
+                    id,
+                    error_codes::METHOD_NOT_FOUND,
+                    format!("unknown tool: {tool}"),
+                ),
+                Err(DispatchError::InvalidParams(msg)) => {
+                    Response::ok(id, wrap_tool_error(&msg))
+                }
+                Err(DispatchError::Transport(msg)) => Response::ok(id, wrap_tool_error(&msg)),
             }
-            Err(DispatchError::InvalidParams(msg)) => {
-                Response::err(id, error_codes::INVALID_PARAMS, msg)
-            }
-            Err(DispatchError::Transport(msg)) => {
-                Response::err(id, error_codes::INTERNAL_ERROR, msg)
+        } else {
+            match outcome {
+                Ok(value) => Response::ok(id, wrap_text_content(&value)),
+                Err(DispatchError::UnknownTool) => Response::err(
+                    id,
+                    error_codes::METHOD_NOT_FOUND,
+                    format!("unknown tool: {tool}"),
+                ),
+                Err(DispatchError::InvalidParams(msg)) => {
+                    Response::err(id, error_codes::INVALID_PARAMS, msg)
+                }
+                Err(DispatchError::Transport(msg)) => {
+                    Response::err(id, error_codes::INTERNAL_ERROR, msg)
+                }
             }
         }
     }
@@ -182,10 +250,24 @@ impl McpServer {
         match tool {
             "search_code" => {
                 let index_id = require_str(args, "index_id")?;
-                let body = args
-                    .get("query")
-                    .cloned()
-                    .ok_or_else(|| DispatchError::InvalidParams("missing 'query'".into()))?;
+                // Accept the spec form `{query: string, top_k?: int}` and
+                // also a pre-built `{query: object}` body for callers that
+                // need to pass advanced search parameters directly.
+                let body = match args.get("query") {
+                    Some(Value::Object(_)) => args.get("query").cloned().unwrap(),
+                    Some(Value::String(text)) => {
+                        let mut b = serde_json::json!({ "text": text });
+                        if let Some(k) = args.get("top_k").and_then(Value::as_u64) {
+                            b["top_k"] = Value::from(k);
+                        }
+                        b
+                    }
+                    _ => {
+                        return Err(DispatchError::InvalidParams(
+                            "missing or invalid 'query' (expected string or object)".into(),
+                        ))
+                    }
+                };
                 self.post(&format!("/indexes/{index_id}/search"), &body).await
             }
             "index_file" => {
@@ -333,18 +415,42 @@ fn wrap_text_content(value: &Value) -> Value {
     })
 }
 
+/// Wrap a successful `tools/call` payload with the spec-required
+/// `isError: false` flag so MCP clients can branch without parsing text.
+fn wrap_tool_result(value: &Value, is_error: bool) -> Value {
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        }],
+        "isError": is_error,
+    })
+}
+
+/// Wrap a tool execution failure as `{content, isError: true}` per MCP spec.
+fn wrap_tool_error(msg: &str) -> Value {
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!("Error: {msg}"),
+        }],
+        "isError": true,
+    })
+}
+
 /// Static metadata for `tools/list`. Keep in sync with [`McpServer::call_tool`].
 pub fn tool_descriptors() -> Value {
     serde_json::json!([
         {
             "name": "search_code",
-            "description": "Hybrid BM25 + vector + KG search over an index",
+            "description": "Hybrid code search (BM25+vector+KG)",
             "inputSchema": {
                 "type": "object",
                 "required": ["index_id", "query"],
                 "properties": {
                     "index_id": { "type": "string" },
-                    "query": { "type": "object" }
+                    "query": { "type": "string" },
+                    "top_k": { "type": "integer", "default": 10 }
                 }
             }
         },
@@ -488,12 +594,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_all_ten() {
+    async fn tools_list_returns_all_tools() {
         let server = McpServer::new("http://127.0.0.1:1");
         let resp = server.dispatch(req("tools/list", Value::Null)).await;
         let result = resp.result.expect("expected result");
         let tools = result.get("tools").and_then(Value::as_array).expect("array");
-        assert_eq!(tools.len(), 10);
+        // Issue #36 requires the 6 core MCP tools to be present; we ship
+        // additional tools beyond that minimum.
+        assert!(tools.len() >= 6, "expected at least 6 tools, got {}", tools.len());
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        for required in [
+            "search_code",
+            "index_file",
+            "remove_file",
+            "list_indexes",
+            "create_index",
+            "search_health",
+        ] {
+            assert!(names.contains(&required), "missing required tool: {required}");
+        }
+    }
+
+    /// Issue #36 — verify the `initialize` handshake returns the spec-shaped
+    /// payload Claude Code expects on startup.
+    #[tokio::test]
+    async fn test_initialize_response() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let r = Request {
+            jsonrpc: "2.0".into(),
+            id: Some(Value::from(1u64)),
+            method: "initialize".into(),
+            params: serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0.0.0" }
+            }),
+        };
+        let resp = server.dispatch(r).await;
+        assert!(resp.error.is_none(), "initialize must not error");
+        let result = resp.result.expect("expected result");
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert!(result["capabilities"].get("tools").is_some());
+        assert_eq!(result["serverInfo"]["name"], "trusty-search");
+        assert!(result["serverInfo"]["version"].is_string());
+    }
+
+    /// Issue #36 — `tools/list` must surface every spec-required tool so
+    /// MCP clients can render the full manifest.
+    #[tokio::test]
+    async fn test_tools_list_response() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server.dispatch(req("tools/list", Value::Null)).await;
+        let result = resp.result.expect("expected result");
+        let tools = result.get("tools").and_then(Value::as_array).expect("array");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        for required in [
+            "search_code",
+            "index_file",
+            "remove_file",
+            "list_indexes",
+            "create_index",
+            "search_health",
+        ] {
+            assert!(
+                names.contains(&required),
+                "tools/list missing '{required}' (got {names:?})"
+            );
+        }
+        // Each tool must carry an inputSchema so clients can validate args.
+        for t in tools {
+            assert!(t.get("name").is_some());
+            assert!(t.get("inputSchema").is_some());
+        }
+    }
+
+    /// Issue #36 — JSON-RPC method-not-found surfaces as -32601.
+    #[tokio::test]
+    async fn test_unknown_method_returns_error() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server
+            .dispatch(req("definitely_not_a_method", Value::Null))
+            .await;
+        let err = resp.error.expect("expected error");
+        assert_eq!(err.code, error_codes::METHOD_NOT_FOUND);
+    }
+
+    /// `notifications/initialized` is a JSON-RPC notification — the server
+    /// must NOT emit a response, signalled by `Response::suppress = true`.
+    #[tokio::test]
+    async fn notification_initialized_is_suppressed() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let r = Request {
+            jsonrpc: "2.0".into(),
+            id: None, // notifications carry no id
+            method: "notifications/initialized".into(),
+            params: Value::Null,
+        };
+        let resp = server.dispatch(r).await;
+        assert!(resp.suppress, "notifications must be suppressed");
     }
 
     #[tokio::test]

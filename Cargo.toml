@@ -22,10 +22,12 @@ clap_complete = "4"
 colored = "2"
 indicatif = "0.17"
 dotenvy = "0.15"
+include_dir = "0.7"
+open = "5"
 
 [package]
 name = "trusty-search"
-version = "0.1.34"
+version = "0.1.35"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -55,6 +57,7 @@ reqwest = { workspace = true }
 dirs = "5"
 fs4 = { version = "0.8", features = ["sync"] }
 walkdir = "2"
+open = { workspace = true }
 
 [dev-dependencies]
 walkdir = "2"

@@ -62,6 +62,13 @@ pub struct SearchAppState {
     /// in BM25-only mode — useful for tests that don't want to download the
     /// model. The vector dimensionality is read from the embedder.
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// Port the daemon ended up listening on. Injected into the served
+    /// `index.html` as `window.__DAEMON_PORT__` so the SPA knows which host
+    /// to call when opened directly. `None` falls back to 7878 in the UI.
+    pub daemon_port: Option<u16>,
+    /// Whether `OPENROUTER_API_KEY` is set when the daemon starts. Toggles
+    /// the Chat panel in the SPA via `window.__OPENROUTER_ENABLED__`.
+    pub openrouter_enabled: bool,
 }
 
 impl SearchAppState {
@@ -75,7 +82,16 @@ impl SearchAppState {
             facts,
             reindex_progress: Arc::new(DashMap::new()),
             embedder: None,
+            daemon_port: None,
+            openrouter_enabled: std::env::var("OPENROUTER_API_KEY").is_ok(),
         }
+    }
+
+    /// Builder-style: record the actual port the daemon bound. Used by
+    /// the UI handler to inject `window.__DAEMON_PORT__`.
+    pub fn with_daemon_port(mut self, port: u16) -> Self {
+        self.daemon_port = Some(port);
+        self
     }
 
     /// Builder-style: attach a shared embedder so newly registered indexes
@@ -119,9 +135,15 @@ pub struct RemoveFileRequest {
 ///
 /// Wraps `state` in an `Arc` so every handler clones the pointer cheaply.
 pub fn build_router(state: SearchAppState) -> Router {
+    use crate::ui::{chat_handler, ui_asset_handler, ui_index_handler};
     Router::new()
         .route("/health", get(health_handler))
         .route("/indexes", get(list_indexes_handler).post(create_index_handler))
+        .route("/indexes/:id", delete(delete_index_handler))
+        .route("/ui", get(ui_index_handler))
+        .route("/ui/", get(ui_index_handler))
+        .route("/ui/*path", get(ui_asset_handler))
+        .route("/chat", post(chat_handler))
         .route("/indexes/:id/search", post(search_handler))
         .route("/indexes/:id/search_similar", post(search_similar_handler))
         .route("/indexes/:id/status", get(index_status_handler))
@@ -268,6 +290,23 @@ async fn create_index_handler(
     };
     state.registry.register(handle);
     Ok(Json(serde_json::json!({ "id": req.id, "created": true })))
+}
+
+/// `DELETE /indexes/:id` — drop an index from the registry.
+///
+/// Why: The admin UI needs a way to evict mistakes / abandoned projects
+/// without restarting the daemon. The on-disk redb store (if any) is left
+/// alone — re-registering with the same id reuses it.
+/// What: Calls `IndexRegistry::unregister`. Returns `{removed: bool}`.
+/// Test: register → delete → list returns empty.
+async fn delete_index_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let index_id = IndexId::new(id.clone());
+    let removed = state.registry.unregister(&index_id);
+    state.reindex_progress.remove(&index_id);
+    Json(serde_json::json!({ "id": id, "removed": removed }))
 }
 
 async fn search_handler(
