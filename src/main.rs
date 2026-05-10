@@ -854,22 +854,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if cli.verbose {
-        // SAFETY: env mutation happens before any threads are spawned that
-        // observe it. tracing-subscriber reads RUST_LOG on init below.
-        std::env::set_var("RUST_LOG", "debug");
-    }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_target(false)
-        .compact()
-        .init();
-
-    let no_color = std::env::var("NO_COLOR").is_ok()
-        || std::env::var("TERM").as_deref() == Ok("dumb");
-    if no_color {
-        colored::control::set_override(false);
-    }
+    // Tracing init + NO_COLOR handling via shared trusty-common helpers.
+    trusty_common::init_tracing(if cli.verbose { 2 } else { 0 });
+    trusty_common::maybe_disable_color(false);
 
     match cli.command {
         Commands::Search {

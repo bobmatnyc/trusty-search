@@ -25,90 +25,12 @@
 //! shapes (-32600 invalid request, -32601 method not found, -32602 invalid
 //! params), and dispatch routing without hitting a real daemon.
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// JSON-RPC 2.0 error codes used by this server.
-pub mod error_codes {
-    pub const PARSE_ERROR: i32 = -32700;
-    pub const INVALID_REQUEST: i32 = -32600;
-    pub const METHOD_NOT_FOUND: i32 = -32601;
-    pub const INVALID_PARAMS: i32 = -32602;
-    pub const INTERNAL_ERROR: i32 = -32603;
-}
-
-/// JSON-RPC 2.0 request envelope.
-///
-/// `id` is optional only for notifications; tool calls must supply one.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Request {
-    pub jsonrpc: String,
-    pub id: Option<Value>,
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
-
-/// JSON-RPC 2.0 response envelope. Exactly one of `result` / `error` is set.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Response {
-    pub jsonrpc: String,
-    pub id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
-    /// Internal: when true, the stdio loop should drop this response (used
-    /// for JSON-RPC notifications which are id-less and require no reply).
-    #[serde(skip)]
-    pub suppress: bool,
-}
-
-/// JSON-RPC 2.0 error object.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JsonRpcError {
-    pub code: i32,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-}
-
-impl Response {
-    pub fn ok(id: Value, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(result),
-            error: None,
-            suppress: false,
-        }
-    }
-
-    pub fn err(id: Value, code: i32, message: impl Into<String>) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: None,
-            error: Some(JsonRpcError {
-                code,
-                message: message.into(),
-                data: None,
-            }),
-            suppress: false,
-        }
-    }
-
-    /// Sentinel for notifications (no `id`, no reply emitted).
-    pub fn suppressed() -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id: Value::Null,
-            result: None,
-            error: None,
-            suppress: true,
-        }
-    }
-}
+// JSON-RPC 2.0 primitives moved to the shared `trusty-mcp-core` crate so
+// trusty-memory and trusty-search agree on the wire shape. Re-exported here
+// to keep `pub use` consumers (and `crate::tools::error_codes` etc.) working.
+pub use trusty_mcp_core::{error_codes, initialize_response, JsonRpcError, Request, Response};
 
 /// Tool dispatcher backed by an HTTP client targeting the daemon.
 #[derive(Clone)]
@@ -145,9 +67,9 @@ impl McpServer {
     /// reported as `INTERNAL_ERROR` rather than panicking.
     pub async fn dispatch(&self, req: Request) -> Response {
         let is_notification = req.id.is_none();
-        let id = req.id.clone().unwrap_or(Value::Null);
+        let id = req.id.clone();
 
-        if req.jsonrpc != "2.0" {
+        if req.jsonrpc.as_deref() != Some("2.0") {
             if is_notification {
                 return Response::suppressed();
             }
@@ -166,14 +88,7 @@ impl McpServer {
             "initialize" => {
                 return Response::ok(
                     id,
-                    serde_json::json!({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": { "tools": {} },
-                        "serverInfo": {
-                            "name": "trusty-search",
-                            "version": env!("CARGO_PKG_VERSION"),
-                        }
-                    }),
+                    initialize_response("trusty-search", env!("CARGO_PKG_VERSION"), None),
                 );
             }
             "notifications/initialized" | "initialized" => {
@@ -184,15 +99,14 @@ impl McpServer {
 
         // MCP "tools/call" wraps tool name + arguments. We also accept the
         // bare method name for ergonomics (`search_code` directly).
+        let params = req.params.clone().unwrap_or(Value::Null);
         let (tool, arguments, via_tools_call) = match req.method.as_str() {
             "tools/call" => {
-                let name = req
-                    .params
+                let name = params
                     .get("name")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let args = req
-                    .params
+                let args = params
                     .get("arguments")
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
@@ -210,7 +124,7 @@ impl McpServer {
             "tools/list" => {
                 return Response::ok(id, serde_json::json!({ "tools": tool_descriptors() }));
             }
-            other => (other.to_string(), req.params.clone(), false),
+            other => (other.to_string(), params, false),
         };
 
         let outcome = self.call_tool(&tool, &arguments).await;
@@ -657,10 +571,10 @@ mod tests {
 
     fn req(method: &str, params: Value) -> Request {
         Request {
-            jsonrpc: "2.0".into(),
+            jsonrpc: Some("2.0".into()),
             id: Some(Value::from(1u64)),
             method: method.into(),
-            params,
+            params: Some(params),
         }
     }
 
@@ -668,15 +582,15 @@ mod tests {
     async fn rejects_wrong_jsonrpc_version() {
         let server = McpServer::new("http://127.0.0.1:1");
         let r = Request {
-            jsonrpc: "1.0".into(),
+            jsonrpc: Some("1.0".into()),
             id: Some(Value::from(7u64)),
             method: "search_health".into(),
-            params: Value::Null,
+            params: None,
         };
         let resp = server.dispatch(r).await;
         let err = resp.error.expect("expected error");
         assert_eq!(err.code, error_codes::INVALID_REQUEST);
-        assert_eq!(resp.id, Value::from(7u64));
+        assert_eq!(resp.id, Some(Value::from(7u64)));
     }
 
     #[tokio::test]
@@ -726,14 +640,14 @@ mod tests {
     async fn test_initialize_response() {
         let server = McpServer::new("http://127.0.0.1:1");
         let r = Request {
-            jsonrpc: "2.0".into(),
+            jsonrpc: Some("2.0".into()),
             id: Some(Value::from(1u64)),
             method: "initialize".into(),
-            params: serde_json::json!({
+            params: Some(serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": { "name": "test", "version": "0.0.0" }
-            }),
+            })),
         };
         let resp = server.dispatch(r).await;
         assert!(resp.error.is_none(), "initialize must not error");
@@ -793,10 +707,10 @@ mod tests {
     async fn notification_initialized_is_suppressed() {
         let server = McpServer::new("http://127.0.0.1:1");
         let r = Request {
-            jsonrpc: "2.0".into(),
+            jsonrpc: Some("2.0".into()),
             id: None, // notifications carry no id
             method: "notifications/initialized".into(),
-            params: Value::Null,
+            params: None,
         };
         let resp = server.dispatch(r).await;
         assert!(resp.suppress, "notifications must be suppressed");

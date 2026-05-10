@@ -5,3 +5,7 @@ search.pid
 trusty-search.pid
 .DS_Store
 *.swp
+
+# fastembed model cache (large, auto-downloaded)
+.fastembed_cache/
+**/.fastembed_cache/
