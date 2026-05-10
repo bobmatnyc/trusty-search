@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.1.46"
+version = "0.1.48"
 dependencies = [
  "anyhow",
  "axum",

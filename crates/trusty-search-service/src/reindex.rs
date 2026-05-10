@@ -135,7 +135,7 @@ impl Default for ReindexProgress {
 ///
 /// Returns immediately; the caller (the HTTP handler) drops its reference and
 /// the task runs to completion.
-pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
+pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, force: bool) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
 
@@ -151,10 +151,19 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
                 "total_files": total,
                 "index_id": index_id.0,
                 "root_path": root,
+                "force": force,
             }))
             .await;
 
         let hashes = hashes_for(&index_id);
+        // `--force` wipes the per-index content-hash cache so every file is
+        // re-parsed, re-embedded, and re-committed even if its bytes haven't
+        // changed since the last reindex in this daemon's lifetime. Without
+        // this, the hash-skip check below silently turns `--force` into a
+        // no-op on a warm daemon.
+        if force {
+            hashes.clear();
+        }
 
         // Process files in batches. Each batch:
         //  1. Reads files concurrently (tokio::fs::read_to_string).
@@ -373,7 +382,7 @@ mod tests {
             root_path: root.clone(),
         });
         let progress = Arc::new(ReindexProgress::new());
-        spawn_reindex(handle, progress.clone());
+        spawn_reindex(handle, progress.clone(), false);
 
         // Wait up to 10s for completion.
         for _ in 0..100 {

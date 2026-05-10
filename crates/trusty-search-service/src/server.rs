@@ -525,6 +525,11 @@ async fn quality_handler(
 pub struct ReindexRequest {
     #[serde(default)]
     pub root_path: Option<std::path::PathBuf>,
+    /// When `true`, the daemon clears the per-index content-hash cache before
+    /// walking the tree, forcing every file to be re-embedded even if its
+    /// content hasn't changed. Set by `trusty-search index --force`.
+    #[serde(default)]
+    pub force: Option<bool>,
 }
 
 async fn reindex_handler(
@@ -538,7 +543,9 @@ async fn reindex_handler(
     // If caller supplied a root_path and the stored handle doesn't have one
     // (or differs), re-register with the new path. We can't mutate the
     // existing Arc in place, but registering replaces the entry.
+    let mut force = false;
     if let Some(Json(req)) = body {
+        force = req.force.unwrap_or(false);
         if let Some(new_root) = req.root_path {
             if handle.root_path.as_os_str().is_empty() || handle.root_path != new_root {
                 let indexer = Arc::clone(&handle.indexer);
@@ -558,7 +565,7 @@ async fn reindex_handler(
         .reindex_progress
         .insert(index_id.clone(), Arc::clone(&progress));
 
-    spawn_reindex(handle, progress);
+    spawn_reindex(handle, progress, force);
 
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,

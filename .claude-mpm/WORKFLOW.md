@@ -15,7 +15,8 @@ Every feature/fix follows this exact sequence:
 
 - Skip Research phase when: implementing a well-defined ticket with clear acceptance criteria
 - Skip QA phase when: engineer ran full test suite (`cargo test --workspace`) and passes
-- Never skip Commit or Patch bump steps
+- **Never skip**: Commit, Patch bump, or `cargo install --path .` (reinstall) steps
+- Reinstall is mandatory after every patch bump — the installed binary must always match the source version
 
 ## Commit Message Format
 

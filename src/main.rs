@@ -611,6 +611,11 @@ struct ReindexOptions {
     /// Chunk count snapshot taken before the reindex started, used to print
     /// "(was N)" in the final verify message.
     prior_chunk_count: Option<u64>,
+    /// Forwarded to the daemon as `"force": true` in the reindex kickoff body.
+    /// Set by `index --force` so the daemon clears its content-hash cache and
+    /// re-embeds every file (otherwise unchanged files would be skipped on a
+    /// warm daemon and `--force` would have no effect).
+    force: bool,
 }
 
 /// Outcome of a reindex run, captured for the post-verify step and the final
@@ -644,6 +649,7 @@ async fn run_reindex_force(index_id: &str, root_path: &std::path::Path) -> Resul
     let opts = ReindexOptions {
         verify_after: true,
         prior_chunk_count: prior,
+        force: true,
     };
     run_reindex_with(index_id, root_path, opts).await.map(|_| ())
 }
@@ -661,7 +667,10 @@ async fn run_reindex_with(
     let client = trusty_common::server::daemon_http_client()?;
 
     let kickoff_url = format!("{}/indexes/{}/reindex", base, index_id);
-    let kickoff_body = serde_json::json!({ "root_path": root_path });
+    let kickoff_body = serde_json::json!({
+        "root_path": root_path,
+        "force": opts.force,
+    });
     let kickoff = client
         .post(&kickoff_url)
         .json(&kickoff_body)
