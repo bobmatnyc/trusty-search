@@ -21,6 +21,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use colored::Colorize;
 use detect::{detect_project, DetectionMethod};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::io;
 
 /// Machine-wide hybrid code search — BM25 + vector + knowledge graph.
@@ -111,9 +112,34 @@ enum Commands {
     #[command(alias = "st", display_order = 3)]
     Status,
 
-    /// Register current directory as a named index  [alias: i]
+    /// Register and index a project in one step  [alias: idx]
     ///
-    /// Creates a .trusty-search marker file and registers with the daemon.
+    /// Registers the index with the daemon if needed, then runs a reindex
+    /// with a live progress bar. Skips the reindex if the index already has
+    /// chunks indexed (use --force to override).
+    ///
+    /// Examples:
+    ///   trusty-search index                   # CWD, name from basename
+    ///   trusty-search index ~/Projects/myapp
+    ///   trusty-search index --force           # full reindex even if up-to-date
+    #[command(alias = "idx", display_order = 4)]
+    Index {
+        /// Directory to register and index (default: CWD)
+        path: Option<std::path::PathBuf>,
+
+        /// Index name (default: directory basename)
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Force a full reindex even if the index already has chunks
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Register current directory as a named index (see `index`)
+    ///
+    /// Kept for backward compatibility. Prefer `trusty-search index`, which
+    /// registers AND indexes in one step.
     ///
     /// Examples:
     ///   trusty-search init
@@ -152,7 +178,10 @@ enum Commands {
         file: std::path::PathBuf,
     },
 
-    /// Full reindex of current project (fire-and-forget)
+    /// Full reindex of current project (see `index --force`)
+    ///
+    /// Streams progress via SSE and renders a live progress bar. Prefer
+    /// `trusty-search index --force` which also handles registration.
     ///
     /// Examples:
     ///   trusty-search reindex
@@ -432,11 +461,42 @@ async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Drive a reindex: POST /reindex, then connect to the SSE stream and render
-/// progress.
-async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
-    use std::io::Write;
+/// Format a millisecond elapsed time as `Xm Ys` (or `Ys` if < 1 minute).
+fn fmt_elapsed(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else if secs > 0 {
+        format!("{}s", secs)
+    } else {
+        format!("{}ms", ms)
+    }
+}
 
+/// Build the indicatif progress bar used by reindex.
+///
+/// Why: a real terminal progress bar with ETA gives the user immediate
+/// feedback on long-running 10k+ file reindex jobs. On non-TTY (piped) output
+/// indicatif degrades to plain periodic prints automatically.
+fn make_reindex_progress_bar(index_id: &str, total_files: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total_files.max(1));
+    // Why: if we can't parse the template, fall back to default style rather
+    // than panic — losing ETA is better than aborting the command.
+    let style = ProgressStyle::with_template(
+        "{spinner:.cyan} Indexing {msg} [{bar:40.cyan/blue}] {pos}/{len} files ({percent}%) — {eta} remaining",
+    )
+    .map(|s| s.progress_chars("█░ "))
+    .ok();
+    if let Some(s) = style {
+        pb.set_style(s);
+    }
+    pb.set_message(index_id.to_string());
+    pb
+}
+
+/// Drive a reindex: POST /reindex, then connect to the SSE stream and render
+/// progress with an indicatif progress bar.
+async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
     let base = daemon_base_url();
     let client = reqwest::Client::new();
 
@@ -451,7 +511,7 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
 
     if kickoff.status() == reqwest::StatusCode::NOT_FOUND {
         eprintln!(
-            "{} index '{}' is not registered on the daemon — run `trusty-search init` first",
+            "{} index '{}' is not registered on the daemon — run `trusty-search index` first",
             "✗".red(),
             index_id
         );
@@ -485,6 +545,10 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
     }
     let mut resp = resp;
 
+    // Why: we build the progress bar lazily because the `start` SSE event
+    // carries the authoritative `total_files`. Until then we have nothing
+    // sensible to plug into `ProgressBar::new`.
+    let mut pb: Option<ProgressBar> = None;
     let mut buf = String::new();
     let mut done = false;
     while !done {
@@ -492,7 +556,11 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
             Ok(Some(c)) => c,
             Ok(None) => break,
             Err(e) => {
-                eprintln!("\n{} stream read error: {e}", "⚠".yellow());
+                if let Some(p) = pb.as_ref() {
+                    p.abandon_with_message(format!("stream read error: {e}"));
+                } else {
+                    eprintln!("\n{} stream read error: {e}", "⚠".yellow());
+                }
                 break;
             }
         };
@@ -519,33 +587,28 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
                             .get("total_files")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        println!(
-                            "{} Reindexing {} files in '{}'…",
-                            "⟳".cyan(),
-                            total,
-                            index_id
-                        );
+                        // Replace any previous bar (defensive: shouldn't happen).
+                        if let Some(p) = pb.take() {
+                            p.finish_and_clear();
+                        }
+                        pb = Some(make_reindex_progress_bar(index_id, total));
                     }
                     Some("progress") => {
                         let indexed = evt
                             .get("indexed")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
+                            .unwrap_or(0);
                         let total = evt
                             .get("total_files")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(1)
-                            .max(1) as usize;
-                        let file = evt.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                        let pct = (indexed * 100) / total;
-                        let trimmed: String = if file.len() > 50 {
-                            let start = file.len() - 50;
-                            format!("…{}", &file[start..])
-                        } else {
-                            file.to_string()
-                        };
-                        print!("\r  [{:>3}%] {}/{} — {:<60}", pct, indexed, total, trimmed);
-                        let _ = std::io::stdout().flush();
+                            .unwrap_or(0);
+                        // Lazy-init in case daemon skips `start` event.
+                        let bar = pb
+                            .get_or_insert_with(|| make_reindex_progress_bar(index_id, total.max(1)));
+                        if total > 0 && bar.length() != Some(total) {
+                            bar.set_length(total);
+                        }
+                        bar.set_position(indexed);
                     }
                     Some("complete") => {
                         let indexed = evt
@@ -564,14 +627,31 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
                             .get("errors")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        println!(
-                            "\n{} Done: {} files, {} chunks in {}ms ({} errors)",
-                            "✓".green(),
-                            indexed,
-                            chunks,
-                            ms,
-                            errors
-                        );
+                        let elapsed = fmt_elapsed(ms);
+                        let final_msg = if errors > 0 {
+                            format!(
+                                "{} Indexed {} files → {} chunks  [took {}, {} errors]",
+                                "✓".green(),
+                                indexed,
+                                chunks,
+                                elapsed,
+                                errors
+                            )
+                        } else {
+                            format!(
+                                "{} Indexed {} files → {} chunks  [took {}]",
+                                "✓".green(),
+                                indexed,
+                                chunks,
+                                elapsed
+                            )
+                        };
+                        if let Some(bar) = pb.take() {
+                            bar.set_position(indexed);
+                            bar.finish_with_message(final_msg);
+                        } else {
+                            println!("{final_msg}");
+                        }
                         done = true;
                     }
                     Some("error") => {
@@ -580,7 +660,12 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
                         let file = evt.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                        eprintln!("\n{}  {}: {}", "⚠".yellow(), file, msg);
+                        // Use `println` on the bar so the line doesn't trample the bar.
+                        if let Some(bar) = pb.as_ref() {
+                            bar.println(format!("{}  {}: {}", "⚠".yellow(), file, msg));
+                        } else {
+                            eprintln!("{}  {}: {}", "⚠".yellow(), file, msg);
+                        }
                     }
                     _ => {}
                 }
@@ -588,7 +673,64 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
         }
     }
 
+    if let Some(bar) = pb.take() {
+        // If we never saw `complete`, abandon the bar with a clear note.
+        if !bar.is_finished() {
+            bar.abandon_with_message(format!(
+                "{} Reindex stream ended without completion event",
+                "⚠".yellow()
+            ));
+        }
+    }
+
     Ok(())
+}
+
+/// Register an index with the daemon (idempotent).
+///
+/// Why: factored out of `Init` and `Index` because both flows need the same
+/// "POST /indexes, parse `created`" dance.
+/// What: returns `Ok((created, daemon_reachable))`. `daemon_reachable=false`
+/// surfaces network failures distinctly from "registered but already existed".
+async fn register_index_with_daemon(
+    index_name: &str,
+    project_path: &std::path::Path,
+) -> Result<(bool, bool)> {
+    let base = daemon_base_url();
+    let client = reqwest::Client::new();
+    let create_url = format!("{}/indexes", base);
+    let create_body = serde_json::json!({
+        "id": index_name,
+        "root_path": project_path,
+    });
+    match client.post(&create_url).json(&create_body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value =
+                resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+            let created = body
+                .get("created")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Ok((created, true))
+        }
+        Ok(resp) => {
+            anyhow::bail!("daemon returned {} for POST /indexes", resp.status());
+        }
+        Err(_) => Ok((false, false)),
+    }
+}
+
+/// Fetch chunk count for an index via /status. Returns `None` if the daemon
+/// is unreachable or the index isn't registered.
+async fn fetch_chunk_count(index_id: &str) -> Option<u64> {
+    let base = daemon_base_url();
+    let url = format!("{}/indexes/{}/status", base, index_id);
+    let resp = reqwest::get(&url).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("chunk_count").and_then(|v| v.as_u64())
 }
 
 // ── Convert helpers (mcp-vector-search → trusty-search migration) ─────────
@@ -1040,48 +1182,31 @@ async fn main() -> Result<()> {
             // Why: previously we printed "Registered" without contacting the daemon
             // — misleading because the daemon had no idea about this index.
             // Now: POST /indexes (idempotent) and report truthfully.
-            let base = daemon_base_url();
-            let client = reqwest::Client::new();
-            let create_url = format!("{}/indexes", base);
-            let create_body = serde_json::json!({
-                "id": index_name,
-                "root_path": project_path,
-            });
-            match client.post(&create_url).json(&create_body).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value =
-                        resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
-                    let created = body
-                        .get("created")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if created {
-                        println!(
-                            "{} Registered '{}' with daemon at {}",
-                            "✓".green(),
-                            index_name.bold(),
-                            project_path.display()
-                        );
-                    } else {
-                        println!(
-                            "{} '{}' already registered with daemon",
-                            "↻".cyan(),
-                            index_name.bold()
-                        );
-                    }
+            match register_index_with_daemon(&index_name, &project_path).await {
+                Ok((true, _)) => {
+                    println!(
+                        "{} Registered '{}' with daemon at {}",
+                        "✓".green(),
+                        index_name.bold(),
+                        project_path.display()
+                    );
                     println!(
                         "  Run {} to index this project.",
-                        "trusty-search reindex".cyan()
+                        "trusty-search index".cyan()
                     );
                 }
-                Ok(resp) => {
-                    eprintln!(
-                        "{} daemon returned {} for /indexes — index will need to be re-registered when daemon is healthy",
-                        "⚠".yellow(),
-                        resp.status()
+                Ok((false, true)) => {
+                    println!(
+                        "{} '{}' already registered with daemon",
+                        "↻".cyan(),
+                        index_name.bold()
+                    );
+                    println!(
+                        "  Run {} to index this project.",
+                        "trusty-search index".cyan()
                     );
                 }
-                Err(_) => {
+                Ok((_, false)) => {
                     println!(
                         "{} Daemon not running — index will be created when daemon starts.",
                         "·".dimmed()
@@ -1089,10 +1214,79 @@ async fn main() -> Result<()> {
                     println!(
                         "  Start with {} then run {}.",
                         "trusty-search start".cyan(),
-                        "trusty-search reindex".cyan()
+                        "trusty-search index".cyan()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} {} — index will need to be re-registered when daemon is healthy",
+                        "⚠".yellow(),
+                        e
                     );
                 }
             }
+        }
+
+        Commands::Index { path, name, force } => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let project_path = path.unwrap_or(cwd);
+            let index_name = name.unwrap_or_else(|| {
+                project_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+
+            // 1. Register with daemon (idempotent). Surface a clear error if
+            //    the daemon is unreachable — `index` is useless without it.
+            let (created, daemon_reachable) =
+                match register_index_with_daemon(&index_name, &project_path).await {
+                    Ok(tuple) => tuple,
+                    Err(e) => {
+                        eprintln!("{} {}", "✗".red(), e);
+                        std::process::exit(1);
+                    }
+                };
+            if !daemon_reachable {
+                eprintln!(
+                    "{} Daemon not reachable at {}. Start it with {}.",
+                    "✗".red(),
+                    daemon_base_url().cyan(),
+                    "trusty-search start".cyan(),
+                );
+                std::process::exit(1);
+            }
+
+            if created {
+                println!(
+                    "{} '{}' registered at {}",
+                    "✓".green(),
+                    index_name.bold(),
+                    project_path.display()
+                );
+            }
+
+            // 2. Skip reindex if already populated, unless --force.
+            //    `chunk_count > 0` is the simplest "is this index already
+            //    populated?" proxy that doesn't require new daemon endpoints.
+            if !force {
+                if let Some(chunks) = fetch_chunk_count(&index_name).await {
+                    if chunks > 0 {
+                        println!(
+                            "{} '{}' is up to date ({} chunks indexed). Use {} to force a full reindex.",
+                            "✓".green(),
+                            index_name.bold(),
+                            chunks,
+                            "--force".cyan()
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
+            // 3. Run reindex with progress bar.
+            run_reindex(&index_name, &project_path).await?;
         }
 
         Commands::Add { file } => {
