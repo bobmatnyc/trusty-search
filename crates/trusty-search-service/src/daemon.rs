@@ -33,7 +33,7 @@ use fs4::FileExt;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    net::{SocketAddr, TcpListener as StdTcpListener},
+    net::SocketAddr,
     path::PathBuf,
 };
 use thiserror::Error;
@@ -81,22 +81,27 @@ pub struct DaemonHandle {
 
 /// Try to bind a `TcpListener` starting at `start_port`, walking forward up
 /// to `max_attempts` ports. `0` means "let the OS pick" — handled directly.
-fn bind_with_auto_port(start_port: u16, max_attempts: u16) -> Result<StdTcpListener, DaemonError> {
-    if start_port == 0 {
-        return StdTcpListener::bind("127.0.0.1:0").map_err(DaemonError::Io);
-    }
-    let mut last: Option<std::io::Error> = None;
-    for offset in 0..max_attempts {
-        let port = start_port.saturating_add(offset);
-        match StdTcpListener::bind(("127.0.0.1", port)) {
-            Ok(l) => return Ok(l),
-            Err(e) => last = Some(e),
-        }
-    }
-    if let Some(e) = last {
-        tracing::warn!("auto-port exhausted from {start_port}: {e}");
-    }
-    Err(DaemonError::NoFreePort(start_port))
+///
+/// Why: thin wrapper around `trusty_common::bind_with_auto_port` so the
+/// daemon and the rest of the trusty-* family share the same port-walk
+/// behaviour. We keep the wrapper to (a) preserve the `NoFreePort` typed
+/// error this crate exposes and (b) translate the shared async helper into
+/// a `DaemonError` boundary.
+async fn bind_with_auto_port(
+    start_port: u16,
+    max_attempts: u16,
+) -> Result<TcpListener, DaemonError> {
+    let addr: SocketAddr = format!("127.0.0.1:{start_port}")
+        .parse()
+        .map_err(|e: std::net::AddrParseError| {
+            DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+    trusty_common::bind_with_auto_port(addr, max_attempts)
+        .await
+        .map_err(|e| {
+            tracing::warn!("auto-port exhausted from {start_port}: {e:#}");
+            DaemonError::NoFreePort(start_port)
+        })
 }
 
 /// Check whether a daemon is already running without starting one.
@@ -181,9 +186,8 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     let _ = lock_file.set_len(0);
     let _ = lock_file.write_all(pid_string.as_bytes());
 
-    let std_listener = bind_with_auto_port(requested_port, 64)?;
-    std_listener.set_nonblocking(true)?;
-    let addr = std_listener.local_addr()?;
+    let listener = bind_with_auto_port(requested_port, 64).await?;
+    let addr = listener.local_addr()?;
     let port = addr.port();
 
     // Atomically write the port file (write + rename).
@@ -194,7 +198,6 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     // the state right before building the router.
     let state = state.with_daemon_port(port);
     let router = build_router(state);
-    let listener = TcpListener::from_std(std_listener)?;
 
     tracing::info!("daemon listening on {addr} (lock {})", lock_path.display());
 
@@ -245,18 +248,19 @@ mod tests {
         assert!(matches!(err, DaemonError::AlreadyRunning(_)));
     }
 
-    #[test]
-    fn auto_port_walks_forward() {
+    #[tokio::test]
+    async fn auto_port_walks_forward() {
         // Bind a port, then ask the auto-port allocator to start there.
         let occupied = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let occupied_port = occupied.local_addr().unwrap().port();
-        let next = bind_with_auto_port(occupied_port, 64).unwrap();
+        let next = bind_with_auto_port(occupied_port, 64).await.unwrap();
         assert_ne!(next.local_addr().unwrap().port(), occupied_port);
     }
 
-    #[test]
-    fn auto_port_zero_uses_os() {
-        let l = bind_with_auto_port(0, 1).unwrap();
+    #[tokio::test]
+    async fn auto_port_zero_uses_os() {
+        // Note: port 0 is special — the shared helper delegates to the OS.
+        let l = bind_with_auto_port(0, 1).await.unwrap();
         assert!(l.local_addr().unwrap().port() > 0);
     }
 }

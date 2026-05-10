@@ -24,6 +24,9 @@ indicatif = "0.17"
 dotenvy = "0.15"
 include_dir = "0.7"
 open = "5"
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
+trusty-common = { path = "../trusty-common/crates/trusty-common" }
 
 [package]
 name = "trusty-search"
@@ -41,6 +44,7 @@ path = "src/main.rs"
 trusty-search-core = { path = "crates/trusty-search-core" }
 trusty-search-service = { path = "crates/trusty-search-service" }
 trusty-search-mcp = { path = "crates/trusty-search-mcp" }
+trusty-common = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
