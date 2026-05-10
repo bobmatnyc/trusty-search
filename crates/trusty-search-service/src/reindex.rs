@@ -14,6 +14,7 @@
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
 use crate::walker::{should_skip_content, walk_source_files};
+use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -84,7 +85,7 @@ pub enum ReindexStatus {
 /// `SearchAppState::reindex_progress` so concurrent SSE subscribers can read
 /// the same snapshot without coordinating.
 pub struct ReindexProgress {
-    pub status: parking_lot_like::AtomicCell<ReindexStatus>,
+    pub status: AtomicCell<ReindexStatus>,
     pub total_files: std::sync::atomic::AtomicUsize,
     pub indexed: std::sync::atomic::AtomicUsize,
     pub total_chunks: std::sync::atomic::AtomicUsize,
@@ -98,57 +99,11 @@ pub struct ReindexProgress {
     pub sender: broadcast::Sender<String>,
 }
 
-/// Tiny in-module helper to avoid pulling parking_lot. We only need atomic
-/// load/store of an enum, so `AtomicU8` + From/Into is enough.
-mod parking_lot_like {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    pub struct AtomicCell<T> {
-        inner: AtomicU8,
-        _marker: std::marker::PhantomData<T>,
-    }
-
-    impl<T: Copy + Into<u8> + From<u8>> AtomicCell<T> {
-        pub fn new(value: T) -> Self {
-            Self {
-                inner: AtomicU8::new(value.into()),
-                _marker: std::marker::PhantomData,
-            }
-        }
-        pub fn load(&self) -> T {
-            T::from(self.inner.load(Ordering::Acquire))
-        }
-        pub fn store(&self, value: T) {
-            self.inner.store(value.into(), Ordering::Release);
-        }
-    }
-}
-
-impl From<ReindexStatus> for u8 {
-    fn from(s: ReindexStatus) -> u8 {
-        match s {
-            ReindexStatus::Running => 0,
-            ReindexStatus::Complete => 1,
-            ReindexStatus::Failed => 2,
-        }
-    }
-}
-
-impl From<u8> for ReindexStatus {
-    fn from(v: u8) -> Self {
-        match v {
-            1 => ReindexStatus::Complete,
-            2 => ReindexStatus::Failed,
-            _ => ReindexStatus::Running,
-        }
-    }
-}
-
 impl ReindexProgress {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
-            status: parking_lot_like::AtomicCell::new(ReindexStatus::Running),
+            status: AtomicCell::new(ReindexStatus::Running),
             total_files: Default::default(),
             indexed: Default::default(),
             total_chunks: Default::default(),
