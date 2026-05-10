@@ -136,7 +136,7 @@ pub struct RemoveFileRequest {
 /// Wraps `state` in an `Arc` so every handler clones the pointer cheaply.
 pub fn build_router(state: SearchAppState) -> Router {
     use crate::ui::{chat_handler, ui_asset_handler, ui_index_handler};
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health_handler))
         .route("/indexes", get(list_indexes_handler).post(create_index_handler))
         .route("/indexes/:id", delete(delete_index_handler))
@@ -156,7 +156,10 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/:id/quality", get(quality_handler))
         .route("/facts", get(list_facts_handler).post(upsert_fact_handler))
         .route("/facts/:id", delete(delete_fact_handler))
-        .with_state(Arc::new(state))
+        .with_state(Arc::new(state));
+    // Standard middleware stack (CORS, tracing, gzip) lives in trusty-common
+    // so every trusty-* daemon ships with the same defaults.
+    trusty_common::server::with_standard_middleware(router)
 }
 
 #[derive(Deserialize)]

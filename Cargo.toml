@@ -33,9 +33,18 @@ trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "t
 trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
 trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.0" }
 
+# Local development override: use the in-tree trusty-common workspace so
+# changes here are picked up without a release cycle. Cargo requires every
+# crate exported from the patched source to be listed, even if not all are
+# consumed.
+[patch."https://github.com/bobmatnyc/trusty-common"]
+trusty-common = { path = "../trusty-common/crates/trusty-common" }
+trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+
 [package]
 name = "trusty-search"
-version = "0.1.43"
+version = "0.1.44"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -68,6 +77,8 @@ fs4 = { version = "0.8", features = ["sync"] }
 walkdir = "2"
 open = { workspace = true }
 libc = "0.2"
+eventsource-stream = "0.2"
+futures-util = "0.3"
 
 [dev-dependencies]
 walkdir = "2"
