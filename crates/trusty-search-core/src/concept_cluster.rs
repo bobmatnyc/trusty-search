@@ -74,24 +74,7 @@ fn doc_comment(content: &str) -> Option<String> {
     }
 }
 
-/// Cosine similarity between two equal-length vectors. Returns 0.0 when
-/// either side is the zero vector (avoids NaN from a 0/0 normalization).
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut dot = 0.0_f32;
-    let mut na = 0.0_f32;
-    let mut nb = 0.0_f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na.sqrt() * nb.sqrt())
-    }
-}
+use crate::mmr::cosine_similarity as cosine;
 
 /// Slugify a label for use in stable entity ids: lowercase ASCII, non-alnum → `-`.
 fn slugify(s: &str) -> String {
