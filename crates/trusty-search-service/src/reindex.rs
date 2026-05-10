@@ -14,11 +14,43 @@
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
 use crate::walker::walk_source_files;
+use dashmap::DashMap;
 use serde::Serialize;
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
 use trusty_search_core::registry::{IndexHandle, IndexId};
+
+/// Files per parallel batch. Each batch is parsed in parallel via rayon and
+/// embedded in a single ONNX call (256 chunks at a time inside the batch).
+const REINDEX_BATCH_SIZE: usize = 32;
+
+/// Per-index, per-process content-hash cache. Used to skip reindexing files
+/// whose content hasn't changed since the last reindex in this daemon's
+/// lifetime. Survives across `POST /indexes/:id/reindex` calls but not daemon
+/// restarts (acceptable: cold start re-embeds everything anyway, and on warm
+/// daemons the user expects "skip unchanged" behaviour).
+fn file_hashes() -> &'static DashMap<IndexId, Arc<DashMap<PathBuf, u64>>> {
+    static FILE_HASHES: OnceLock<DashMap<IndexId, Arc<DashMap<PathBuf, u64>>>> =
+        OnceLock::new();
+    FILE_HASHES.get_or_init(DashMap::new)
+}
+
+fn hashes_for(id: &IndexId) -> Arc<DashMap<PathBuf, u64>> {
+    file_hashes()
+        .entry(id.clone())
+        .or_insert_with(|| Arc::new(DashMap::new()))
+        .clone()
+}
+
+fn hash_content(content: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    content.hash(&mut h);
+    h.finish()
+}
 
 /// Capacity of the per-reindex broadcast channel. Lagged subscribers will
 /// drop events older than this — the SSE handler also replays from the buffer
@@ -42,6 +74,8 @@ pub struct ReindexProgress {
     pub indexed: std::sync::atomic::AtomicUsize,
     pub total_chunks: std::sync::atomic::AtomicUsize,
     pub errors: std::sync::atomic::AtomicUsize,
+    /// Files skipped because their content hash matched the previous reindex.
+    pub skipped: std::sync::atomic::AtomicUsize,
     /// Append-only log of JSON-encoded events. Replayed to late SSE
     /// subscribers so they don't miss earlier `start` / `progress` events.
     pub events: Arc<Mutex<Vec<String>>>,
@@ -104,6 +138,7 @@ impl ReindexProgress {
             indexed: Default::default(),
             total_chunks: Default::default(),
             errors: Default::default(),
+            skipped: Default::default(),
             events: Arc::new(Mutex::new(Vec::new())),
             sender,
         }
@@ -131,14 +166,14 @@ impl Default for ReindexProgress {
 /// the task runs to completion.
 pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
     tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+
         let started = Instant::now();
         let root = handle.root_path.clone();
         let index_id: IndexId = handle.id.clone();
         let walk = walk_source_files(&root);
         let total = walk.files.len();
-        progress
-            .total_files
-            .store(total, std::sync::atomic::Ordering::Release);
+        progress.total_files.store(total, Ordering::Release);
         progress
             .push(serde_json::json!({
                 "event": "start",
@@ -148,75 +183,133 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
             }))
             .await;
 
-        for path in walk.files {
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            let content = match tokio::fs::read_to_string(&path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    progress
-                        .errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let hashes = hashes_for(&index_id);
+
+        // Process files in batches. Each batch:
+        //  1. Reads files concurrently (tokio::fs::read_to_string).
+        //  2. Skips files whose content hash matches the previous reindex.
+        //  3. Calls `CodeIndexer::index_files_batch` — one ONNX call per
+        //     EMBED_BATCH_SIZE chunks across the whole batch, one symbol-graph
+        //     rebuild per batch.
+        for batch in walk.files.chunks(REINDEX_BATCH_SIZE) {
+            // 1) Read all files in the batch concurrently.
+            let read_futs = batch.iter().map(|path| {
+                let path = path.clone();
+                async move {
+                    let content = tokio::fs::read_to_string(&path).await;
+                    (path, content)
+                }
+            });
+            let read_results = futures::future::join_all(read_futs).await;
+
+            // 2) Build the batch payload, applying hash-skip.
+            let mut to_index: Vec<(String, String)> = Vec::with_capacity(batch.len());
+            let mut to_index_paths: Vec<PathBuf> = Vec::with_capacity(batch.len());
+            let mut new_hashes: Vec<(PathBuf, u64)> = Vec::with_capacity(batch.len());
+            for (path, content_res) in read_results {
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                let content = match content_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        progress.errors.fetch_add(1, Ordering::Release);
+                        progress
+                            .push(serde_json::json!({
+                                "event": "error",
+                                "file": rel,
+                                "message": format!("read: {e}"),
+                                "indexed": progress.indexed.load(Ordering::Acquire),
+                                "total_files": total,
+                            }))
+                            .await;
+                        continue;
+                    }
+                };
+                let h = hash_content(&content);
+                if hashes.get(&path).map(|prev| *prev == h).unwrap_or(false) {
+                    progress.skipped.fetch_add(1, Ordering::Release);
+                    let indexed = progress.indexed.fetch_add(1, Ordering::Release) + 1;
                     progress
                         .push(serde_json::json!({
-                            "event": "error",
+                            "event": "skip",
                             "file": rel,
-                            "message": format!("read: {e}"),
-                            "indexed": progress.indexed.load(std::sync::atomic::Ordering::Acquire),
+                            "indexed": indexed,
                             "total_files": total,
                         }))
                         .await;
                     continue;
                 }
-            };
+                let path_str = path.to_string_lossy().to_string();
+                to_index.push((path_str, content));
+                to_index_paths.push(path.clone());
+                new_hashes.push((path, h));
+            }
 
-            let path_str = path.to_string_lossy().to_string();
-            let before_chunks = {
-                let indexer = handle.indexer.read().await;
-                indexer.chunk_count()
-            };
+            if to_index.is_empty() {
+                continue;
+            }
+
+            // 3) Bulk-index. We need the corpus-write paths inside the indexer,
+            //    so take the write lock for the duration of the batch — this
+            //    is still net cheaper than the per-file lock thrash.
             let result = {
-                let indexer = handle.indexer.read().await;
-                indexer.index_file(&path_str, &content).await
+                let indexer = handle.indexer.write().await;
+                indexer.index_files_batch(&to_index).await
             };
             match result {
-                Ok(()) => {
-                    let after_chunks = {
-                        let indexer = handle.indexer.read().await;
-                        indexer.chunk_count()
+                Ok(new_chunks) => {
+                    progress.total_chunks.fetch_add(new_chunks, Ordering::Release);
+                    let batch_files = to_index.len();
+                    let indexed =
+                        progress.indexed.fetch_add(batch_files, Ordering::Release) + batch_files;
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let chunks_per_sec = if elapsed_ms > 0 {
+                        (progress.total_chunks.load(Ordering::Acquire) as u64 * 1000)
+                            / elapsed_ms
+                    } else {
+                        0
                     };
-                    let new_chunks = after_chunks.saturating_sub(before_chunks);
-                    progress
-                        .total_chunks
-                        .fetch_add(new_chunks, std::sync::atomic::Ordering::Release);
-                    let indexed = progress
-                        .indexed
-                        .fetch_add(1, std::sync::atomic::Ordering::Release)
-                        + 1;
+                    // Persist new content hashes for next reindex.
+                    for (path, h) in new_hashes {
+                        hashes.insert(path, h);
+                    }
                     progress
                         .push(serde_json::json!({
-                            "event": "progress",
-                            "file": rel,
-                            "chunks": new_chunks,
+                            "event": "batch",
+                            "batch_files": batch_files,
+                            "batch_chunks": new_chunks,
                             "indexed": indexed,
                             "total_files": total,
-                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                            "elapsed_ms": elapsed_ms,
+                            "chunks_per_sec": chunks_per_sec,
                         }))
                         .await;
                 }
                 Err(e) => {
+                    // Whole batch failed — surface a single error event listing
+                    // the affected files. Caller can retry the failing files
+                    // individually via `index_file`.
+                    let files_in_batch: Vec<String> = to_index_paths
+                        .iter()
+                        .map(|p| {
+                            p.strip_prefix(&root)
+                                .unwrap_or(p)
+                                .display()
+                                .to_string()
+                        })
+                        .collect();
                     progress
                         .errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                        .fetch_add(to_index_paths.len(), Ordering::Release);
                     progress
                         .push(serde_json::json!({
                             "event": "error",
-                            "file": rel,
-                            "message": format!("index: {e}"),
-                            "indexed": progress.indexed.load(std::sync::atomic::Ordering::Acquire),
+                            "files": files_in_batch,
+                            "message": format!("batch index: {e}"),
+                            "indexed": progress.indexed.load(Ordering::Acquire),
                             "total_files": total,
                         }))
                         .await;
@@ -225,13 +318,22 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
         }
 
         progress.status.store(ReindexStatus::Complete);
+        let total_chunks = progress.total_chunks.load(Ordering::Acquire);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let chunks_per_sec = if elapsed_ms > 0 {
+            (total_chunks as u64 * 1000) / elapsed_ms
+        } else {
+            0
+        };
         progress
             .push(serde_json::json!({
                 "event": "complete",
-                "indexed": progress.indexed.load(std::sync::atomic::Ordering::Acquire),
-                "total_chunks": progress.total_chunks.load(std::sync::atomic::Ordering::Acquire),
-                "errors": progress.errors.load(std::sync::atomic::Ordering::Acquire),
-                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "indexed": progress.indexed.load(Ordering::Acquire),
+                "total_chunks": total_chunks,
+                "skipped": progress.skipped.load(Ordering::Acquire),
+                "errors": progress.errors.load(Ordering::Acquire),
+                "elapsed_ms": elapsed_ms,
+                "chunks_per_sec": chunks_per_sec,
             }))
             .await;
     });

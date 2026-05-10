@@ -38,6 +38,10 @@ use crate::symbol_graph::{ChunkTuple, SymbolGraph};
 const QUERY_CACHE_CAPACITY: usize = 256;
 /// Oversample factor for the HNSW lane before RRF fusion.
 const HNSW_OVERSAMPLE: usize = 4;
+/// Batch size for the fastembed ONNX call when bulk-indexing files.
+/// 256 chunks per batch lets ONNX/SIMD amortise tensor setup; larger batches
+/// risk transient memory spikes on machines with many cores.
+const EMBED_BATCH_SIZE: usize = 256;
 /// Legacy default score multiplier applied to chunks brought in via KG
 /// expansion. Retained for backwards-compat documentation: the live pipeline
 /// now uses [`EdgeKind::score_multiplier`] (issue #18) so each edge type
@@ -478,6 +482,156 @@ impl CodeIndexer {
         // partial failure mid-file doesn't leave a stale graph; this is cheap.
         self.rebuild_symbol_graph().await;
         Ok(())
+    }
+
+    /// Bulk-index many files in one shot.
+    ///
+    /// Why: per-file `index_file` issues one ONNX `embed` call per chunk and
+    /// rebuilds the symbol graph after every chunk. On a 13k-file Java
+    /// monorepo that translates to ~80k serial ONNX calls and ~80k graph
+    /// rebuilds — the dominant cost of a cold reindex.
+    ///
+    /// What:
+    /// 1. Parse every file into chunks + entities in parallel via rayon.
+    /// 2. Collect all chunk texts and embed them in batches of
+    ///    [`EMBED_BATCH_SIZE`] — one ONNX call per batch instead of per chunk.
+    /// 3. Upsert vectors + insert chunks under a single corpus write lock.
+    /// 4. Rebuild the symbol graph **once** at the end.
+    ///
+    /// Returns the total number of chunks added across the batch. Files whose
+    /// chunker returned no chunks contribute zero; per-file embed/upsert
+    /// failures are surfaced as `Err` and abort the batch (the caller should
+    /// fall back to per-file `index_file` for diagnostics).
+    pub async fn index_files_batch(
+        &self,
+        files: &[(String, String)],
+    ) -> Result<usize> {
+        if files.is_empty() {
+            return Ok(0);
+        }
+
+        // 1) Parse every file in parallel. `chunk_ast` is sync + CPU-bound, so
+        //    rayon's worker pool is a better fit than tokio tasks.
+        let parsed: Vec<(String, Vec<RawChunk>, Vec<RawEntity>)> = {
+            use rayon::prelude::*;
+            let owned: Vec<(String, String)> = files.to_vec();
+            tokio::task::spawn_blocking(move || {
+                owned
+                    .par_iter()
+                    .map(|(path, content)| {
+                        let (mut chunks, entities) = chunk_ast(path, content);
+                        // Replicate the virtual_terms pass from `index_file` so
+                        // batch-indexed chunks get the same BM25 surface area
+                        // as one-by-one indexed chunks (issue #19).
+                        for chunk in chunks.iter_mut() {
+                            let mut seen: std::collections::HashSet<&str> =
+                                std::collections::HashSet::new();
+                            let mut terms: Vec<String> = Vec::new();
+                            for ent in &entities {
+                                if ent.line >= chunk.start_line
+                                    && ent.line <= chunk.end_line
+                                    && seen.insert(ent.text.as_str())
+                                {
+                                    terms.push(ent.text.clone());
+                                }
+                            }
+                            chunk.virtual_terms = terms;
+                        }
+                        (path.clone(), chunks, entities)
+                    })
+                    .collect()
+            })
+            .await
+            .context("batch parse task panicked")?
+        };
+
+        // Flatten into a single chunk list while remembering which file each
+        // entity list belongs to so we can write `entities_by_file` at the end.
+        let mut all_chunks: Vec<RawChunk> = Vec::new();
+        let mut entities_by_file: Vec<(String, Vec<RawEntity>)> = Vec::with_capacity(parsed.len());
+        for (path, chunks, entities) in parsed {
+            all_chunks.extend(chunks);
+            entities_by_file.push((path, entities));
+        }
+        let chunk_total = all_chunks.len();
+        if chunk_total == 0 {
+            // Still need to record the (empty) entity lists so callers see
+            // the file as "indexed". Symbol graph rebuild is unnecessary.
+            let mut emap = self.entities.write().await;
+            for (path, ents) in entities_by_file {
+                emap.insert(path, ents);
+            }
+            return Ok(0);
+        }
+
+        // 2) Embed in batches if an embedder is wired. BM25-only mode (no
+        //    embedder/store) skips this step entirely — chunks still land in
+        //    the in-memory corpus and BM25 picks them up.
+        let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; chunk_total];
+        if let (Some(embedder), Some(_store)) = (&self.embedder, &self.store) {
+            for batch_start in (0..chunk_total).step_by(EMBED_BATCH_SIZE) {
+                let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunk_total);
+                let batch_texts: Vec<&str> = all_chunks[batch_start..batch_end]
+                    .iter()
+                    .map(|c| c.content.as_str())
+                    .collect();
+                let batch_vecs = embedder
+                    .embed_batch(&batch_texts)
+                    .await
+                    .context("batch embed_batch failed")?;
+                if batch_vecs.len() != batch_texts.len() {
+                    anyhow::bail!(
+                        "embed_batch returned {} vectors, expected {}",
+                        batch_vecs.len(),
+                        batch_texts.len()
+                    );
+                }
+                for (offset, vec) in batch_vecs.into_iter().enumerate() {
+                    embeddings[batch_start + offset] = Some(vec);
+                }
+            }
+        }
+
+        // 3) Upsert into store + insert into corpus + cache embeddings.
+        //    We hold the corpus write lock once across the whole batch so the
+        //    insert phase doesn't thrash the lock per chunk.
+        if let Some(store) = &self.store {
+            for (chunk, vec_opt) in all_chunks.iter().zip(embeddings.iter()) {
+                if let Some(vec) = vec_opt {
+                    store
+                        .upsert(&chunk.id, vec.clone())
+                        .await
+                        .context("batch upsert chunk vector")?;
+                }
+            }
+        }
+        {
+            let mut corpus = self.chunks.write().await;
+            for chunk in &all_chunks {
+                corpus.insert(chunk.id.clone(), chunk.clone());
+            }
+        }
+        if self.embedder.is_some() {
+            let mut emb_cache = self.chunk_embeddings.write().await;
+            for (chunk, vec_opt) in all_chunks.iter().zip(embeddings.into_iter()) {
+                if let Some(vec) = vec_opt {
+                    emb_cache.insert(chunk.id.clone(), vec);
+                }
+            }
+        }
+
+        // 4) Persist entity lists.
+        {
+            let mut emap = self.entities.write().await;
+            for (path, ents) in entities_by_file {
+                emap.insert(path, ents);
+            }
+        }
+
+        // 5) Rebuild the symbol graph **once** for the whole batch.
+        self.rebuild_symbol_graph().await;
+
+        Ok(chunk_total)
     }
 
     /// Read-only access to the entity list for a file (None if never indexed).
@@ -1356,6 +1510,70 @@ mod tests {
             .unwrap();
         assert!(results.iter().all(|c| c.id != "a:1:1"));
         assert!(results.iter().all(|c| c.match_reason == "vector"));
+    }
+
+    #[tokio::test]
+    async fn test_index_files_batch_indexes_all_chunks_once() {
+        // Bulk-indexing two files should leave the corpus with the same chunks
+        // as if we'd called index_file twice, but issue exactly one symbol-graph
+        // rebuild and one batched embed call (we can't observe the latter
+        // directly without a counter, but we can assert correctness end-to-end).
+        let idx = make_indexer();
+        let files = vec![
+            (
+                "src/a.rs".to_string(),
+                "fn alpha() { beta(); }\nfn beta() {}\n".to_string(),
+            ),
+            (
+                "src/b.rs".to_string(),
+                "fn gamma() {}\nfn delta() { gamma(); }\n".to_string(),
+            ),
+        ];
+        let added = idx.index_files_batch(&files).await.unwrap();
+        assert!(added >= 4, "expected at least 4 chunks, got {added}");
+        // Symbol graph must reflect cross-file edges (delta -> gamma).
+        let g = idx.symbol_graph().await;
+        assert!(g.node_count() >= 4);
+        // Search must surface the right chunk.
+        let q = SearchQuery {
+            text: "fn alpha".to_string(),
+            top_k: 5,
+            expand_graph: false,
+            compact: false,
+        };
+        let r = idx.search(&q).await.unwrap();
+        assert!(r.iter().any(|c| c.file == "src/a.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_index_files_batch_empty_input_is_noop() {
+        let idx = make_indexer();
+        let added = idx.index_files_batch(&[]).await.unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(idx.chunk_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_index_files_batch_bm25_only_mode() {
+        // No embedder/store wired — the batch path must still populate the
+        // corpus and BM25 must still find chunks.
+        let idx = CodeIndexer::new("bm25-batch", "/tmp/test");
+        let files = vec![(
+            "x.rs".to_string(),
+            "fn authenticate() {}\nfn other() {}\n".to_string(),
+        )];
+        let added = idx.index_files_batch(&files).await.unwrap();
+        assert!(added >= 2);
+        let r = idx
+            .search(&SearchQuery {
+                text: "authenticate".to_string(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+            })
+            .await
+            .unwrap();
+        assert!(r.iter().any(|c| c.content.contains("authenticate")));
     }
 
     #[test]
