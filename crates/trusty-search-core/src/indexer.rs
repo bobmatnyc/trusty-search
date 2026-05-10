@@ -157,6 +157,19 @@ fn build_compact_snippet(content: &str) -> String {
     lines[..7].join("\n")
 }
 
+/// Output of the parse+embed phase: chunks paired with their (optional)
+/// embeddings plus the per-file entity lists, ready to be committed into the
+/// indexer's shared state. Held without any write lock so it can be shipped
+/// between async tasks freely.
+#[derive(Default)]
+pub struct ParsedBatch {
+    pub chunks: Vec<RawChunk>,
+    /// `embeddings[i]` is `Some(vec)` iff an embedder was wired during parse.
+    /// Always the same length as `chunks`.
+    pub embeddings: Vec<Option<Vec<f32>>>,
+    pub entities_by_file: Vec<(String, Vec<RawEntity>)>,
+}
+
 /// `CodeIndexer`: hybrid search engine for one named index.
 pub struct CodeIndexer {
     pub index_id: String,
@@ -577,20 +590,42 @@ impl CodeIndexer {
         if files.is_empty() {
             return Ok(0);
         }
+        let parsed = self.parse_and_embed_files(files.to_vec()).await?;
+        let total = self
+            .commit_parsed_batch(parsed, defer_graph_rebuild)
+            .await?;
+        Ok(total)
+    }
+
+    /// Phase 1+2 of the bulk pipeline: parse files into chunks and embed them.
+    ///
+    /// Why: This phase does the heavy CPU/ONNX work but mutates **no shared
+    /// state**. Lifting it out of the corpus write lock lets the reindex
+    /// orchestrator overlap a batch's parse+embed with the previous batch's
+    /// commit phase, and ensures concurrent search readers are never blocked
+    /// by ONNX inference.
+    /// What: parallel parse via rayon (with virtual_terms population from
+    /// entities), then batched ONNX embed (`EMBED_BATCH_SIZE` chunks per
+    /// `embed_batch` call). Returns a [`ParsedBatch`] ready for
+    /// [`Self::commit_parsed_batch`].
+    /// Test: covered indirectly by every `index_files_batch*` test.
+    pub async fn parse_and_embed_files(
+        &self,
+        files: Vec<(String, String)>,
+    ) -> Result<ParsedBatch> {
+        if files.is_empty() {
+            return Ok(ParsedBatch::default());
+        }
 
         // 1) Parse every file in parallel. `chunk_ast` is sync + CPU-bound, so
         //    rayon's worker pool is a better fit than tokio tasks.
         let parsed: Vec<(String, Vec<RawChunk>, Vec<RawEntity>)> = {
             use rayon::prelude::*;
-            let owned: Vec<(String, String)> = files.to_vec();
             tokio::task::spawn_blocking(move || {
-                owned
+                files
                     .par_iter()
                     .map(|(path, content)| {
                         let (mut chunks, entities) = chunk_ast(path, content);
-                        // Replicate the virtual_terms pass from `index_file` so
-                        // batch-indexed chunks get the same BM25 surface area
-                        // as one-by-one indexed chunks (issue #19).
                         for chunk in chunks.iter_mut() {
                             let mut seen: std::collections::HashSet<&str> =
                                 std::collections::HashSet::new();
@@ -613,30 +648,18 @@ impl CodeIndexer {
             .context("batch parse task panicked")?
         };
 
-        // Flatten into a single chunk list while remembering which file each
-        // entity list belongs to so we can write `entities_by_file` at the end.
         let mut all_chunks: Vec<RawChunk> = Vec::new();
         let mut entities_by_file: Vec<(String, Vec<RawEntity>)> = Vec::with_capacity(parsed.len());
         for (path, chunks, entities) in parsed {
             all_chunks.extend(chunks);
             entities_by_file.push((path, entities));
         }
-        let chunk_total = all_chunks.len();
-        if chunk_total == 0 {
-            // Still need to record the (empty) entity lists so callers see
-            // the file as "indexed". Symbol graph rebuild is unnecessary.
-            let mut emap = self.entities.write().await;
-            for (path, ents) in entities_by_file {
-                emap.insert(path, ents);
-            }
-            return Ok(0);
-        }
 
-        // 2) Embed in batches if an embedder is wired. BM25-only mode (no
-        //    embedder/store) skips this step entirely — chunks still land in
-        //    the in-memory corpus and BM25 picks them up.
-        let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; chunk_total];
+        // 2) Embed in batches if an embedder is wired. No write lock held —
+        //    other readers (search) run in parallel with this ONNX work.
+        let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; all_chunks.len()];
         if let (Some(embedder), Some(_store)) = (&self.embedder, &self.store) {
+            let chunk_total = all_chunks.len();
             for batch_start in (0..chunk_total).step_by(EMBED_BATCH_SIZE) {
                 let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunk_total);
                 let batch_texts: Vec<&str> = all_chunks[batch_start..batch_end]
@@ -660,19 +683,61 @@ impl CodeIndexer {
             }
         }
 
-        // 3) Upsert into store + insert into corpus + cache embeddings.
-        //    We hold the corpus write lock once across the whole batch so the
-        //    insert phase doesn't thrash the lock per chunk.
+        Ok(ParsedBatch {
+            chunks: all_chunks,
+            embeddings,
+            entities_by_file,
+        })
+    }
+
+    /// Phase 3+4 of the bulk pipeline: commit a [`ParsedBatch`] into the index.
+    ///
+    /// Why: this is the **only** phase that mutates shared state (BM25 index,
+    /// corpus map, chunk_embeddings cache, HNSW store, entities map). By
+    /// isolating it from the parse+embed work, the write-lock window shrinks
+    /// from "minutes per batch" to "milliseconds per batch", letting concurrent
+    /// searches and the next batch's parse+embed phase overlap freely.
+    /// What: single-pass BM25 upsert, single-call HNSW `upsert_batch`, one
+    /// corpus write lock for the whole batch, one entities write lock, then
+    /// the (optional) graph rebuild.
+    /// Test: covered indirectly by `test_index_files_batch_*`.
+    pub async fn commit_parsed_batch(
+        &self,
+        parsed: ParsedBatch,
+        defer_graph_rebuild: bool,
+    ) -> Result<usize> {
+        let ParsedBatch {
+            chunks: mut all_chunks,
+            embeddings,
+            entities_by_file,
+        } = parsed;
+        let chunk_total = all_chunks.len();
+        if chunk_total == 0 {
+            let mut emap = self.entities.write().await;
+            for (path, ents) in entities_by_file {
+                emap.insert(path, ents);
+            }
+            return Ok(0);
+        }
+
+        // Vector store: single batched call. Drops 3N lock acquisitions to 3
+        // for a batch of N chunks (key alloc, key rev-map, HNSW write).
         if let Some(store) = &self.store {
-            for (chunk, vec_opt) in all_chunks.iter().zip(embeddings.iter()) {
-                if let Some(vec) = vec_opt {
-                    store
-                        .upsert(&chunk.id, vec.clone())
-                        .await
-                        .context("batch upsert chunk vector")?;
-                }
+            let items: Vec<(String, Vec<f32>)> = all_chunks
+                .iter()
+                .zip(embeddings.iter())
+                .filter_map(|(chunk, vec_opt)| {
+                    vec_opt.as_ref().map(|v| (chunk.id.clone(), v.clone()))
+                })
+                .collect();
+            if !items.is_empty() {
+                store
+                    .upsert_batch(&items)
+                    .await
+                    .context("batch upsert chunk vectors")?;
             }
         }
+
         // BM25: upsert each chunk's body+virtual_terms before we move chunks
         // into the corpus. Doing this first avoids a second clone of `chunk`.
         {
@@ -690,16 +755,12 @@ impl CodeIndexer {
                 }
             }
         }
-        // Move chunks into the corpus. `drain(..)` lets us avoid cloning each
-        // RawChunk (which can be large — content + virtual_terms + calls).
         {
             let mut corpus = self.chunks.write().await;
             for chunk in all_chunks.drain(..) {
                 corpus.insert(chunk.id.clone(), chunk);
             }
         }
-
-        // 4) Persist entity lists.
         {
             let mut emap = self.entities.write().await;
             for (path, ents) in entities_by_file {
@@ -707,12 +768,9 @@ impl CodeIndexer {
             }
         }
 
-        // 5) Rebuild the symbol graph **once** for the whole batch — unless
-        //    the caller is part of a bulk reindex that will rebuild at the end.
         if !defer_graph_rebuild {
             self.rebuild_symbol_graph().await;
         }
-
         Ok(chunk_total)
     }
 

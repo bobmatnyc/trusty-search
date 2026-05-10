@@ -33,6 +33,23 @@ pub trait VectorStore: Send + Sync {
     async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>>;
     async fn remove(&self, id: &str) -> Result<()>;
     async fn len(&self) -> Result<usize>;
+
+    /// Bulk-upsert many `(chunk_id, embedding)` pairs.
+    ///
+    /// Why: per-chunk `upsert` acquires three write locks (`id_to_key`,
+    /// `key_to_id`, `index`) for each call. On a 115k-chunk index that's
+    /// ~345k lock round-trips and serializes the entire embed pipeline behind
+    /// the HNSW write lock. Concrete impls should override to do all key
+    /// allocation and all HNSW writes under a single lock acquisition each.
+    /// What: default implementation loops over `upsert` so non-Usearch backends
+    /// keep working; `UsearchStore` overrides for the fast path.
+    /// Test: see `test_upsert_batch_inserts_all` in this module.
+    async fn upsert_batch(&self, items: &[(String, Vec<f32>)]) -> Result<()> {
+        for (id, vec) in items {
+            self.upsert(id, vec.clone()).await?;
+        }
+        Ok(())
+    }
 }
 
 /// `UsearchStore`: usearch HNSW index wrapped in `Arc<RwLock<>>` for concurrent reads.
@@ -226,6 +243,69 @@ impl VectorStore for UsearchStore {
     async fn len(&self) -> Result<usize> {
         Ok(self.index.read().await.size())
     }
+
+    /// Single-lock-pass override. Two phases:
+    /// 1. Resolve/assign every chunk's `u64` key under one write-lock pair
+    ///    (`id_to_key` + `key_to_id`).
+    /// 2. Insert every vector under one HNSW write lock.
+    /// This drops 6N lock acquisitions to 6 for a batch of N items.
+    async fn upsert_batch(&self, items: &[(String, Vec<f32>)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        // Validate dims up front so we don't half-commit on a bad batch.
+        for (_, v) in items {
+            if v.len() != self.dim {
+                return Err(anyhow!(
+                    "embedding dim mismatch: got {}, expected {}",
+                    v.len(),
+                    self.dim
+                ));
+            }
+        }
+
+        // Phase 1: assign keys for any new IDs under a single write-lock pair.
+        {
+            let mut id_map = self.id_to_key.write().await;
+            let mut key_map = self.key_to_id.write().await;
+            for (id, _) in items {
+                if !id_map.contains_key(id.as_str()) {
+                    let k = self.next_key.fetch_add(1, Ordering::Relaxed);
+                    id_map.insert(id.clone(), k);
+                    key_map.insert(k, id.clone());
+                }
+            }
+        }
+
+        // Phase 2: insert every vector under one HNSW write lock.
+        let id_map = self.id_to_key.read().await;
+        let index = self.index.write().await;
+        // Reserve once for the worst case (every item is new) so we don't
+        // re-enter the reserve path inside the hot loop.
+        let want = index.size() + items.len();
+        if want > index.capacity() {
+            let mut new_cap = index.capacity().max(1);
+            while new_cap < want {
+                new_cap = new_cap.saturating_mul(2);
+            }
+            index
+                .reserve(new_cap)
+                .map_err(|e| anyhow!("usearch reserve grow failed: {e}"))?;
+        }
+        for (id, embedding) in items {
+            if let Some(&key) = id_map.get(id.as_str()) {
+                if index.contains(key) {
+                    index
+                        .remove(key)
+                        .map_err(|e| anyhow!("usearch remove (for upsert) failed: {e}"))?;
+                }
+                index
+                    .add(key, embedding)
+                    .map_err(|e| anyhow!("usearch add failed: {e}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +401,44 @@ mod tests {
         let store = UsearchStore::new(4).expect("store init");
         assert!(store.upsert("bad", vec![1.0, 0.0]).await.is_err());
         assert!(store.search(&[1.0, 0.0], 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_batch_inserts_all() {
+        let store = UsearchStore::new(4).expect("store init");
+        // Use orthogonal directions so cosine sim distinguishes them (parallel
+        // vectors share cosine sim of 1 regardless of magnitude).
+        let dirs: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let items: Vec<(String, Vec<f32>)> = (0..4)
+            .map(|i| (format!("k{i}"), dirs[i].to_vec()))
+            .collect();
+        store.upsert_batch(&items).await.expect("batch upsert");
+        assert_eq!(store.len().await.unwrap(), 4);
+        // Re-batch upserting the same ids should overwrite, not duplicate.
+        store.upsert_batch(&items).await.expect("re-batch upsert");
+        assert_eq!(store.len().await.unwrap(), 4);
+        // Top hit for k2's exact vector must be k2.
+        let hits = store.search(&dirs[2], 1).await.unwrap();
+        assert_eq!(hits[0].chunk_id, "k2");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_batch_empty_noop() {
+        let store = UsearchStore::new(4).expect("store init");
+        store.upsert_batch(&[]).await.unwrap();
+        assert_eq!(store.len().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_batch_dim_mismatch_errors() {
+        let store = UsearchStore::new(4).expect("store init");
+        let items = vec![("bad".to_string(), vec![1.0, 0.0])];
+        assert!(store.upsert_batch(&items).await.is_err());
     }
 
     #[tokio::test]

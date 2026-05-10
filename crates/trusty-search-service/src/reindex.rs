@@ -27,12 +27,13 @@ use trusty_search_core::registry::{IndexHandle, IndexId};
 /// Files per parallel batch. Each batch is parsed in parallel via rayon and
 /// embedded in a single ONNX call (256 chunks at a time inside the batch).
 ///
-/// 128 files keeps the embedder's ONNX session saturated (typical Java/Rust
-/// files chunk to ~3-10 chunks each, so 128 files comfortably feeds several
-/// 256-chunk embed calls per batch) while still letting the SSE progress
-/// stream emit useful interim updates. Larger values trade off responsiveness
-/// of progress events against marginal gains in lock-acquisition amortization.
-const REINDEX_BATCH_SIZE: usize = 128;
+/// 512 files maximizes lock-acquisition amortization across the indexer's
+/// write-lock-protected commit phase: with the split parse/embed-vs-commit
+/// pipeline, each batch acquires the corpus write lock exactly once. Larger
+/// batches mean fewer lock cycles and better ONNX-session saturation; the
+/// downside is coarser-grained SSE progress updates, which is acceptable
+/// because progress events are batch-level by design.
+const REINDEX_BATCH_SIZE: usize = 512;
 
 /// Per-index, per-process content-hash cache. Used to skip reindexing files
 /// whose content hasn't changed since the last reindex in this daemon's
@@ -243,18 +244,23 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
                 continue;
             }
 
-            // 3) Bulk-index. We need the corpus-write paths inside the indexer,
-            //    so take the write lock for the duration of the batch — this
-            //    is still net cheaper than the per-file lock thrash.
-            //    `_no_rebuild` defers symbol-graph rebuild to the very end of
-            //    the reindex (one rebuild instead of one per batch — major win
-            //    on large corpora since the rebuild is roughly O(N + E) over
-            //    the whole corpus and would otherwise scale quadratically with
-            //    the file count).
-            let result = {
+            // 3) Bulk-index. We split the work into:
+            //    (a) parse + embed — pure CPU/ONNX, NO write lock required.
+            //        Concurrent searches and the next batch's I/O proceed
+            //        unblocked while this runs.
+            //    (b) commit — acquires the corpus/BM25/HNSW write locks for
+            //        the minimum window needed to install the new chunks.
+            //    The graph rebuild is deferred to the very end of the reindex
+            //    (one rebuild instead of one per batch).
+            let result: anyhow::Result<usize> = async {
+                let parsed = {
+                    let indexer = handle.indexer.read().await;
+                    indexer.parse_and_embed_files(to_index.clone()).await?
+                };
                 let indexer = handle.indexer.write().await;
-                indexer.index_files_batch_no_rebuild(&to_index).await
-            };
+                indexer.commit_parsed_batch(parsed, true).await
+            }
+            .await;
             match result {
                 Ok(new_chunks) => {
                     progress.total_chunks.fetch_add(new_chunks, Ordering::Release);
