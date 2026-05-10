@@ -901,19 +901,110 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status => {
-            let (index_id, warned) = resolve_index(&cli.index);
-            print_index_header(&index_id, warned);
+            // Why: a multi-index status overview is more useful than a single-index
+            // dump — the user wants to know "is the daemon up, and what's it serving".
+            // Calls /health + /indexes + per-index /status.
+            let base = daemon_base_url();
+            let client = reqwest::Client::new();
+
+            let health = client.get(format!("{}/health", base)).send().await;
+            let health_body: serde_json::Value = match health {
+                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+                _ => {
+                    if cli.json {
+                        println!(r#"{{"daemon":"not_running"}}"#);
+                    } else {
+                        eprintln!("{} Daemon: not running ({})", "✗".red(), base);
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let list = client.get(format!("{}/indexes", base)).send().await;
+            let list_body: serde_json::Value = match list {
+                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+                _ => serde_json::json!({"indexes": []}),
+            };
+            let empty: Vec<serde_json::Value> = Vec::new();
+            let names: Vec<String> = list_body
+                .get("indexes")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+
+            // Fetch per-index status concurrently.
+            let mut joinset = tokio::task::JoinSet::new();
+            for name in &names {
+                let n = name.clone();
+                let url = format!("{}/indexes/{}/status", base, n);
+                let c = client.clone();
+                joinset.spawn(async move {
+                    let body: serde_json::Value = match c.get(&url).send().await {
+                        Ok(r) if r.status().is_success() => {
+                            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+                        }
+                        _ => serde_json::json!({}),
+                    };
+                    (n, body)
+                });
+            }
+            let mut per_index: Vec<(String, serde_json::Value)> = Vec::new();
+            while let Some(j) = joinset.join_next().await {
+                if let Ok(pair) = j {
+                    per_index.push(pair);
+                }
+            }
+            per_index.sort_by(|a, b| a.0.cmp(&b.0));
+
             if cli.json {
-                println!(
-                    r#"{{"index_id":"{}","status":"not_implemented"}}"#,
-                    index_id
-                );
-            } else {
-                println!("{} {}", "Index:".bold(), index_id);
+                let arr: Vec<serde_json::Value> = per_index
+                    .iter()
+                    .map(|(n, b)| serde_json::json!({"id": n, "status": b}))
+                    .collect();
                 println!(
                     "{}",
-                    "  Status endpoint not yet implemented — see issue #8".yellow()
+                    serde_json::json!({
+                        "daemon": "running",
+                        "url": base,
+                        "version": health_body.get("version").cloned().unwrap_or(serde_json::json!(null)),
+                        "indexes": arr,
+                    })
                 );
+            } else {
+                println!(
+                    "{} running ({})",
+                    "Daemon:".bold(),
+                    base.cyan()
+                );
+                if per_index.is_empty() {
+                    println!("{} {}", "Indexes:".bold(), "(none)".dimmed());
+                } else {
+                    println!("{}", "Indexes:".bold());
+                    for (name, body) in &per_index {
+                        let chunks = body
+                            .get("chunk_count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let files = body
+                            .get("file_count")
+                            .and_then(|v| v.as_u64());
+                        match files {
+                            Some(f) => println!(
+                                "  {:<24} — {} chunks, {} files",
+                                name.bold(),
+                                chunks,
+                                f
+                            ),
+                            None => println!(
+                                "  {:<24} — {} chunks",
+                                name.bold(),
+                                chunks
+                            ),
+                        }
+                    }
+                }
             }
         }
 
@@ -944,16 +1035,62 @@ async fn main() -> Result<()> {
                 println!("{} Extra exclusions: {}", "·".dimmed(), exclude.join(", "));
             }
 
-            println!(
-                "{} Registered '{}' at {}",
-                "✓".green(),
-                index_name.bold(),
-                project_path.display()
-            );
-            println!(
-                "  Run {} to index this project.",
-                "trusty-search reindex".cyan()
-            );
+            // Why: previously we printed "Registered" without contacting the daemon
+            // — misleading because the daemon had no idea about this index.
+            // Now: POST /indexes (idempotent) and report truthfully.
+            let base = daemon_base_url();
+            let client = reqwest::Client::new();
+            let create_url = format!("{}/indexes", base);
+            let create_body = serde_json::json!({
+                "id": index_name,
+                "root_path": project_path,
+            });
+            match client.post(&create_url).json(&create_body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value =
+                        resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+                    let created = body
+                        .get("created")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if created {
+                        println!(
+                            "{} Registered '{}' with daemon at {}",
+                            "✓".green(),
+                            index_name.bold(),
+                            project_path.display()
+                        );
+                    } else {
+                        println!(
+                            "{} '{}' already registered with daemon",
+                            "↻".cyan(),
+                            index_name.bold()
+                        );
+                    }
+                    println!(
+                        "  Run {} to index this project.",
+                        "trusty-search reindex".cyan()
+                    );
+                }
+                Ok(resp) => {
+                    eprintln!(
+                        "{} daemon returned {} for /indexes — index will need to be re-registered when daemon is healthy",
+                        "⚠".yellow(),
+                        resp.status()
+                    );
+                }
+                Err(_) => {
+                    println!(
+                        "{} Daemon not running — index will be created when daemon starts.",
+                        "·".dimmed()
+                    );
+                    println!(
+                        "  Start with {} then run {}.",
+                        "trusty-search start".cyan(),
+                        "trusty-search reindex".cyan()
+                    );
+                }
+            }
         }
 
         Commands::Add { file } => {
@@ -1038,18 +1175,138 @@ async fn main() -> Result<()> {
             top_k,
             full,
         } => {
-            println!(
-                "{} {} {} {} {}",
-                "→".cyan(),
-                format!("[{}]", indexes).dimmed(),
-                query.bold(),
-                format!("(top-{})", top_k).dimmed(),
-                if full { "(full)" } else { "" }.dimmed()
-            );
-            println!(
-                "{}",
-                "  Cross-project search not yet implemented — see issue #10".yellow()
-            );
+            // Why: resolve which index to search.
+            // Precedence: --index flag > --indexes (single name) > auto-detect (if "*" and one index).
+            // For multi-index "*" with several indexes registered, require explicit choice
+            // because the daemon's search endpoint is single-index-scoped.
+            let base = daemon_base_url();
+            let client = reqwest::Client::new();
+
+            let target_id: String = if let Some(id) = cli.index.as_ref() {
+                id.clone()
+            } else if indexes != "*" && !indexes.contains(',') {
+                indexes.clone()
+            } else {
+                // Try to resolve by listing.
+                let resp = client.get(format!("{}/indexes", base)).send().await;
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        let body: serde_json::Value =
+                            r.json().await.unwrap_or_else(|_| serde_json::json!({}));
+                        let empty: Vec<serde_json::Value> = Vec::new();
+                        let names: Vec<String> = body
+                            .get("indexes")
+                            .and_then(|v| v.as_array())
+                            .unwrap_or(&empty)
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
+                        if names.len() == 1 {
+                            names.into_iter().next().unwrap()
+                        } else {
+                            eprintln!(
+                                "{} Multiple indexes registered — please pass --index <id>: {}",
+                                "✗".red(),
+                                names.join(", ")
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    _ => {
+                        eprintln!(
+                            "{} could not reach daemon at {}",
+                            "✗".red(),
+                            base
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            };
+
+            let url = format!("{}/indexes/{}/search", base, target_id);
+            let body = serde_json::json!({"text": query, "top_k": top_k});
+            let resp = client.post(&url).json(&body).send().await;
+            let body_json: serde_json::Value = match resp {
+                Ok(r) if r.status().is_success() => {
+                    r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                    eprintln!(
+                        "{} index '{}' not found on daemon",
+                        "✗".red(),
+                        target_id
+                    );
+                    std::process::exit(1);
+                }
+                Ok(r) => {
+                    eprintln!("{} daemon returned {}", "✗".red(), r.status());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
+                    std::process::exit(1);
+                }
+            };
+
+            if cli.json {
+                println!("{}", body_json);
+            } else {
+                let empty: Vec<serde_json::Value> = Vec::new();
+                let results = body_json
+                    .get("results")
+                    .and_then(|v| v.as_array())
+                    .unwrap_or(&empty);
+                let intent = body_json
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let latency = body_json
+                    .get("latency_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!(
+                    "{} [{}] {} {}",
+                    "→".cyan(),
+                    target_id.dimmed(),
+                    query.bold(),
+                    format!("(intent={}, {}ms, {} results)", intent, latency, results.len()).dimmed()
+                );
+                if results.is_empty() {
+                    println!("  {}", "(no matches)".dimmed());
+                }
+                for (i, r) in results.iter().enumerate() {
+                    let file = r.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+                    let start = r.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let end = r.get("end_line").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let score = r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let reason = r
+                        .get("match_reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    println!(
+                        "[{}] {}:{}-{}  {}",
+                        i + 1,
+                        file,
+                        start,
+                        end,
+                        format!("(score: {:.3}, {})", score, reason).dimmed()
+                    );
+                    let snippet = if full {
+                        r.get("content").and_then(|v| v.as_str()).unwrap_or("")
+                    } else {
+                        r.get("compact_snippet")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| r.get("content").and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                    };
+                    for line in snippet.lines().take(if full { usize::MAX } else { 7 }) {
+                        println!("    {}", line);
+                    }
+                    if !full && snippet.lines().count() > 7 {
+                        println!("    {}", "...".dimmed());
+                    }
+                }
+            }
         }
 
         Commands::Health => {
@@ -1109,10 +1366,29 @@ async fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let state = trusty_search_service::SearchAppState::new(
+            // Bug A fix: build a single FastEmbedder up front and share it
+            // across every index registered during the daemon's lifetime.
+            // Without this, `create_index_handler` constructs a BM25-only
+            // `CodeIndexer` and the HNSW lane silently contributes nothing
+            // — the symptom seen in the 115k-chunk benchmark where every
+            // result returned `match_reason: "bm25"`.
+            let embedder: Option<std::sync::Arc<dyn trusty_search_core::Embedder>> =
+                match trusty_search_core::FastEmbedder::new().await {
+                    Ok(e) => Some(std::sync::Arc::new(e)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "FastEmbedder init failed ({e}); daemon falling back to BM25-only mode"
+                        );
+                        None
+                    }
+                };
+            let mut state = trusty_search_service::SearchAppState::new(
                 trusty_search_core::registry::IndexRegistry::new(),
                 facts,
             );
+            if let Some(e) = embedder {
+                state = state.with_embedder(e);
+            }
             match trusty_search_service::run_daemon(state, port).await {
                 Ok(()) => {}
                 Err(trusty_search_service::DaemonError::AlreadyRunning(p)) => {
