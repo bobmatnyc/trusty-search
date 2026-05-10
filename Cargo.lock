@@ -4169,7 +4169,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -4180,6 +4180,7 @@ dependencies = [
  "dotenvy",
  "fs4",
  "indicatif 0.17.11",
+ "libc",
  "open",
  "reqwest",
  "serde",

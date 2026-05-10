@@ -35,7 +35,7 @@ trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "tru
 
 [package]
 name = "trusty-search"
-version = "0.1.41"
+version = "0.1.42"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -67,6 +67,7 @@ dirs = "5"
 fs4 = { version = "0.8", features = ["sync"] }
 walkdir = "2"
 open = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 walkdir = "2"

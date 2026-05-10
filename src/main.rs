@@ -104,7 +104,10 @@ enum Commands {
         path: Option<std::path::PathBuf>,
     },
 
-    /// Show index stats for current project  [alias: st]
+    /// Show daemon status and all index stats  [alias: st]
+    ///
+    /// Shows daemon liveness, version, and per-index chunk counts.
+    /// `health` produces the same output (kept for backward compatibility).
     ///
     /// Examples:
     ///   trusty-search status
@@ -224,7 +227,10 @@ enum Commands {
         full: bool,
     },
 
-    /// Check daemon liveness and version
+    /// Check daemon liveness (alias for `status`)
+    ///
+    /// Kept for backward compatibility. Both `health` and `status` produce
+    /// the same rich output: daemon URL, version, and per-index chunk counts.
     ///
     /// Examples:
     ///   trusty-search health
@@ -303,6 +309,22 @@ enum Commands {
         /// Port the daemon is listening on (default: read port file or 7878)
         #[arg(long)]
         port: Option<u16>,
+    },
+
+    /// Diagnose configuration, model cache, and index health
+    ///
+    /// Checks each component and reports ✓ / ✗ / ⚠ for each. Exit code 0
+    /// when all checks pass or only warnings; exit code 1 when any error is
+    /// found. Pass --fix to attempt automatic repair of fixable problems.
+    ///
+    /// Examples:
+    ///   trusty-search doctor
+    ///   trusty-search doctor --fix
+    #[command(display_order = 28)]
+    Doctor {
+        /// Attempt to fix detected problems automatically
+        #[arg(long)]
+        fix: bool,
     },
 
     /// Generate shell completion script
@@ -988,6 +1010,541 @@ fn print_convert_line(idx: usize, total: usize, r: &ConvertResult) {
     }
 }
 
+// ── Status / Health helper ────────────────────────────────────────────────
+
+/// Format a u64 with locale-style thousands separators (e.g. 115585 → "115,585").
+///
+/// Why: chunk counts for large repos (100k+) are hard to read without commas.
+/// What: groups digits in threes from the right, separated by ",".
+/// Test: 0 → "0", 1000 → "1,000", 115585 → "115,585".
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
+}
+
+/// Shared handler for `status` and `health` — both show the same rich output.
+///
+/// Why: removing duplication between the two CLI aliases; a single source of
+/// truth for the daemon+indexes display logic.
+/// What: queries `/health` + `/indexes` + per-index `/status`, then prints
+/// or emits JSON. Exits 1 when the daemon is not reachable.
+async fn run_status(json: bool) -> Result<()> {
+    let base = daemon_base_url();
+    let client = reqwest::Client::new();
+
+    let health = client.get(format!("{}/health", base)).send().await;
+    let health_body: serde_json::Value = match health {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+        _ => {
+            if json {
+                println!(r#"{{"daemon":"not_running"}}"#);
+            } else {
+                eprintln!("{} Daemon not running ({})", "✗".red(), base);
+                eprintln!("  Start with: {}", "trusty-search start".cyan());
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let list = client.get(format!("{}/indexes", base)).send().await;
+    let list_body: serde_json::Value = match list {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+        _ => serde_json::json!({"indexes": []}),
+    };
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let names: Vec<String> = list_body
+        .get("indexes")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+
+    // Fetch per-index status concurrently.
+    let mut joinset = tokio::task::JoinSet::new();
+    for name in &names {
+        let n = name.clone();
+        let url = format!("{}/indexes/{}/status", base, n);
+        let c = client.clone();
+        joinset.spawn(async move {
+            let body: serde_json::Value = match c.get(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+                }
+                _ => serde_json::json!({}),
+            };
+            (n, body)
+        });
+    }
+    let mut per_index: Vec<(String, serde_json::Value)> = Vec::new();
+    while let Some(j) = joinset.join_next().await {
+        if let Ok(pair) = j {
+            per_index.push(pair);
+        }
+    }
+    per_index.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if json {
+        let arr: Vec<serde_json::Value> = per_index
+            .iter()
+            .map(|(n, b)| serde_json::json!({"id": n, "status": b}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "daemon": "running",
+                "url": base,
+                "version": health_body.get("version").cloned().unwrap_or(serde_json::json!(null)),
+                "indexes": arr,
+            })
+        );
+    } else {
+        let version = health_body
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        println!(
+            "{} Daemon running  {}  v{}",
+            "✓".green(),
+            base.cyan(),
+            version
+        );
+        if per_index.is_empty() {
+            println!("{}", "Indexes:".bold());
+            println!("  {}", "(none)".dimmed());
+        } else {
+            println!("{}", "Indexes:".bold());
+            for (name, body) in &per_index {
+                let chunks = body
+                    .get("chunk_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let root = body
+                    .get("root_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let chunks_fmt = format_with_commas(chunks);
+                if root.is_empty() {
+                    println!(
+                        "  {:<16} {:>12} chunks",
+                        name.bold(),
+                        chunks_fmt,
+                    );
+                } else {
+                    println!(
+                        "  {:<16} {:>12} chunks  {}",
+                        name.bold(),
+                        chunks_fmt,
+                        root.dimmed()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Doctor ────────────────────────────────────────────────────────────────
+
+/// Return the directory where fastembed caches ONNX models.
+///
+/// Why: fastembed uses `FASTEMBED_CACHE_DIR` env var when set, otherwise
+/// `.fastembed_cache` relative to the process CWD. For the daemon the CWD
+/// is wherever the user launched it — so we check the env var first, then
+/// fall back to the cache path next to the trusty-search data dir.
+fn fastembed_cache_dir() -> std::path::PathBuf {
+    if let Ok(s) = std::env::var("FASTEMBED_CACHE_DIR") {
+        return std::path::PathBuf::from(s);
+    }
+    // fastembed's default is ".fastembed_cache" in the process CWD at the
+    // time TextEmbedding::try_new() is called. For doctor we look in the
+    // most likely candidate: the data dir used by the daemon.
+    if let Some(d) = dirs::data_local_dir() {
+        let candidate = d.join("trusty-search").join(".fastembed_cache");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Also check next to the binary (common dev setup).
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(".fastembed_cache");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Final fallback: relative to CWD (matches fastembed default).
+    std::path::PathBuf::from(".fastembed_cache")
+}
+
+/// Compute total byte size of a directory tree (best-effort; ignores errors).
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                total += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            } else if p.is_dir() {
+                total += dir_size_bytes(&p);
+            }
+        }
+    }
+    total
+}
+
+/// Format bytes as a human-readable string (MB / KB / B).
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.0}MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.0}KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+/// Check whether a TCP port is open (non-blocking connect with 500 ms timeout).
+async fn port_reachable(host: &str, port: u16) -> bool {
+    let addr = format!("{}:{}", host, port);
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .is_some()
+}
+
+/// Read the daemon port from the port file (or return 7878).
+fn read_daemon_port() -> u16 {
+    daemon_port_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(7878)
+}
+
+/// Outcome of a single doctor check.
+#[derive(Debug, Clone, PartialEq)]
+enum CheckResult {
+    /// Check passed.
+    Ok(String),
+    /// Non-fatal issue; doctor continues.
+    Warn(String),
+    /// Fatal issue; counted as an error.
+    Error(String),
+}
+
+impl CheckResult {
+    fn print(&self) {
+        match self {
+            CheckResult::Ok(msg) => println!("{} {}", "✓".green(), msg),
+            CheckResult::Warn(msg) => println!("{} {}", "⚠".yellow(), msg),
+            CheckResult::Error(msg) => println!("{} {}", "✗".red(), msg),
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        matches!(self, CheckResult::Error(_))
+    }
+
+    fn is_warn(&self) -> bool {
+        matches!(self, CheckResult::Warn(_))
+    }
+}
+
+/// Represents an index that has no chunks (fixable via reindex).
+#[derive(Debug)]
+struct EmptyIndex {
+    name: String,
+    root_path: String,
+}
+
+/// Run the full doctor diagnostic suite and return (checks, empty_indexes).
+async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
+    let mut checks: Vec<CheckResult> = Vec::new();
+    let mut empty_indexes: Vec<EmptyIndex> = Vec::new();
+
+    // ── 1. Daemon liveness ────────────────────────────────────────────────
+    let port = read_daemon_port();
+    let base = daemon_base_url();
+    let client = reqwest::Client::new();
+
+    let health_result = client
+        .get(format!("{}/health", base))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await;
+
+    let (daemon_running, daemon_version) = match health_result {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_else(|_| serde_json::json!({}));
+            let ver = body
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            (true, ver)
+        }
+        _ => (false, String::new()),
+    };
+
+    if daemon_running {
+        checks.push(CheckResult::Ok(format!(
+            "Daemon running at {} (v{})",
+            base, daemon_version
+        )));
+    } else {
+        checks.push(CheckResult::Error(
+            "Daemon not running — run `trusty-search start`".to_string(),
+        ));
+    }
+
+    // ── 2. Model cache ────────────────────────────────────────────────────
+    let model_cache = fastembed_cache_dir();
+    let model_name = "all-MiniLM-L6-v2";
+    let model_subdir = model_cache.join("models--Qdrant--all-MiniLM-L6-v2-onnx");
+    if model_subdir.exists() {
+        let size = dir_size_bytes(&model_cache);
+        checks.push(CheckResult::Ok(format!(
+            "Model cache: {} ({}, {})",
+            model_cache.display(),
+            fmt_bytes(size),
+            model_name
+        )));
+    } else if model_cache.exists() {
+        checks.push(CheckResult::Warn(format!(
+            "Model cache directory exists ({}) but {} not found — will download on first start",
+            model_cache.display(),
+            model_name
+        )));
+    } else {
+        checks.push(CheckResult::Warn(
+            "Model not cached — will download on first `trusty-search start`".to_string(),
+        ));
+    }
+
+    // ── 3. Data directory ─────────────────────────────────────────────────
+    let data_dir = dirs::data_local_dir()
+        .map(|d| d.join("trusty-search"))
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/trusty-search"));
+
+    if data_dir.exists() {
+        // Probe writability with a temp file.
+        let probe = data_dir.join(".write_probe");
+        let writable = std::fs::write(&probe, b"").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if writable {
+            checks.push(CheckResult::Ok(format!(
+                "Data directory: {} (writable)",
+                data_dir.display()
+            )));
+        } else {
+            checks.push(CheckResult::Error(format!(
+                "Data directory {} is not writable",
+                data_dir.display()
+            )));
+        }
+    } else {
+        checks.push(CheckResult::Warn(format!(
+            "Data directory {} does not exist (will be created on first start)",
+            data_dir.display()
+        )));
+    }
+
+    // ── 4. Lock file ──────────────────────────────────────────────────────
+    let lock_path = data_dir.join("daemon.lock");
+    if lock_path.exists() {
+        // Read the PID stored in the lockfile and check if that process is alive.
+        let pid_opt = std::fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        match pid_opt {
+            Some(pid) => {
+                // POSIX: kill(pid, 0) — check existence without sending a signal.
+                let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                if alive {
+                    if daemon_running {
+                        checks.push(CheckResult::Ok(format!(
+                            "Lock file: healthy (PID {} is running)",
+                            pid
+                        )));
+                    } else {
+                        checks.push(CheckResult::Warn(format!(
+                            "Lock file contains PID {} which is alive but /health failed",
+                            pid
+                        )));
+                    }
+                } else {
+                    checks.push(CheckResult::Warn(format!(
+                        "Stale lock file: PID {} is not running ({})",
+                        pid,
+                        lock_path.display()
+                    )));
+                }
+            }
+            None => {
+                checks.push(CheckResult::Warn(format!(
+                    "Lock file exists but contains no valid PID ({})",
+                    lock_path.display()
+                )));
+            }
+        }
+    } else {
+        checks.push(CheckResult::Ok("Lock file: healthy (no stale lock)".into()));
+    }
+
+    // ── 5. Indexes ────────────────────────────────────────────────────────
+    if daemon_running {
+        let list = client.get(format!("{}/indexes", base)).send().await;
+        let list_body: serde_json::Value = match list {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+            _ => serde_json::json!({"indexes": []}),
+        };
+        let empty_arr: Vec<serde_json::Value> = Vec::new();
+        let names: Vec<String> = list_body
+            .get("indexes")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty_arr)
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+
+        if names.is_empty() {
+            checks.push(CheckResult::Warn(
+                "No indexes registered — run `trusty-search index` to add a project".into(),
+            ));
+        } else {
+            // Fetch status for each index concurrently.
+            let mut joinset = tokio::task::JoinSet::new();
+            for name in &names {
+                let n = name.clone();
+                let url = format!("{}/indexes/{}/status", base, n);
+                let c = client.clone();
+                joinset.spawn(async move {
+                    let body: serde_json::Value = match c.get(&url).send().await {
+                        Ok(r) if r.status().is_success() => {
+                            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+                        }
+                        _ => serde_json::json!({}),
+                    };
+                    (n, body)
+                });
+            }
+            let mut per_index: Vec<(String, serde_json::Value)> = Vec::new();
+            while let Some(j) = joinset.join_next().await {
+                if let Ok(pair) = j {
+                    per_index.push(pair);
+                }
+            }
+            per_index.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let zero_count = per_index
+                .iter()
+                .filter(|(_, b)| b.get("chunk_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0)
+                .count();
+
+            if zero_count == 0 {
+                checks.push(CheckResult::Ok(format!(
+                    "{} index{} registered, all have chunks",
+                    per_index.len(),
+                    if per_index.len() == 1 { "" } else { "es" }
+                )));
+            } else {
+                checks.push(CheckResult::Warn(format!(
+                    "{} index{} registered, {} {} no chunks yet:",
+                    per_index.len(),
+                    if per_index.len() == 1 { "" } else { "es" },
+                    zero_count,
+                    if zero_count == 1 { "has" } else { "have" }
+                )));
+            }
+
+            // Print per-index breakdown (indented).
+            for (name, body) in &per_index {
+                let chunks = body
+                    .get("chunk_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let root = body
+                    .get("root_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let chunks_fmt = format_with_commas(chunks);
+                if chunks == 0 {
+                    println!(
+                        "    {} {:<16} {:>12} chunks  {} — run `trusty-search index` to populate",
+                        "⚠".yellow(),
+                        name.bold(),
+                        chunks_fmt,
+                        root.dimmed()
+                    );
+                    empty_indexes.push(EmptyIndex {
+                        name: name.clone(),
+                        root_path: root,
+                    });
+                } else {
+                    println!(
+                        "    {} {:<16} {:>12} chunks  {}",
+                        "✓".green(),
+                        name.bold(),
+                        chunks_fmt,
+                        root.dimmed()
+                    );
+                }
+            }
+        }
+    } else {
+        checks.push(CheckResult::Warn(
+            "Indexes: skipped (daemon not running)".into(),
+        ));
+    }
+
+    // ── 6. Port reachability ──────────────────────────────────────────────
+    if port_reachable("127.0.0.1", port).await {
+        checks.push(CheckResult::Ok(format!("Port {} is reachable", port)));
+    } else {
+        checks.push(CheckResult::Error(format!(
+            "Port {} is not reachable",
+            port
+        )));
+    }
+
+    (checks, empty_indexes)
+}
+
+/// Remove a stale lock file and report the outcome.
+fn fix_stale_lock(data_dir: &std::path::Path) {
+    let lock_path = data_dir.join("daemon.lock");
+    if lock_path.exists() {
+        let pid_opt = std::fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let stale = pid_opt
+            .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) } != 0)
+            .unwrap_or(true);
+        if stale {
+            match std::fs::remove_file(&lock_path) {
+                Ok(()) => println!("  {} Removed stale lock file {}", "✓".green(), lock_path.display()),
+                Err(e) => println!("  {} Could not remove lock file {}: {e}", "✗".red(), lock_path.display()),
+            }
+        } else {
+            println!("  {} Lock file is held by a live process — not removing", "⚠".yellow());
+        }
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1045,111 +1602,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status => {
-            // Why: a multi-index status overview is more useful than a single-index
-            // dump — the user wants to know "is the daemon up, and what's it serving".
-            // Calls /health + /indexes + per-index /status.
-            let base = daemon_base_url();
-            let client = reqwest::Client::new();
-
-            let health = client.get(format!("{}/health", base)).send().await;
-            let health_body: serde_json::Value = match health {
-                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
-                _ => {
-                    if cli.json {
-                        println!(r#"{{"daemon":"not_running"}}"#);
-                    } else {
-                        eprintln!("{} Daemon: not running ({})", "✗".red(), base);
-                    }
-                    std::process::exit(1);
-                }
-            };
-
-            let list = client.get(format!("{}/indexes", base)).send().await;
-            let list_body: serde_json::Value = match list {
-                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
-                _ => serde_json::json!({"indexes": []}),
-            };
-            let empty: Vec<serde_json::Value> = Vec::new();
-            let names: Vec<String> = list_body
-                .get("indexes")
-                .and_then(|v| v.as_array())
-                .unwrap_or(&empty)
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-
-            // Fetch per-index status concurrently.
-            let mut joinset = tokio::task::JoinSet::new();
-            for name in &names {
-                let n = name.clone();
-                let url = format!("{}/indexes/{}/status", base, n);
-                let c = client.clone();
-                joinset.spawn(async move {
-                    let body: serde_json::Value = match c.get(&url).send().await {
-                        Ok(r) if r.status().is_success() => {
-                            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
-                        }
-                        _ => serde_json::json!({}),
-                    };
-                    (n, body)
-                });
-            }
-            let mut per_index: Vec<(String, serde_json::Value)> = Vec::new();
-            while let Some(j) = joinset.join_next().await {
-                if let Ok(pair) = j {
-                    per_index.push(pair);
-                }
-            }
-            per_index.sort_by(|a, b| a.0.cmp(&b.0));
-
-            if cli.json {
-                let arr: Vec<serde_json::Value> = per_index
-                    .iter()
-                    .map(|(n, b)| serde_json::json!({"id": n, "status": b}))
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "daemon": "running",
-                        "url": base,
-                        "version": health_body.get("version").cloned().unwrap_or(serde_json::json!(null)),
-                        "indexes": arr,
-                    })
-                );
-            } else {
-                println!(
-                    "{} running ({})",
-                    "Daemon:".bold(),
-                    base.cyan()
-                );
-                if per_index.is_empty() {
-                    println!("{} {}", "Indexes:".bold(), "(none)".dimmed());
-                } else {
-                    println!("{}", "Indexes:".bold());
-                    for (name, body) in &per_index {
-                        let chunks = body
-                            .get("chunk_count")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let files = body
-                            .get("file_count")
-                            .and_then(|v| v.as_u64());
-                        match files {
-                            Some(f) => println!(
-                                "  {:<24} — {} chunks, {} files",
-                                name.bold(),
-                                chunks,
-                                f
-                            ),
-                            None => println!(
-                                "  {:<24} — {} chunks",
-                                name.bold(),
-                                chunks
-                            ),
-                        }
-                    }
-                }
-            }
+            run_status(cli.json).await?;
         }
 
         Commands::Init {
@@ -1505,38 +1958,11 @@ async fn main() -> Result<()> {
             }
         }
 
+        // `health` is an alias registered on the `status` subcommand, so
+        // this arm catches the bare `Commands::Health` variant which is kept
+        // for backward-compat with any scripts that invoke it directly.
         Commands::Health => {
-            let url = format!("{}/health", daemon_base_url());
-            match reqwest::get(&url).await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value =
-                        resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
-                    if cli.json {
-                        println!("{}", body);
-                    } else {
-                        println!(
-                            "{} daemon ok at {} (version {})",
-                            "✓".green(),
-                            daemon_base_url().cyan(),
-                            body.get("version")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?")
-                        );
-                    }
-                }
-                Ok(resp) => {
-                    eprintln!("{} daemon returned {}", "✗".red(), resp.status());
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} could not reach daemon at {}: {e}",
-                        "✗".red(),
-                        daemon_base_url()
-                    );
-                    std::process::exit(1);
-                }
-            }
+            run_status(cli.json).await?;
         }
 
         Commands::Start { port } => {
@@ -1887,6 +2313,112 @@ async fn main() -> Result<()> {
                     "⚠".yellow(),
                     url
                 );
+            }
+        }
+
+        Commands::Doctor { fix } => {
+            println!("\ntrusty-search doctor\n");
+            println!("Checking configuration...\n");
+
+            let (checks, empty_indexes) = run_doctor_checks().await;
+
+            // Print all checks (index sub-lines were already printed inline
+            // by run_doctor_checks, so we skip the index summary line itself
+            // to avoid double-printing — it carries the per-index detail).
+            for check in &checks {
+                check.print();
+            }
+
+            let errors = checks.iter().filter(|c| c.is_error()).count();
+            let warnings = checks.iter().filter(|c| c.is_warn()).count();
+
+            // ── Fix mode ──────────────────────────────────────────────────
+            if fix {
+                let mut fixed_any = false;
+
+                // Fix 1: Stale lock file.
+                let data_dir = dirs::data_local_dir()
+                    .map(|d| d.join("trusty-search"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/trusty-search"));
+                let lock_path = data_dir.join("daemon.lock");
+                if lock_path.exists() {
+                    let pid_opt = std::fs::read_to_string(&lock_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    let stale = pid_opt
+                        .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) } != 0)
+                        .unwrap_or(true);
+                    if stale {
+                        println!("\nFixing issues...");
+                        fix_stale_lock(&data_dir);
+                        fixed_any = true;
+                    }
+                }
+
+                // Fix 2: Zero-chunk indexes — reindex each one.
+                if !empty_indexes.is_empty() {
+                    if !fixed_any {
+                        println!("\nFixing issues...");
+                        fixed_any = true;
+                    }
+                    for idx in &empty_indexes {
+                        let root = if idx.root_path.is_empty() {
+                            eprintln!(
+                                "  {} '{}' has no root_path — cannot auto-fix; run `trusty-search index` manually",
+                                "⚠".yellow(),
+                                idx.name
+                            );
+                            continue;
+                        } else {
+                            std::path::PathBuf::from(&idx.root_path)
+                        };
+                        println!("  Indexing '{}'...", idx.name);
+                        match run_reindex(&idx.name, &root).await {
+                            Ok(()) => println!("  {} '{}' done", "✓".green(), idx.name),
+                            Err(e) => println!("  {} '{}' failed: {e}", "✗".red(), idx.name),
+                        }
+                    }
+                }
+
+                // Fix 3: Missing model — cannot pre-download, just inform.
+                let has_model_warn = checks.iter().any(|c| {
+                    matches!(c, CheckResult::Warn(msg) if msg.contains("not cached") || msg.contains("not found"))
+                });
+                if has_model_warn {
+                    if !fixed_any {
+                        println!("\nFixing issues...");
+                    }
+                    println!(
+                        "  {} Model downloads automatically on `trusty-search start` — no manual action needed",
+                        "·".dimmed()
+                    );
+                }
+            }
+
+            // ── Summary ───────────────────────────────────────────────────
+            println!();
+            if errors == 0 && warnings == 0 {
+                println!("{}", "Everything looks good!".green().bold());
+            } else {
+                if errors > 0 || warnings > 0 {
+                    println!(
+                        "Issues found: {} warning{}, {} error{}",
+                        warnings,
+                        if warnings == 1 { "" } else { "s" },
+                        errors,
+                        if errors == 1 { "" } else { "s" }
+                    );
+                }
+                if !fix {
+                    println!(
+                        "Run {} to attempt automatic repair.",
+                        "trusty-search doctor --fix".cyan()
+                    );
+                }
+            }
+
+            if errors > 0 {
+                std::process::exit(1);
             }
         }
 
