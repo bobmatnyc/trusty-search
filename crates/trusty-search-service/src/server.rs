@@ -21,18 +21,27 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Json,
+    },
     routing::{delete, get, post},
     Router,
 };
+use dashmap::DashMap;
+use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::sync::Arc;
+use tokio_stream::wrappers::BroadcastStream;
 use trusty_search_core::{
     classifier::QueryClassifier,
     facts::{FactRecord, FactStore},
     indexer::{CodeIndexer, SearchQuery},
     registry::{IndexHandle, IndexId, IndexRegistry},
 };
+
+use crate::reindex::{spawn_reindex, ReindexProgress, ReindexStatus};
 
 /// Shared state injected into every axum handler.
 #[derive(Clone)]
@@ -42,6 +51,22 @@ pub struct SearchAppState {
     /// (they return 503 when unavailable) — useful for tests that don't need
     /// persistence.
     pub facts: Option<FactStore>,
+    /// Per-index reindex progress (live counters + SSE replay buffer). Started
+    /// by `POST /indexes/:id/reindex`, consumed by
+    /// `GET /indexes/:id/reindex/stream`. Lazily populated.
+    pub reindex_progress: Arc<DashMap<IndexId, Arc<ReindexProgress>>>,
+}
+
+impl SearchAppState {
+    /// Convenience constructor for callers (`daemon`, tests) that want default
+    /// reindex tracking without hand-rolling the `Arc<DashMap<…>>`.
+    pub fn new(registry: IndexRegistry, facts: Option<FactStore>) -> Self {
+        Self {
+            registry,
+            facts,
+            reindex_progress: Arc::new(DashMap::new()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -85,6 +110,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/:id/index-file", post(index_file_handler))
         .route("/indexes/:id/remove-file", post(remove_file_handler))
         .route("/indexes/:id/reindex", post(reindex_handler))
+        .route("/indexes/:id/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/:id/complexity_hotspots", get(complexity_hotspots_handler))
         .route("/indexes/:id/smells", get(smells_handler))
         .route("/indexes/:id/quality", get(quality_handler))
@@ -411,16 +437,95 @@ async fn quality_handler(
     })))
 }
 
+/// Optional body for `POST /indexes/:id/reindex`: lets the CLI override the
+/// `root_path` stored on the handle (useful when registering + reindexing in
+/// one CLI flow).
+#[derive(Deserialize, Default)]
+pub struct ReindexRequest {
+    #[serde(default)]
+    pub root_path: Option<std::path::PathBuf>,
+}
+
 async fn reindex_handler(
     State(state): State<Arc<SearchAppState>>,
     Path(id): Path<String>,
+    body: Option<Json<ReindexRequest>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let index_id = IndexId::new(id);
-    let _handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
-    // Fire-and-forget: a real reindex would walk root_path and re-feed every
-    // file. For now we acknowledge — issue #3 owns the walker.
+    let index_id = IndexId::new(id.clone());
+    let mut handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    // If caller supplied a root_path and the stored handle doesn't have one
+    // (or differs), re-register with the new path. We can't mutate the
+    // existing Arc in place, but registering replaces the entry.
+    if let Some(Json(req)) = body {
+        if let Some(new_root) = req.root_path {
+            if handle.root_path.as_os_str().is_empty() || handle.root_path != new_root {
+                let indexer = Arc::clone(&handle.indexer);
+                let new_handle = IndexHandle {
+                    id: index_id.clone(),
+                    indexer,
+                    root_path: new_root,
+                };
+                handle = state.registry.register(new_handle);
+            }
+        }
+    }
+
+    // Replace any prior progress entry so SSE subscribers see fresh state.
+    let progress = Arc::new(ReindexProgress::new());
+    state
+        .reindex_progress
+        .insert(index_id.clone(), Arc::clone(&progress));
+
+    spawn_reindex(handle, progress);
+
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,
         "queued": true,
+        "stream_url": format!("/indexes/{}/reindex/stream", index_id.0),
     })))
+}
+
+/// SSE stream of reindex progress events.
+///
+/// Replays any events already buffered (so a late subscriber still sees the
+/// `start` event) and then streams live events from the broadcast channel
+/// until the reindex completes.
+async fn reindex_stream_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let progress = state
+        .reindex_progress
+        .get(&index_id)
+        .map(|r| Arc::clone(r.value()))
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Snapshot the replay buffer first so we don't miss the `start` event,
+    // then subscribe for live updates. New events that arrive between the
+    // snapshot and subscription will appear in both — duplicates are harmless
+    // for SSE consumers and rare in practice.
+    let replay = progress.events.lock().await.clone();
+    let rx = progress.sender.subscribe();
+    let live = BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
+
+    let initial_status = progress.status.load();
+    let stream = stream::iter(replay)
+        .chain(live)
+        .map(|line| Ok(Event::default().data(line)));
+
+    // If the reindex already finished before the subscriber connected, the
+    // replay buffer contains the terminal `complete` event and the live
+    // stream will idle forever. Trim to just the replay in that case.
+    let stream: futures::future::Either<_, _> = if initial_status != ReindexStatus::Running {
+        let replay_only = progress.events.lock().await.clone();
+        futures::future::Either::Left(
+            stream::iter(replay_only).map(|line| Ok(Event::default().data(line))),
+        )
+    } else {
+        futures::future::Either::Right(stream)
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
