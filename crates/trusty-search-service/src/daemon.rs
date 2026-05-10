@@ -66,6 +66,12 @@ pub fn daemon_port_path() -> Result<PathBuf, DaemonError> {
 }
 
 fn daemon_dir() -> Result<PathBuf, DaemonError> {
+    // NB: We use `data_local_dir()` (not the shared `trusty_common::resolve_data_dir`
+    // which uses `data_dir()`) because the lockfile path is replicated in `main.rs`
+    // (`Stop`, `daemon_port_path`) against `data_local_dir()`. They must agree;
+    // diverging would break daemon discovery on Windows where the two paths differ
+    // (Roaming vs Local). If/when `trusty-common` grows a `resolve_data_local_dir`
+    // helper, switch both sides at once.
     let dir = dirs::data_local_dir()
         .ok_or(DaemonError::NoDataDir)?
         .join("trusty-search");
