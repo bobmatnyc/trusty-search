@@ -23,8 +23,9 @@ use colored::Colorize;
 use detect::{detect_project, DetectionMethod};
 use eventsource_stream::Eventsource;
 use futures_util::stream::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::io;
+use std::time::Duration;
 
 /// Machine-wide hybrid code search — BM25 + vector + knowledge graph.
 ///
@@ -497,30 +498,165 @@ fn fmt_elapsed(ms: u64) -> String {
     }
 }
 
-/// Build the indicatif progress bar used by reindex.
-///
-/// Why: a real terminal progress bar with ETA gives the user immediate
-/// feedback on long-running 10k+ file reindex jobs. On non-TTY (piped) output
-/// indicatif degrades to plain periodic prints automatically.
-fn make_reindex_progress_bar(index_id: &str, total_files: u64) -> ProgressBar {
-    let pb = ProgressBar::new(total_files.max(1));
-    // Why: if we can't parse the template, fall back to default style rather
-    // than panic — losing ETA is better than aborting the command.
-    let style = ProgressStyle::with_template(
-        "{spinner:.cyan} Indexing {msg} [{bar:40.cyan/blue}] {pos}/{len} files ({percent}%) — {eta} remaining",
-    )
-    .map(|s| s.progress_chars("█░ "))
-    .ok();
-    if let Some(s) = style {
-        pb.set_style(s);
+/// Format an elapsed seconds count as `Xm Ys` (or `Ys`).
+fn fmt_secs(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
     }
-    pb.set_message(index_id.to_string());
-    pb
+}
+
+/// Multi-line live progress display for a reindex.
+///
+/// Why: a single-line `ProgressBar` can't simultaneously show file progress,
+/// chunk count, skipped count, speed, and elapsed/ETA. `MultiProgress` stacks
+/// three lines (header / files bar / stats) that update independently.
+///
+/// Layout:
+///   ⟳ Indexing <index>
+///     [████████░░░░] 7,234/14,445 files (50%) — ETA 50s
+///     Chunks: 58,402  Skipped: 12  Speed: 142 files/s  Elapsed: 50s  ETA: ~50s
+struct ReindexUi {
+    /// Held to keep the MultiProgress draw target alive for the bars' lifetime.
+    #[allow(dead_code)]
+    multi: MultiProgress,
+    header: ProgressBar,
+    files: ProgressBar,
+    stats: ProgressBar,
+}
+
+impl ReindexUi {
+    fn new(index_id: &str) -> Self {
+        let multi = MultiProgress::new();
+
+        let header = multi.add(ProgressBar::new(1));
+        if let Ok(s) = ProgressStyle::with_template("{spinner:.cyan} {msg}") {
+            header.set_style(s);
+        }
+        header.set_message(format!("Indexing {}", index_id.bold()));
+        header.enable_steady_tick(Duration::from_millis(120));
+
+        let files = multi.add(ProgressBar::new(1));
+        if let Ok(s) = ProgressStyle::with_template(
+            "  [{bar:40.cyan/blue}] {pos}/{len} files ({percent}%) — ETA {eta}",
+        ) {
+            files.set_style(s.progress_chars("█░ "));
+        }
+
+        let stats = multi.add(ProgressBar::new(1));
+        if let Ok(s) = ProgressStyle::with_template("  {msg}") {
+            stats.set_style(s);
+        }
+        stats.set_message("Waiting for daemon…".to_string());
+
+        Self {
+            multi,
+            header,
+            files,
+            stats,
+        }
+    }
+
+    fn set_total(&self, total: u64) {
+        self.files.set_length(total.max(1));
+    }
+
+    fn set_position(&self, indexed: u64) {
+        self.files.set_position(indexed);
+    }
+
+    fn update_stats(&self, indexed: u64, total_chunks: u64, skipped: u64, elapsed_secs: u64) {
+        let files_per_sec = if elapsed_secs > 0 {
+            indexed / elapsed_secs
+        } else {
+            0
+        };
+        self.stats.set_message(format!(
+            "Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}",
+            chunks = format_with_commas(total_chunks),
+            skipped = format_with_commas(skipped),
+            fps = files_per_sec,
+            elapsed = fmt_secs(elapsed_secs),
+        ));
+    }
+
+    fn finish(self, final_msg: String) {
+        self.files.finish_and_clear();
+        self.stats.finish_and_clear();
+        self.header.finish_with_message(final_msg);
+    }
+
+    fn abandon(self, final_msg: String) {
+        self.files.abandon();
+        self.stats.abandon();
+        self.header.abandon_with_message(final_msg);
+    }
+}
+
+/// Options controlling reindex CLI behaviour.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReindexOptions {
+    /// After the reindex completes, fetch `/status` and issue a sanity-check
+    /// search to verify the index is healthy. Enabled by `--force` to give
+    /// the user a blue-green-style safety net.
+    ///
+    /// Note: the daemon's reindex is NOT atomic blue-green — it mutates the
+    /// in-memory index in place via a write lock per batch (see
+    /// `crates/trusty-search-service/src/reindex.rs::spawn_reindex` —
+    /// `index_files_batch_no_rebuild` adds chunks per-batch). If verify fails
+    /// after a `--force`, the index is already in its new (possibly broken)
+    /// state. We surface that fact loudly so the user can manually re-run.
+    verify_after: bool,
+    /// Chunk count snapshot taken before the reindex started, used to print
+    /// "(was N)" in the final verify message.
+    prior_chunk_count: Option<u64>,
+}
+
+/// Outcome of a reindex run, captured for the post-verify step and the final
+/// summary line. `indexed` includes skipped files (the daemon emits one
+/// `indexed++` per file regardless of whether it was hashed-skip or re-embedded).
+#[derive(Debug, Default, Clone, Copy)]
+struct ReindexOutcome {
+    indexed: u64,
+    total_chunks: u64,
+    skipped: u64,
+    errors: u64,
+    elapsed_ms: u64,
+    completed: bool,
+}
+
+/// Plain reindex (no post-verify). Used by the non-force `index` command, the
+/// bare `reindex` command, and the doctor auto-repair path. The daemon's
+/// hash-skip optimization (see `reindex.rs::hash_content`) means unchanged
+/// files are cheap, so calling this even when nothing changed is fine.
+async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
+    run_reindex_with(index_id, root_path, ReindexOptions::default())
+        .await
+        .map(|_| ())
+}
+
+/// `index --force` reindex: snapshot the prior chunk count, kick off a full
+/// reindex, and run a post-reindex health check. Exits 1 if the new index
+/// looks unhealthy (no chunks or empty sanity query).
+async fn run_reindex_force(index_id: &str, root_path: &std::path::Path) -> Result<()> {
+    let prior = fetch_chunk_count(index_id).await;
+    let opts = ReindexOptions {
+        verify_after: true,
+        prior_chunk_count: prior,
+    };
+    run_reindex_with(index_id, root_path, opts).await.map(|_| ())
 }
 
 /// Drive a reindex: POST /reindex, then connect to the SSE stream and render
-/// progress with an indicatif progress bar.
-async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
+/// progress with an indicatif `MultiProgress` layout (header + files bar +
+/// stats line). A wall-clock ticker keeps the stats line moving even when
+/// SSE events are sparse (e.g. the embedder is mid-batch).
+async fn run_reindex_with(
+    index_id: &str,
+    root_path: &std::path::Path,
+    opts: ReindexOptions,
+) -> Result<ReindexOutcome> {
     let base = daemon_base_url();
     let client = trusty_common::server::daemon_http_client()?;
 
@@ -567,17 +703,70 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
         );
         std::process::exit(1);
     }
-    // Why: we build the progress bar lazily because the `start` SSE event
-    // carries the authoritative `total_files`. Until then we have nothing
-    // sensible to plug into `ProgressBar::new`.
-    let mut pb: Option<ProgressBar> = None;
+    // MultiProgress UI: header + files bar + stats line. Built eagerly so
+    // the user sees something during the 1–2 second daemon warmup before the
+    // first SSE event arrives.
+    let ui = ReindexUi::new(index_id);
+
+    // Atomics shared with the wall-clock ticker. The ticker refreshes the
+    // stats line every second so the user sees movement even when the SSE
+    // stream is idle (e.g. mid-batch embedding of 256 chunks).
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc as StdArc;
+    let started = std::time::Instant::now();
+    let indexed_now = StdArc::new(AtomicU64::new(0));
+    let chunks_now = StdArc::new(AtomicU64::new(0));
+    let skipped_now = StdArc::new(AtomicU64::new(0));
+    let tick_done = StdArc::new(AtomicBool::new(false));
+
+    let ticker = {
+        let indexed_now = indexed_now.clone();
+        let chunks_now = chunks_now.clone();
+        let skipped_now = skipped_now.clone();
+        let tick_done = tick_done.clone();
+        let stats_bar = ui.stats.clone();
+        let files_bar = ui.files.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.tick().await; // discard immediate tick
+            loop {
+                interval.tick().await;
+                if tick_done.load(Ordering::Acquire) {
+                    break;
+                }
+                let elapsed = started.elapsed().as_secs();
+                let indexed = indexed_now.load(Ordering::Acquire);
+                let chunks = chunks_now.load(Ordering::Acquire);
+                let skipped = skipped_now.load(Ordering::Acquire);
+                let fps = if elapsed > 0 { indexed / elapsed } else { 0 };
+                let total = files_bar.length().unwrap_or(0);
+                let eta = if fps > 0 && total > indexed {
+                    fmt_secs((total - indexed) / fps)
+                } else {
+                    "?".to_string()
+                };
+                stats_bar.set_message(format!(
+                    "Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}s  ETA: ~{eta}",
+                    chunks = format_with_commas(chunks),
+                    skipped = format_with_commas(skipped),
+                    fps = fps,
+                    elapsed = elapsed,
+                    eta = eta,
+                ));
+            }
+        })
+    };
+
+    let mut outcome = ReindexOutcome::default();
     let mut done = false;
 
-    // `eventsource-stream` handles the SSE framing (event-block delimiting,
-    // `data: ` prefix stripping, multi-line data folding) so this loop only
-    // sees one decoded `Event` per real SSE event. The daemon ships JSON
-    // payloads inside `data: …`; we keep the dispatch on the inner `"event"`
-    // field of that JSON to match the old wire protocol byte-for-byte.
+    // `eventsource-stream` handles SSE framing. The daemon emits these event
+    // types (see `crates/trusty-search-service/src/reindex.rs::spawn_reindex`):
+    //   - start:    total_files, index_id, root_path
+    //   - batch:    batch_files, batch_chunks, indexed, total_files, elapsed_ms
+    //   - skip:     file, indexed, total_files (hash matched OR minified)
+    //   - error:    message, file (or files for a batch failure)
+    //   - complete: indexed, total_chunks, skipped, errors, elapsed_ms
     let byte_stream = resp.bytes_stream();
     let stream = byte_stream.eventsource();
     tokio::pin!(stream);
@@ -585,11 +774,8 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
         let event = match stream.next().await {
             Some(Ok(e)) => e,
             Some(Err(e)) => {
-                if let Some(p) = pb.as_ref() {
-                    p.abandon_with_message(format!("stream read error: {e}"));
-                } else {
-                    eprintln!("\n{} stream read error: {e}", "⚠".yellow());
-                }
+                ui.stats
+                    .println(format!("{} stream read error: {e}", "⚠".yellow()));
                 break;
             }
             None => break,
@@ -605,71 +791,73 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
                     .get("total_files")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                // Replace any previous bar (defensive: shouldn't happen).
-                if let Some(p) = pb.take() {
-                    p.finish_and_clear();
-                }
-                pb = Some(make_reindex_progress_bar(index_id, total));
+                ui.set_total(total);
             }
-            Some("progress") => {
+            Some("batch") => {
                 let indexed = evt
                     .get("indexed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let batch_chunks = evt
+                    .get("batch_chunks")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 let total = evt
                     .get("total_files")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                // Lazy-init in case daemon skips `start` event.
-                let bar = pb
-                    .get_or_insert_with(|| make_reindex_progress_bar(index_id, total.max(1)));
-                if total > 0 && bar.length() != Some(total) {
-                    bar.set_length(total);
+                if total > 0 && ui.files.length() != Some(total.max(1)) {
+                    ui.set_total(total);
                 }
-                bar.set_position(indexed);
+                indexed_now.store(indexed, Ordering::Release);
+                let new_chunks =
+                    chunks_now.fetch_add(batch_chunks, Ordering::AcqRel) + batch_chunks;
+                ui.set_position(indexed);
+                ui.update_stats(
+                    indexed,
+                    new_chunks,
+                    skipped_now.load(Ordering::Acquire),
+                    started.elapsed().as_secs(),
+                );
             }
-            Some("complete") => {
+            Some("skip") => {
                 let indexed = evt
                     .get("indexed")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let chunks = evt
+                indexed_now.store(indexed, Ordering::Release);
+                let skipped = skipped_now.fetch_add(1, Ordering::AcqRel) + 1;
+                ui.set_position(indexed);
+                ui.update_stats(
+                    indexed,
+                    chunks_now.load(Ordering::Acquire),
+                    skipped,
+                    started.elapsed().as_secs(),
+                );
+            }
+            Some("complete") => {
+                outcome.indexed = evt
+                    .get("indexed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                outcome.total_chunks = evt
                     .get("total_chunks")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let ms = evt
-                    .get("elapsed_ms")
+                outcome.skipped = evt
+                    .get("skipped")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let errors = evt
+                    .unwrap_or_else(|| skipped_now.load(Ordering::Acquire));
+                outcome.errors = evt
                     .get("errors")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let elapsed = fmt_elapsed(ms);
-                let final_msg = if errors > 0 {
-                    format!(
-                        "{} Indexed {} files → {} chunks  [took {}, {} errors]",
-                        "✓".green(),
-                        indexed,
-                        chunks,
-                        elapsed,
-                        errors
-                    )
-                } else {
-                    format!(
-                        "{} Indexed {} files → {} chunks  [took {}]",
-                        "✓".green(),
-                        indexed,
-                        chunks,
-                        elapsed
-                    )
-                };
-                if let Some(bar) = pb.take() {
-                    bar.set_position(indexed);
-                    bar.finish_with_message(final_msg);
-                } else {
-                    println!("{final_msg}");
-                }
+                outcome.elapsed_ms = evt
+                    .get("elapsed_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                outcome.completed = true;
+                ui.set_position(outcome.indexed);
                 done = true;
             }
             Some("error") => {
@@ -678,28 +866,147 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 let file = evt.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                // Use `println` on the bar so the line doesn't trample the bar.
-                if let Some(bar) = pb.as_ref() {
-                    bar.println(format!("{}  {}: {}", "⚠".yellow(), file, msg));
-                } else {
-                    eprintln!("{}  {}: {}", "⚠".yellow(), file, msg);
-                }
+                ui.stats
+                    .println(format!("{}  {}: {}", "⚠".yellow(), file, msg));
             }
             _ => {}
         }
     }
 
-    if let Some(bar) = pb.take() {
-        // If we never saw `complete`, abandon the bar with a clear note.
-        if !bar.is_finished() {
-            bar.abandon_with_message(format!(
-                "{} Reindex stream ended without completion event",
-                "⚠".yellow()
-            ));
+    // Stop the ticker before finishing the UI so it doesn't overwrite the
+    // final message during the brief window between finish() and shutdown.
+    tick_done.store(true, Ordering::Release);
+    let _ = ticker.await;
+
+    if !outcome.completed {
+        ui.abandon(format!(
+            "{} Reindex stream ended without completion event",
+            "⚠".yellow()
+        ));
+        anyhow::bail!("reindex did not complete");
+    }
+
+    // Final headline. We distinguish three cases:
+    //   1. errors > 0          → show error count + unchanged count
+    //   2. nothing changed     → "is up to date" message (Improvement 3)
+    //   3. some files changed  → "Indexed N changed files" with unchanged tally
+    let elapsed = fmt_elapsed(outcome.elapsed_ms);
+    let changed = outcome.indexed.saturating_sub(outcome.skipped);
+    let final_msg = if outcome.errors > 0 {
+        format!(
+            "{} Indexed {} files → {} chunks  [took {}, {} errors, {} unchanged]",
+            "✓".green(),
+            format_with_commas(changed),
+            format_with_commas(outcome.total_chunks),
+            elapsed,
+            outcome.errors,
+            format_with_commas(outcome.skipped),
+        )
+    } else if changed == 0 && outcome.indexed > 0 {
+        format!(
+            "{} '{}' is up to date ({} chunks, {} files — no changes detected)  [took {}]",
+            "✓".green(),
+            index_id,
+            format_with_commas(outcome.total_chunks),
+            format_with_commas(outcome.indexed),
+            elapsed,
+        )
+    } else {
+        format!(
+            "{} Indexed {} changed file{} → {} chunks  [took {}, {} unchanged]",
+            "✓".green(),
+            format_with_commas(changed),
+            if changed == 1 { "" } else { "s" },
+            format_with_commas(outcome.total_chunks),
+            elapsed,
+            format_with_commas(outcome.skipped),
+        )
+    };
+    ui.finish(final_msg);
+
+    // ── Post-reindex health check (blue-green safety net) ─────────────────
+    if opts.verify_after {
+        verify_reindex_health(&client, &base, index_id, &outcome, opts.prior_chunk_count)
+            .await?;
+    }
+
+    Ok(outcome)
+}
+
+/// After a `--force` reindex, fetch the new chunk count and run a sanity
+/// query. Exits 1 if either looks wrong.
+///
+/// Why: the daemon's reindex mutates the in-memory `CodeIndexer` in place
+/// (no shadow slot — see `reindex.rs::spawn_reindex`, which writes each batch
+/// directly into the live indexer via `index_files_batch_no_rebuild`). If the
+/// rebuild produces a broken index, the only signal the user has is "search
+/// returns nothing" hours later. This check surfaces that immediately.
+async fn verify_reindex_health(
+    client: &reqwest::Client,
+    base: &str,
+    index_id: &str,
+    outcome: &ReindexOutcome,
+    prior: Option<u64>,
+) -> Result<()> {
+    // 1) Chunk count via /status.
+    let status_url = format!("{}/indexes/{}/status", base, index_id);
+    let new_chunks = match client.get(&status_url).send().await {
+        Ok(r) if r.status().is_success() => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("chunk_count").and_then(|n| n.as_u64()))
+            .unwrap_or(0),
+        _ => 0,
+    };
+
+    // 2) Sanity query: pick something that hits virtually any source tree
+    //    (`fn` matches Rust; `function` JS/TS; `def` Python; etc.). One hit
+    //    in any single probe is enough to consider the index queryable.
+    let search_url = format!("{}/indexes/{}/search", base, index_id);
+    let probes = ["fn", "function", "def", "class", "the"];
+    let mut got_hit = false;
+    for probe in probes {
+        let body = serde_json::json!({ "text": probe, "top_k": 1 });
+        if let Ok(resp) = client.post(&search_url).json(&body).send().await {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let n = json
+                        .get("results")
+                        .and_then(|r| r.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if n > 0 {
+                        got_hit = true;
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    Ok(())
+    let healthy = new_chunks > 0 && got_hit && outcome.errors == 0;
+    let was = prior
+        .map(|p| format!(" (was {})", format_with_commas(p)))
+        .unwrap_or_default();
+    if healthy {
+        println!(
+            "{} Reindex complete: {} chunks{}",
+            "✓".green(),
+            format_with_commas(new_chunks),
+            was
+        );
+        Ok(())
+    } else {
+        eprintln!(
+            "{} Reindex produced unhealthy index: {} chunks{}, sanity query {} — old index NOT preserved (daemon reindex is in-place; see crates/trusty-search-service/src/reindex.rs)",
+            "✗".red(),
+            format_with_commas(new_chunks),
+            was,
+            if got_hit { "ok" } else { "returned 0 results" }
+        );
+        std::process::exit(1);
+    }
 }
 
 /// Register an index with the daemon (idempotent).
@@ -1731,26 +2038,21 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // 2. Skip reindex if already populated, unless --force.
-            //    `chunk_count > 0` is the simplest "is this index already
-            //    populated?" proxy that doesn't require new daemon endpoints.
-            if !force {
-                if let Some(chunks) = fetch_chunk_count(&index_name).await {
-                    if chunks > 0 {
-                        println!(
-                            "{} '{}' is up to date ({} chunks indexed). Use {} to force a full reindex.",
-                            "✓".green(),
-                            index_name.bold(),
-                            chunks,
-                            "--force".cyan()
-                        );
-                        return Ok(());
-                    }
-                }
+            // 2. Run the reindex. The daemon's hash-skip optimization
+            //    (see `reindex.rs::hash_content`) re-reads file content but
+            //    skips re-embedding when the SHA-256 matches the previous
+            //    run, so calling reindex even when nothing has changed is
+            //    cheap. The final summary line tells the user whether any
+            //    files actually changed (Improvement 3).
+            //
+            //    `--force` adds a post-reindex health check (chunk count +
+            //    sanity query) so the user gets immediate feedback if the
+            //    rebuild produced an empty/broken index.
+            if force {
+                run_reindex_force(&index_name, &project_path).await?;
+            } else {
+                run_reindex(&index_name, &project_path).await?;
             }
-
-            // 3. Run reindex with progress bar.
-            run_reindex(&index_name, &project_path).await?;
         }
 
         Commands::Add { file } => {
