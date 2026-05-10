@@ -13,7 +13,7 @@
 //!
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
-use crate::walker::walk_source_files;
+use crate::walker::{should_skip_content, walk_source_files};
 use dashmap::DashMap;
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
@@ -234,6 +234,27 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
                         continue;
                     }
                 };
+                // Content-level minification check. Catches minified bundles
+                // that don't carry a `.min.js` suffix — detected after read so
+                // we can inspect the actual line structure.
+                if should_skip_content(&path, &content) {
+                    tracing::debug!(
+                        "reindex: skipping minified content in {}",
+                        path.display()
+                    );
+                    progress.skipped.fetch_add(1, Ordering::Release);
+                    let indexed = progress.indexed.fetch_add(1, Ordering::Release) + 1;
+                    progress
+                        .push(serde_json::json!({
+                            "event": "skip",
+                            "file": rel,
+                            "reason": "minified",
+                            "indexed": indexed,
+                            "total_files": total,
+                        }))
+                        .await;
+                    continue;
+                }
                 let h = hash_content(&content);
                 if hashes.get(&path).map(|prev| *prev == h).unwrap_or(false) {
                     progress.skipped.fetch_add(1, Ordering::Release);
