@@ -177,6 +177,13 @@ pub struct CodeIndexer {
     /// a re-embed or HNSW round-trip per candidate.
     chunk_embeddings: Arc<RwLock<HashMap<String, Vec<f32>>>>,
 
+    /// Persistent BM25 index kept hot alongside the HNSW index. Mutated by
+    /// `add_chunk` / `index_files_batch` / `remove_*` so the search hot path
+    /// just acquires a read lock and runs `score_query_all` instead of
+    /// rebuilding the entire posting list every query (was O(N) over all
+    /// chunks; on a 115k-chunk index that dominated p50 latency by ~9s).
+    bm25: Arc<RwLock<Bm25Index>>,
+
     /// LRU cache of query → embedding, keyed by `hash_query`. Skips the embedder
     /// entirely on repeated queries — the daemon's "zero cold-start" promise.
     query_cache: Arc<Mutex<LruCache<u64, Vec<f32>>>>,
@@ -206,6 +213,7 @@ impl CodeIndexer {
             chunks: Arc::new(RwLock::new(HashMap::new())),
             entities: Arc::new(RwLock::new(HashMap::new())),
             chunk_embeddings: Arc::new(RwLock::new(HashMap::new())),
+            bm25: Arc::new(RwLock::new(Bm25Index::new())),
             query_cache: Arc::new(Mutex::new(LruCache::new(cap))),
             symbol_graph: Arc::new(RwLock::new(Arc::new(SymbolGraph::new()))),
             ner: crate::ner::NerExtractor::try_load(),
@@ -378,6 +386,25 @@ impl CodeIndexer {
             .unwrap_or(0)
     }
 
+    /// Compose the BM25 document text for a chunk: body + virtual_terms,
+    /// matching the layout the per-query rebuild used to construct.
+    fn bm25_doc_text(chunk: &RawChunk) -> String {
+        if chunk.virtual_terms.is_empty() {
+            chunk.content.clone()
+        } else {
+            let mut s = String::with_capacity(
+                chunk.content.len()
+                    + chunk.virtual_terms.iter().map(|t| t.len() + 1).sum::<usize>(),
+            );
+            s.push_str(&chunk.content);
+            for t in &chunk.virtual_terms {
+                s.push(' ');
+                s.push_str(t);
+            }
+            s
+        }
+    }
+
     /// Add (or replace) a chunk in the corpus. If an embedder + store are
     /// attached, the chunk is also embedded and upserted into the HNSW index.
     pub async fn add_chunk(&self, chunk: RawChunk) -> Result<()> {
@@ -399,6 +426,14 @@ impl CodeIndexer {
                 .await
                 .insert(id.clone(), vec);
         }
+
+        // Maintain the persistent BM25 index. Doing this on every write keeps
+        // the search path O(query_terms · postings) instead of O(corpus).
+        let bm25_text = Self::bm25_doc_text(&chunk);
+        self.bm25
+            .write()
+            .await
+            .upsert_document(&id, &bm25_text);
 
         self.chunks.write().await.insert(id, chunk);
         self.rebuild_symbol_graph().await;
@@ -611,6 +646,16 @@ impl CodeIndexer {
                 corpus.insert(chunk.id.clone(), chunk.clone());
             }
         }
+        // Persistent BM25: upsert each chunk's body+virtual_terms once. This
+        // replaces the per-query O(N) rebuild and is the dominant performance
+        // win on large indexes.
+        {
+            let mut bm25 = self.bm25.write().await;
+            for chunk in &all_chunks {
+                let text = Self::bm25_doc_text(chunk);
+                bm25.upsert_document(&chunk.id, &text);
+            }
+        }
         if self.embedder.is_some() {
             let mut emb_cache = self.chunk_embeddings.write().await;
             for (chunk, vec_opt) in all_chunks.iter().zip(embeddings.into_iter()) {
@@ -712,6 +757,12 @@ impl CodeIndexer {
                 emb.remove(id);
             }
         }
+        {
+            let mut bm25 = self.bm25.write().await;
+            for id in &ids {
+                bm25.remove_document(id);
+            }
+        }
         self.entities.write().await.remove(file_path);
         self.rebuild_symbol_graph().await;
         Ok(removed)
@@ -724,6 +775,7 @@ impl CodeIndexer {
         }
         self.chunks.write().await.remove(chunk_id);
         self.chunk_embeddings.write().await.remove(chunk_id);
+        self.bm25.write().await.remove_document(chunk_id);
         self.rebuild_symbol_graph().await;
         Ok(())
     }
@@ -755,58 +807,20 @@ impl CodeIndexer {
         Ok(Some(vec))
     }
 
-    /// Build a fresh BM25 index over the current chunk corpus and run `query`
-    /// against it. Returns `(chunk_id, score)` sorted by score desc.
+    /// Run `query` against the hot, persistent BM25 index.
     ///
-    /// Why per-query rebuilds: keeping IDF accurate as the corpus changes is
-    /// simpler than incremental BM25 maintenance, and our BM25 impl is in-memory
-    /// + cheap. When this becomes a hot spot we can cache the index between
-    ///   queries and invalidate on writes.
+    /// Why: the previous implementation rebuilt the entire posting list on
+    /// every search. On a 115k-chunk index that single line cost ~9.5s and
+    /// caused all results to rank by BM25 alone (the HNSW lane completed
+    /// fast but the latency budget was already gone). The index is now
+    /// maintained incrementally by `add_chunk` / `index_files_batch` /
+    /// `remove_*`, so the search hot path is just a read lock + posting walk.
     async fn bm25_search(&self, query: &str, want: usize) -> Result<Vec<(String, f32)>> {
-        let chunks = self.chunks.read().await;
-        if chunks.is_empty() {
+        let bm25 = self.bm25.read().await;
+        if bm25.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Stable iteration order so doc_id ↔ chunk_id is reproducible.
-        let mut entries: Vec<(&String, &RawChunk)> = chunks.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut bm25 = Bm25Index::new();
-        for (doc_id, (_, chunk)) in entries.iter().enumerate() {
-            // Issue #19: append entity-derived virtual_terms so symbolic queries
-            // ("authenticate", "Arc", "ParseError") can match the chunk via BM25
-            // even when those terms don't appear literally in the body.
-            if chunk.virtual_terms.is_empty() {
-                bm25.add_document(doc_id, &chunk.content);
-            } else {
-                let mut doc = String::with_capacity(
-                    chunk.content.len()
-                        + chunk.virtual_terms.iter().map(|t| t.len() + 1).sum::<usize>(),
-                );
-                doc.push_str(&chunk.content);
-                for t in &chunk.virtual_terms {
-                    doc.push(' ');
-                    doc.push_str(t);
-                }
-                bm25.add_document(doc_id, &doc);
-            }
-        }
-
-        let mut scored: Vec<(String, f32)> = entries
-            .iter()
-            .enumerate()
-            .map(|(doc_id, (id, _))| ((*id).clone(), bm25.score(query, doc_id)))
-            .filter(|(_, s)| *s > 0.0)
-            .collect();
-
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        scored.truncate(want);
-        Ok(scored)
+        Ok(bm25.score_query_all(query, want))
     }
 
     /// Run the HNSW lane. Returns `(chunk_id, distance)` style — we treat the

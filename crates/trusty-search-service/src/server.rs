@@ -36,9 +36,11 @@ use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use trusty_search_core::{
     classifier::QueryClassifier,
+    embed::Embedder,
     facts::{FactRecord, FactStore},
     indexer::{CodeIndexer, SearchQuery},
     registry::{IndexHandle, IndexId, IndexRegistry},
+    store::{UsearchStore, VectorStore},
 };
 
 use crate::reindex::{spawn_reindex, ReindexProgress, ReindexStatus};
@@ -55,17 +57,33 @@ pub struct SearchAppState {
     /// by `POST /indexes/:id/reindex`, consumed by
     /// `GET /indexes/:id/reindex/stream`. Lazily populated.
     pub reindex_progress: Arc<DashMap<IndexId, Arc<ReindexProgress>>>,
+    /// Process-wide embedder shared across every index so the (expensive)
+    /// fastembed ONNX session is initialized once. `None` keeps the daemon
+    /// in BM25-only mode — useful for tests that don't want to download the
+    /// model. The vector dimensionality is read from the embedder.
+    pub embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl SearchAppState {
     /// Convenience constructor for callers (`daemon`, tests) that want default
-    /// reindex tracking without hand-rolling the `Arc<DashMap<…>>`.
+    /// reindex tracking without hand-rolling the `Arc<DashMap<…>>`. Defaults
+    /// to BM25-only mode (no embedder); use [`Self::with_embedder`] to enable
+    /// the vector lane.
     pub fn new(registry: IndexRegistry, facts: Option<FactStore>) -> Self {
         Self {
             registry,
             facts,
             reindex_progress: Arc::new(DashMap::new()),
+            embedder: None,
         }
+    }
+
+    /// Builder-style: attach a shared embedder so newly registered indexes
+    /// run the full hybrid pipeline. The embedder is shared across every
+    /// index registered after this point.
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 }
 
@@ -221,7 +239,28 @@ async fn create_index_handler(
             "reason": "already exists",
         })));
     }
-    let indexer = CodeIndexer::new(req.id.clone(), req.root_path.clone());
+    // Bug A fix: when an embedder is attached to the shared state, wire the
+    // newly created indexer with both an `Embedder` and a `VectorStore` so
+    // the HNSW lane actually contributes results. Previously every index
+    // was BM25-only because `with_components` was never called, which is
+    // why the benchmark observed `match_reason: "bm25"` for 100% of hits.
+    let mut indexer = CodeIndexer::new(req.id.clone(), req.root_path.clone());
+    if let Some(embedder) = &state.embedder {
+        let dim = embedder.dimension();
+        match UsearchStore::new(dim) {
+            Ok(store) => {
+                let store: Arc<dyn VectorStore> = Arc::new(store);
+                indexer = indexer.with_components(Arc::clone(embedder), store);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "failed to allocate UsearchStore for index {}: {e} \
+                     — index will run in BM25-only mode",
+                    req.id
+                );
+            }
+        }
+    }
     let handle = IndexHandle {
         id: id.clone(),
         indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
