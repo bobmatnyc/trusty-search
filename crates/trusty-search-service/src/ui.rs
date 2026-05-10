@@ -27,6 +27,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::server::SearchAppState;
+use trusty_common::{openrouter_chat, ChatMessage as CommonChatMessage};
 
 /// Why: `include_dir!` walks at compile time and embeds every byte. We point
 /// it at `../../../ui/dist` (relative to this crate's `src/`).
@@ -197,68 +198,33 @@ pub async fn chat_handler(
         req.index_id, context_snippet
     );
 
-    let mut messages: Vec<serde_json::Value> = Vec::new();
-    messages.push(serde_json::json!({"role": "system", "content": system}));
-    for m in &req.history {
-        messages.push(serde_json::json!({"role": m.role, "content": m.content}));
-    }
-    messages.push(serde_json::json!({"role": "user", "content": req.message}));
-
-    // 3. Forward to OpenRouter.
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "model": "anthropic/claude-3.5-sonnet",
-        "messages": messages,
+    // Build messages in the shared `trusty_common::ChatMessage` shape.
+    let mut messages: Vec<CommonChatMessage> = Vec::new();
+    messages.push(CommonChatMessage {
+        role: "system".into(),
+        content: system,
     });
-    let resp = match client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("openrouter request failed: {e}")})),
-            )
-                .into_response()
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("openrouter {status}: {text}")})),
-        )
-            .into_response();
+    for m in &req.history {
+        messages.push(CommonChatMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        });
     }
+    messages.push(CommonChatMessage {
+        role: "user".into(),
+        content: req.message.clone(),
+    });
 
-    let json: serde_json::Value = match resp.json().await {
-        Ok(j) => j,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("openrouter response decode: {e}")})),
-            )
-                .into_response()
-        }
-    };
-
-    let reply = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("(no reply)")
-        .to_string();
-
-    Json(serde_json::json!({ "reply": reply, "raw": json })).into_response()
+    // 3. Forward to OpenRouter via the shared helper. Keeps every trusty-*
+    //    chat caller using identical headers / decoding / error semantics.
+    match openrouter_chat(&api_key, "anthropic/claude-3.5-sonnet", messages).await {
+        Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("openrouter: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 async fn search_for_context(
