@@ -3,9 +3,6 @@ members = [
     "crates/trusty-search-core",
     "crates/trusty-search-service",
     "crates/trusty-search-mcp",
-    "crates/trusty-mcp-core",
-    "crates/trusty-embedder",
-    "crates/trusty-common",
     ".",
 ]
 resolver = "2"
@@ -32,9 +29,9 @@ indicatif = "0.17"
 dotenvy = "0.15"
 include_dir = "0.7"
 open = "5"
-trusty-mcp-core = { path = "crates/trusty-mcp-core" }
-trusty-embedder = { path = "crates/trusty-embedder" }
-trusty-common = { path = "crates/trusty-common" }
+trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
+trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
+trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.0" }
 
 [package]
 name = "trusty-search"
