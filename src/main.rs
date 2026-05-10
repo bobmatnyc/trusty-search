@@ -21,9 +21,10 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use colored::Colorize;
 use detect::{detect_project, DetectionMethod};
+use eventsource_stream::Eventsource;
+use futures_util::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io;
-use std::time::Duration;
 
 /// Machine-wide hybrid code search — BM25 + vector + knowledge graph.
 ///
@@ -422,20 +423,6 @@ fn daemon_port_path() -> Option<std::path::PathBuf> {
     dirs::data_local_dir().map(|d| d.join("trusty-search").join("daemon.port"))
 }
 
-/// Build a reqwest client with short connect + total timeouts.
-///
-/// Why: every CLI command that talks to the daemon must fail fast when the
-/// daemon is not running.  Without timeouts, reqwest waits for the OS TCP
-/// stack (minutes on some platforms), freezing the terminal.
-/// What: 2 s connect timeout, 5 s total request timeout.  All daemon calls
-/// must use this instead of `reqwest::Client::new()`.
-fn daemon_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-}
-
 /// Index a single file via the daemon's `/indexes/:id/index-file` endpoint.
 async fn index_single_file(
     client: &reqwest::Client,
@@ -462,7 +449,7 @@ async fn index_single_file(
 /// a directory walks `walk_source_files` and indexes every match.
 async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
     let base = daemon_base_url();
-    let client = daemon_client()?;
+    let client = trusty_common::server::daemon_http_client()?;
 
     if path.is_dir() {
         let walk = trusty_search_service::walker::walk_source_files(path);
@@ -535,7 +522,7 @@ fn make_reindex_progress_bar(index_id: &str, total_files: u64) -> ProgressBar {
 /// progress with an indicatif progress bar.
 async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
     let base = daemon_base_url();
-    let client = daemon_client()?;
+    let client = trusty_common::server::daemon_http_client()?;
 
     let kickoff_url = format!("{}/indexes/{}/reindex", base, index_id);
     let kickoff_body = serde_json::json!({ "root_path": root_path });
@@ -580,19 +567,24 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
         );
         std::process::exit(1);
     }
-    let mut resp = resp;
-
     // Why: we build the progress bar lazily because the `start` SSE event
     // carries the authoritative `total_files`. Until then we have nothing
     // sensible to plug into `ProgressBar::new`.
     let mut pb: Option<ProgressBar> = None;
-    let mut buf = String::new();
     let mut done = false;
+
+    // `eventsource-stream` handles the SSE framing (event-block delimiting,
+    // `data: ` prefix stripping, multi-line data folding) so this loop only
+    // sees one decoded `Event` per real SSE event. The daemon ships JSON
+    // payloads inside `data: …`; we keep the dispatch on the inner `"event"`
+    // field of that JSON to match the old wire protocol byte-for-byte.
+    let byte_stream = resp.bytes_stream();
+    let stream = byte_stream.eventsource();
+    tokio::pin!(stream);
     while !done {
-        let chunk = match resp.chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(e) => {
+        let event = match stream.next().await {
+            Some(Ok(e)) => e,
+            Some(Err(e)) => {
                 if let Some(p) = pb.as_ref() {
                     p.abandon_with_message(format!("stream read error: {e}"));
                 } else {
@@ -600,113 +592,100 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
                 }
                 break;
             }
+            None => break,
         };
-        let text = match std::str::from_utf8(&chunk) {
-            Ok(s) => s,
+
+        let evt: serde_json::Value = match serde_json::from_str(event.data.trim()) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        buf.push_str(text);
-
-        // SSE events are separated by blank lines. Process each complete one.
-        while let Some(idx) = buf.find("\n\n") {
-            let event_block: String = buf.drain(..idx + 2).collect();
-            for line in event_block.lines() {
-                let Some(json_str) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
-                    continue;
+        match evt.get("event").and_then(|v| v.as_str()) {
+            Some("start") => {
+                let total = evt
+                    .get("total_files")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                // Replace any previous bar (defensive: shouldn't happen).
+                if let Some(p) = pb.take() {
+                    p.finish_and_clear();
+                }
+                pb = Some(make_reindex_progress_bar(index_id, total));
+            }
+            Some("progress") => {
+                let indexed = evt
+                    .get("indexed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let total = evt
+                    .get("total_files")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                // Lazy-init in case daemon skips `start` event.
+                let bar = pb
+                    .get_or_insert_with(|| make_reindex_progress_bar(index_id, total.max(1)));
+                if total > 0 && bar.length() != Some(total) {
+                    bar.set_length(total);
+                }
+                bar.set_position(indexed);
+            }
+            Some("complete") => {
+                let indexed = evt
+                    .get("indexed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let chunks = evt
+                    .get("total_chunks")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let ms = evt
+                    .get("elapsed_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let errors = evt
+                    .get("errors")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let elapsed = fmt_elapsed(ms);
+                let final_msg = if errors > 0 {
+                    format!(
+                        "{} Indexed {} files → {} chunks  [took {}, {} errors]",
+                        "✓".green(),
+                        indexed,
+                        chunks,
+                        elapsed,
+                        errors
+                    )
+                } else {
+                    format!(
+                        "{} Indexed {} files → {} chunks  [took {}]",
+                        "✓".green(),
+                        indexed,
+                        chunks,
+                        elapsed
+                    )
                 };
-                let evt: serde_json::Value = match serde_json::from_str(json_str.trim()) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                match evt.get("event").and_then(|v| v.as_str()) {
-                    Some("start") => {
-                        let total = evt
-                            .get("total_files")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        // Replace any previous bar (defensive: shouldn't happen).
-                        if let Some(p) = pb.take() {
-                            p.finish_and_clear();
-                        }
-                        pb = Some(make_reindex_progress_bar(index_id, total));
-                    }
-                    Some("progress") => {
-                        let indexed = evt
-                            .get("indexed")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let total = evt
-                            .get("total_files")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        // Lazy-init in case daemon skips `start` event.
-                        let bar = pb
-                            .get_or_insert_with(|| make_reindex_progress_bar(index_id, total.max(1)));
-                        if total > 0 && bar.length() != Some(total) {
-                            bar.set_length(total);
-                        }
-                        bar.set_position(indexed);
-                    }
-                    Some("complete") => {
-                        let indexed = evt
-                            .get("indexed")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let chunks = evt
-                            .get("total_chunks")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let ms = evt
-                            .get("elapsed_ms")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let errors = evt
-                            .get("errors")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let elapsed = fmt_elapsed(ms);
-                        let final_msg = if errors > 0 {
-                            format!(
-                                "{} Indexed {} files → {} chunks  [took {}, {} errors]",
-                                "✓".green(),
-                                indexed,
-                                chunks,
-                                elapsed,
-                                errors
-                            )
-                        } else {
-                            format!(
-                                "{} Indexed {} files → {} chunks  [took {}]",
-                                "✓".green(),
-                                indexed,
-                                chunks,
-                                elapsed
-                            )
-                        };
-                        if let Some(bar) = pb.take() {
-                            bar.set_position(indexed);
-                            bar.finish_with_message(final_msg);
-                        } else {
-                            println!("{final_msg}");
-                        }
-                        done = true;
-                    }
-                    Some("error") => {
-                        let msg = evt
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let file = evt.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                        // Use `println` on the bar so the line doesn't trample the bar.
-                        if let Some(bar) = pb.as_ref() {
-                            bar.println(format!("{}  {}: {}", "⚠".yellow(), file, msg));
-                        } else {
-                            eprintln!("{}  {}: {}", "⚠".yellow(), file, msg);
-                        }
-                    }
-                    _ => {}
+                if let Some(bar) = pb.take() {
+                    bar.set_position(indexed);
+                    bar.finish_with_message(final_msg);
+                } else {
+                    println!("{final_msg}");
+                }
+                done = true;
+            }
+            Some("error") => {
+                let msg = evt
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let file = evt.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                // Use `println` on the bar so the line doesn't trample the bar.
+                if let Some(bar) = pb.as_ref() {
+                    bar.println(format!("{}  {}: {}", "⚠".yellow(), file, msg));
+                } else {
+                    eprintln!("{}  {}: {}", "⚠".yellow(), file, msg);
                 }
             }
+            _ => {}
         }
     }
 
@@ -734,7 +713,7 @@ async fn register_index_with_daemon(
     project_path: &std::path::Path,
 ) -> Result<(bool, bool)> {
     let base = daemon_base_url();
-    let client = daemon_client()?;
+    let client = trusty_common::server::daemon_http_client()?;
     let create_url = format!("{}/indexes", base);
     let create_body = serde_json::json!({
         "id": index_name,
@@ -762,7 +741,7 @@ async fn register_index_with_daemon(
 async fn fetch_chunk_count(index_id: &str) -> Option<u64> {
     let base = daemon_base_url();
     let url = format!("{}/indexes/{}/status", base, index_id);
-    let client = daemon_client().ok()?;
+    let client = trusty_common::server::daemon_http_client().ok()?;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -919,7 +898,7 @@ async fn convert_one(
         };
     }
 
-    let client = match daemon_client() {
+    let client = match trusty_common::server::daemon_http_client() {
         Ok(c) => c,
         Err(e) => {
             return ConvertResult {
@@ -1062,7 +1041,7 @@ fn format_with_commas(n: u64) -> String {
 /// or emits JSON. Exits 1 when the daemon is not reachable.
 async fn run_status(json: bool) -> Result<()> {
     let base = daemon_base_url();
-    let client = daemon_client()?;
+    let client = trusty_common::server::daemon_http_client()?;
 
     let health = client.get(format!("{}/health", base)).send().await;
     let health_body: serde_json::Value = match health {
@@ -1305,7 +1284,7 @@ async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
     // ── 1. Daemon liveness ────────────────────────────────────────────────
     let port = read_daemon_port();
     let base = daemon_base_url();
-    let client = match daemon_client() {
+    let client = match trusty_common::server::daemon_http_client() {
         Ok(c) => c,
         Err(e) => {
             checks.push(CheckResult::Error(format!("failed to build HTTP client: {e}")));
@@ -1785,7 +1764,7 @@ async fn main() -> Result<()> {
             print_index_header(&index_id, warned);
             let base = daemon_base_url();
             let url = format!("{}/indexes/{}/remove-file", base, index_id);
-            let client = daemon_client()?;
+            let client = trusty_common::server::daemon_http_client()?;
             let body = serde_json::json!({ "path": file.display().to_string() });
             match client.post(&url).json(&body).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -1815,7 +1794,7 @@ async fn main() -> Result<()> {
         Commands::List => {
             let base = daemon_base_url();
             let url = format!("{}/indexes", base);
-            let list_client = daemon_client()?;
+            let list_client = trusty_common::server::daemon_http_client()?;
             match list_client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value =
@@ -1862,7 +1841,7 @@ async fn main() -> Result<()> {
             // For multi-index "*" with several indexes registered, require explicit choice
             // because the daemon's search endpoint is single-index-scoped.
             let base = daemon_base_url();
-            let client = daemon_client()?;
+            let client = trusty_common::server::daemon_http_client()?;
 
             let target_id: String = if let Some(id) = cli.index.as_ref() {
                 id.clone()
@@ -2324,7 +2303,7 @@ async fn main() -> Result<()> {
             // Probe the daemon — if it's not running, surface a friendly
             // hint instead of a confusing browser error page.
             let probe_url = format!("http://127.0.0.1:{port}/health");
-            let ui_probe_client = daemon_client()?;
+            let ui_probe_client = trusty_common::server::daemon_http_client()?;
             let healthy = ui_probe_client
                 .get(&probe_url)
                 .send()
