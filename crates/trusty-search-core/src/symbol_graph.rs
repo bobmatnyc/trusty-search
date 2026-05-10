@@ -111,6 +111,20 @@ impl SymbolGraph {
             g.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
         }
 
+        // Build a `simple_name → first-NodeIndex` lookup for qualified-symbol
+        // resolution. Replaces the per-edge `O(symbols)` linear suffix scan
+        // that used to live inside `resolve_callee`. On a 115k-chunk corpus
+        // with thousands of qualified methods this collapses what was an
+        // O(N²) build pass into O(N).
+        let mut by_suffix: HashMap<&str, NodeIndex> = HashMap::new();
+        for (sym, &idx) in g.by_symbol.iter() {
+            if let Some(suffix) = sym.rsplit("::").next() {
+                // First-write-wins to match the original semantics (the old
+                // `find` returned the first qualified hit).
+                by_suffix.entry(suffix).or_insert(idx);
+            }
+        }
+
         // Pass 2: add CallsFunction + Implements edges. For each call, also
         // try the simple-name suffix of a qualified caller's symbol, so
         // `Foo::bar` calling `baz` resolves even when only `baz` is in the
@@ -121,7 +135,7 @@ impl SymbolGraph {
                 continue;
             };
             for callee in calls {
-                if let Some(to) = g.resolve_callee(callee) {
+                if let Some(to) = g.resolve_callee_fast(callee, &by_suffix) {
                     if from != to {
                         g.graph.add_edge(from, to, EdgeKind::CallsFunction);
                     }
@@ -129,7 +143,7 @@ impl SymbolGraph {
             }
             // Issue #33: INHERITS / Implements edges from `inherits_from`.
             for parent in inherits_from {
-                if let Some(to) = g.resolve_callee(parent) {
+                if let Some(to) = g.resolve_callee_fast(parent, &by_suffix) {
                     if from != to {
                         g.graph.add_edge(from, to, EdgeKind::Implements);
                     }
@@ -194,21 +208,21 @@ impl SymbolGraph {
         g
     }
 
-    /// Resolve a callee name (already simple-name via the chunker) to a node.
-    /// Falls back to suffix match against qualified symbols so `bar` finds
-    /// `Foo::bar` when only the qualified version is in the index.
-    fn resolve_callee(&self, callee: &str) -> Option<NodeIndex> {
+    /// O(1) callee lookup using a precomputed `simple_name → NodeIndex` map.
+    ///
+    /// Why: the previous implementation linearly scanned every symbol per call
+    /// edge looking for a `::callee` suffix. On a 115k-chunk corpus this was
+    /// the single biggest cost in `build_from_chunks`. We now materialize the
+    /// suffix map once per build and look up in O(1).
+    fn resolve_callee_fast(
+        &self,
+        callee: &str,
+        by_suffix: &HashMap<&str, NodeIndex>,
+    ) -> Option<NodeIndex> {
         if let Some(&idx) = self.by_symbol.get(callee) {
             return Some(idx);
         }
-        // Suffix scan: prefer the first qualified match. Linear, but the graph
-        // is small relative to the chunk corpus and resolution happens once
-        // per call edge at build time.
-        let needle = format!("::{callee}");
-        self.by_symbol
-            .iter()
-            .find(|(sym, _)| sym.ends_with(&needle))
-            .map(|(_, &idx)| idx)
+        by_suffix.get(callee).copied()
     }
 
     /// Number of symbol nodes in the graph.

@@ -541,6 +541,39 @@ impl CodeIndexer {
         &self,
         files: &[(String, String)],
     ) -> Result<usize> {
+        self.index_files_batch_inner(files, false).await
+    }
+
+    /// Bulk-index variant that skips the trailing symbol graph rebuild.
+    ///
+    /// Why: a full reindex calls `index_files_batch` many times. Each call
+    /// previously rebuilt the symbol graph (`O(N + E)` over the entire corpus
+    /// with a per-edge suffix scan). On 14k files / 115k chunks that adds up
+    /// to the dominant non-embedding cost. The reindex orchestrator now calls
+    /// `index_files_batch_no_rebuild` per batch and rebuilds the graph **once**
+    /// at the very end.
+    ///
+    /// Single-file paths (`add_chunk`, `index_file`, file watcher) keep the
+    /// per-call rebuild for correctness — they're not in the bulk-cold-start
+    /// hot path.
+    pub async fn index_files_batch_no_rebuild(
+        &self,
+        files: &[(String, String)],
+    ) -> Result<usize> {
+        self.index_files_batch_inner(files, true).await
+    }
+
+    /// Public hook for the bulk reindex orchestrator: rebuild the symbol graph
+    /// once after a series of `index_files_batch_no_rebuild` calls.
+    pub async fn rebuild_symbol_graph_now(&self) {
+        self.rebuild_symbol_graph().await;
+    }
+
+    async fn index_files_batch_inner(
+        &self,
+        files: &[(String, String)],
+        defer_graph_rebuild: bool,
+    ) -> Result<usize> {
         if files.is_empty() {
             return Ok(0);
         }
@@ -640,15 +673,8 @@ impl CodeIndexer {
                 }
             }
         }
-        {
-            let mut corpus = self.chunks.write().await;
-            for chunk in &all_chunks {
-                corpus.insert(chunk.id.clone(), chunk.clone());
-            }
-        }
-        // Persistent BM25: upsert each chunk's body+virtual_terms once. This
-        // replaces the per-query O(N) rebuild and is the dominant performance
-        // win on large indexes.
+        // BM25: upsert each chunk's body+virtual_terms before we move chunks
+        // into the corpus. Doing this first avoids a second clone of `chunk`.
         {
             let mut bm25 = self.bm25.write().await;
             for chunk in &all_chunks {
@@ -664,6 +690,14 @@ impl CodeIndexer {
                 }
             }
         }
+        // Move chunks into the corpus. `drain(..)` lets us avoid cloning each
+        // RawChunk (which can be large — content + virtual_terms + calls).
+        {
+            let mut corpus = self.chunks.write().await;
+            for chunk in all_chunks.drain(..) {
+                corpus.insert(chunk.id.clone(), chunk);
+            }
+        }
 
         // 4) Persist entity lists.
         {
@@ -673,8 +707,11 @@ impl CodeIndexer {
             }
         }
 
-        // 5) Rebuild the symbol graph **once** for the whole batch.
-        self.rebuild_symbol_graph().await;
+        // 5) Rebuild the symbol graph **once** for the whole batch — unless
+        //    the caller is part of a bulk reindex that will rebuild at the end.
+        if !defer_graph_rebuild {
+            self.rebuild_symbol_graph().await;
+        }
 
         Ok(chunk_total)
     }
