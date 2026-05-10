@@ -417,13 +417,42 @@ impl CodeIndexer {
             chunk.virtual_terms = terms;
         }
 
+        // Snapshot chunk contents before move so we can run the ConceptCluster
+        // pass (Phase C, issue #22) below. Borrowing into the for-loop would
+        // hold the slice across `await`, which `add_chunk` doesn't allow.
+        let chunk_contents: Vec<String> =
+            chunks.iter().map(|c| c.content.clone()).collect();
+
         for chunk in chunks {
             self.add_chunk(chunk).await?;
         }
+
+        // Phase C: ConceptCluster entities (async, non-blocking; opt-in —
+        // only runs when an embedder is wired and the file has enough doc
+        // comments to cluster).
+        let mut all_entities = entities;
+        if let Some(embedder) = &self.embedder {
+            let refs: Vec<&str> = chunk_contents.iter().map(|s| s.as_str()).collect();
+            let cluster_entities = crate::concept_cluster::cluster_concepts_from_contents(
+                &refs,
+                embedder.as_ref(),
+                file_path,
+            )
+            .await;
+            if !cluster_entities.is_empty() {
+                tracing::debug!(
+                    "concept_cluster: {} ConceptCluster entities for {}",
+                    cluster_entities.len(),
+                    file_path
+                );
+                all_entities.extend(cluster_entities);
+            }
+        }
+
         self.entities
             .write()
             .await
-            .insert(file_path.to_string(), entities);
+            .insert(file_path.to_string(), all_entities);
         // `add_chunk` already rebuilds, but we also rebuild once more here so a
         // partial failure mid-file doesn't leave a stale graph; this is cheap.
         self.rebuild_symbol_graph().await;
