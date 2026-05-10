@@ -28,6 +28,8 @@ Machine-wide service (single install, one daemon per machine)
   └── IndexRegistry: DashMap<IndexId, Arc<IndexHandle>>
         └── IndexHandle
               ├── CodeIndexer: Arc<RwLock<HnswIndex>> (usearch) — concurrent reads
+              │     ├── parse_and_embed_files()  — runs outside write lock (parse + embed)
+              │     └── commit_parsed_batch()    — holds write lock only for redb+HNSW commit
               ├── BM25Builder: per-query, built from chunk corpus
               ├── KnowledgeGraph: Arc<SymbolGraph> (petgraph, tree-sitter derived)
               ├── FileWatcher: notify-debouncer-mini, 500ms debounce
@@ -141,7 +143,9 @@ POST   /chat                         OpenRouter proxy with search context inject
 - **HNSW pre-warmed**: index loaded at daemon start, never paged out
   (`Duration::MAX` cool-after)
 - **LRU embedding cache** (256 entries): repeated queries skip the embedder entirely
-- **Parallel indexing**: rayon for chunk hashing + batched fastembed calls
+- **~2–3 min for a 14k-file repo** (4 optimizations: INT8 quantized model
+  `AllMiniLML6V2Q`, batch upsert into HNSW, split lock via
+  `parse_and_embed_files` / `commit_parsed_batch`, batch size 512)
 
 ## CLI
 
@@ -250,8 +254,8 @@ via `cargo install trusty-search`.
 
 **Potential next steps**:
 - KG Phase B: IMPORTS/INHERITS edge propagation across file boundaries
-- SCIP ingest: complete `from_refs` wiring for IDE-grade symbol resolution
 - ONNX NER: enable doc comment entity extraction when model file is present
 - Benchmark regression CI gate (MRR@5 / Recall@10)
 - `cargo install trusty-search` smoke test in CI
 - Windows / Linux daemon path support in `trusty-common`
+- Blue-green verify canary query tuning (currently uses a fixed probe string)

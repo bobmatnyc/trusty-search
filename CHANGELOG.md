@@ -9,11 +9,27 @@ Versions correspond to `Cargo.toml` patch releases.
 
 ## [Unreleased]
 
-### Fixed
-- Replace `DefaultHasher` (SipHash, randomized per-build) with `sha2::Sha256` for stable content fingerprinting in incremental reindex skip logic ([#43])
+_(no unreleased changes)_
 
-### Refactored
-- Consolidate `cosine_similarity` — remove duplicate in `concept_cluster`, import from `mmr` module; `mmr` version handles mismatched lengths gracefully in release builds ([#46])
+---
+
+## [0.1.46] — 4 indexing speed optimizations
+
+### Performance
+- **INT8 quantized model**: switch fastembed model to `AllMiniLML6V2Q` (INT8 quantized); same 384-dim output, ~30% faster ONNX inference
+- **Batch upsert**: accumulate HNSW vectors across all chunks in a reindex pass and call a single `UsearchStore::upsert_batch` instead of N individual inserts; eliminates per-chunk lock overhead
+- **Split lock** (`parse_and_embed_files` / `commit_parsed_batch`): parsing + embedding now runs outside the write lock; the write lock is held only for the final redb + HNSW commit, enabling higher concurrency
+- **Batch size 512**: increase ONNX batch size 256 → 512 for better GPU/NEON/AVX2 saturation
+- Combined target: **< 2 min on a 14k-file repo** (down from ~2–4 min after v0.1.34)
+
+---
+
+## [0.1.45] — multi-line progress + blue-green verify + incremental index
+
+### Added
+- **Multi-line progress display**: `indicatif::MultiProgress` shows concurrent bars — one per active reindex stream — plus a summary line with aggregate `chunks/s`
+- **Blue-green verify**: after a reindex completes, a lightweight verification pass confirms the new HNSW index answers a canary query before swapping the live handle; prevents silent corruption on large repos
+- **Incremental index flag** (`--incremental`, default on): skips files whose sha2 fingerprint matches the stored value even across daemon restarts; `--force` still triggers a full rebuild
 
 ---
 
@@ -403,7 +419,9 @@ Versions correspond to `Cargo.toml` patch releases.
 - `IndexRegistry` with `DashMap` + `Arc<RwLock<CodeIndexer>>`
 - axum router skeleton
 
-[Unreleased]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.44...HEAD
+[Unreleased]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.46...HEAD
+[0.1.46]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.45...v0.1.46
+[0.1.45]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.44...v0.1.45
 [0.1.44]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.43...v0.1.44
 [0.1.43]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.42...v0.1.43
 [0.1.42]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.41...v0.1.42
