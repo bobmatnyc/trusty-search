@@ -85,6 +85,9 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/:id/index-file", post(index_file_handler))
         .route("/indexes/:id/remove-file", post(remove_file_handler))
         .route("/indexes/:id/reindex", post(reindex_handler))
+        .route("/indexes/:id/complexity_hotspots", get(complexity_hotspots_handler))
+        .route("/indexes/:id/smells", get(smells_handler))
+        .route("/indexes/:id/quality", get(quality_handler))
         .route("/facts", get(list_facts_handler).post(upsert_fact_handler))
         .route("/facts/:id", delete(delete_fact_handler))
         .with_state(Arc::new(state))
@@ -317,6 +320,94 @@ async fn remove_file_handler(
         "index_id": index_id.0,
         "path": req.path,
         "removed_chunks": removed,
+    })))
+}
+
+/// Query params for `GET /indexes/:id/complexity_hotspots`.
+#[derive(Deserialize)]
+pub struct HotspotsParams {
+    #[serde(default = "default_hotspots_top_n")]
+    pub top_n: usize,
+}
+
+fn default_hotspots_top_n() -> usize {
+    20
+}
+
+async fn complexity_hotspots_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<HotspotsParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let indexer = handle.indexer.read().await;
+    let mut chunks = indexer.all_chunks().await;
+    chunks.sort_by(|a, b| b.complexity.cyclomatic.cmp(&a.complexity.cyclomatic));
+    chunks.truncate(params.top_n);
+    Ok(Json(serde_json::json!({
+        "index_id": index_id.0,
+        "top_n": params.top_n,
+        "hotspots": chunks,
+    })))
+}
+
+async fn smells_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let indexer = handle.indexer.read().await;
+    let chunks: Vec<_> = indexer
+        .all_chunks()
+        .await
+        .into_iter()
+        .filter(|c| !c.complexity.smells.is_empty())
+        .collect();
+    Ok(Json(serde_json::json!({
+        "index_id": index_id.0,
+        "count": chunks.len(),
+        "chunks": chunks,
+    })))
+}
+
+async fn quality_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use trusty_search_core::complexity::ComplexityGrade;
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let indexer = handle.indexer.read().await;
+    let chunks = indexer.all_chunks().await;
+    let chunk_count = chunks.len();
+    let (sum_cyclo, grade_a, smell_count) = chunks.iter().fold(
+        (0u64, 0usize, 0usize),
+        |(s, a, sm), c| {
+            let a_inc = if c.complexity.grade == ComplexityGrade::A { 1 } else { 0 };
+            (
+                s + c.complexity.cyclomatic as u64,
+                a + a_inc,
+                sm + c.complexity.smells.len(),
+            )
+        },
+    );
+    let avg_cyclomatic = if chunk_count == 0 {
+        0.0_f32
+    } else {
+        sum_cyclo as f32 / chunk_count as f32
+    };
+    let pct_grade_a = if chunk_count == 0 {
+        0.0_f32
+    } else {
+        grade_a as f32 / chunk_count as f32
+    };
+    Ok(Json(serde_json::json!({
+        "avg_cyclomatic": avg_cyclomatic,
+        "pct_grade_a": pct_grade_a,
+        "smell_count": smell_count,
+        "chunk_count": chunk_count,
     })))
 }
 
