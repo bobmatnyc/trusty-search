@@ -45,6 +45,12 @@ ndarray = "0.15"
 ndarray-rand = "0.14"
 rand = "0.8"
 
+# ONNX NER (optional feature, gated by model file presence at runtime).
+# Pulled in only with `--features ner` so the default build doesn't compile
+# the ONNX runtime.
+ort = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -53,3 +59,6 @@ default = []
 # Exposes test doubles (e.g. `MockEmbedder`) outside `cfg(test)` so other
 # crates in the workspace — and downstream integration tests — can reuse them.
 test-support = []
+# Compile in the ONNX NER extractor. Even with this feature on, NER stays
+# inert at runtime unless `~/.trusty-search/models/ner.onnx` is present.
+ner = ["dep:ort", "dep:tokenizers"]

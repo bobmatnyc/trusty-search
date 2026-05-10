@@ -9,6 +9,7 @@ pub mod entity;
 pub mod facts;
 pub mod indexer;
 pub mod mmr;
+pub mod ner;
 pub mod registry;
 pub mod search;
 pub mod store;

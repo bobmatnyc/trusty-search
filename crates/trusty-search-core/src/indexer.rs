@@ -180,6 +180,11 @@ pub struct CodeIndexer {
     /// Call graph derived from the chunk corpus. Rebuilt cheaply after each
     /// corpus mutation; reads via `Arc::clone` are lock-free.
     symbol_graph: Arc<RwLock<Arc<SymbolGraph>>>,
+
+    /// Optional ONNX NER for `NaturalLanguagePhrase` extraction from doc
+    /// comments (issue #23). Always present, but inert unless both the `ner`
+    /// feature is compiled in and `~/.trusty-search/models/ner.onnx` exists.
+    ner: crate::ner::NerExtractor,
 }
 
 impl CodeIndexer {
@@ -199,6 +204,7 @@ impl CodeIndexer {
             chunk_embeddings: Arc::new(RwLock::new(HashMap::new())),
             query_cache: Arc::new(Mutex::new(LruCache::new(cap))),
             symbol_graph: Arc::new(RwLock::new(Arc::new(SymbolGraph::new()))),
+            ner: crate::ner::NerExtractor::try_load(),
         }
     }
 
@@ -427,10 +433,25 @@ impl CodeIndexer {
             self.add_chunk(chunk).await?;
         }
 
+        // Phase D: ONNX NER over doc comments (issue #23). Gated — no-op when
+        // the model file is absent. We feed the extractor the concatenated
+        // `///` / `//!` text from the file rather than re-parsing per chunk so
+        // the (potentially expensive) ONNX session runs at most once per file.
+        let doc_text = crate::ner::extract_doc_comments(content);
+        let ner_entities = self.ner.extract(&doc_text, file_path);
+        if !ner_entities.is_empty() {
+            tracing::debug!(
+                "ner: {} NaturalLanguagePhrase entities for {}",
+                ner_entities.len(),
+                file_path
+            );
+        }
+
         // Phase C: ConceptCluster entities (async, non-blocking; opt-in —
         // only runs when an embedder is wired and the file has enough doc
         // comments to cluster).
         let mut all_entities = entities;
+        all_entities.extend(ner_entities);
         if let Some(embedder) = &self.embedder {
             let refs: Vec<&str> = chunk_contents.iter().map(|s| s.as_str()).collect();
             let cluster_entities = crate::concept_cluster::cluster_concepts_from_contents(
