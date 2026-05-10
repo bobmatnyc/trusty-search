@@ -74,13 +74,17 @@ pub struct CodeChunk {
 ### HTTP API (axum, single daemon, multi-index)
 
 ```
-GET  /health                       liveness probe
-GET  /indexes                      list all registered indexes
-POST /indexes/:id/search           hybrid search query
-POST /indexes/:id/index-file       add/update a file
-POST /indexes/:id/remove-file      remove from index
-POST /indexes/:id/reindex          full reindex (fire-and-forget)
-GET  /indexes/:id/status           index stats (chunks, last-updated)
+GET    /health                       liveness probe
+GET    /indexes                      list all registered indexes
+POST   /indexes/:id/search           hybrid search query
+POST   /indexes/:id/index-file       add/update a file
+POST   /indexes/:id/remove-file      remove from index
+POST   /indexes/:id/reindex          full reindex (fire-and-forget)
+GET    /indexes/:id/reindex/stream   SSE progress stream (start/progress/complete/error)
+GET    /indexes/:id/status           index stats (chunks, last-updated)
+DELETE /indexes/:id                  delete an index
+GET    /ui                           web management UI (Svelte, embedded)
+POST   /chat                         OpenRouter proxy with search context injection
 ```
 
 ### MCP Tools
@@ -91,6 +95,10 @@ GET  /indexes/:id/status           index stats (chunks, last-updated)
 - `list_indexes` — enumerate registered indexes
 - `create_index` — register a new index
 - `search_health` — daemon liveness
+- `delete_index` — delete an index
+- `reindex` — trigger full reindex
+- `index_status` — per-index stats
+- `chat` — OpenRouter conversational Q&A
 
 ## Stack
 
@@ -111,6 +119,9 @@ GET  /indexes/:id/status           index stats (chunks, last-updated)
 - **Tracing**: tracing + tracing-subscriber (env-filter)
 - **CLI**: clap 4 (derive)
 - **HTTP client**: reqwest 0.12 (rustls-tls, no native-tls dependency)
+- **Progress display**: indicatif (progress bars during reindex)
+- **Embedded assets**: include_dir (Svelte admin UI compiled into binary)
+- **Content hashing**: sha2 (stable file fingerprints for incremental reindex skip)
 
 ## Multi-Request Design
 
@@ -135,12 +146,18 @@ GET  /indexes/:id/status           index stats (chunks, last-updated)
 ## CLI
 
 ```bash
-trusty-search serve [--http <addr>]                  # MCP stdio (default) or HTTP/SSE
-trusty-search daemon [--port <port>]                 # background HTTP daemon
-trusty-search index <path> [--name <id>]             # add a project
+trusty-search start                                  # start HTTP daemon (background)
+trusty-search stop                                   # stop daemon (SIGTERM via PID lockfile)
+trusty-search index [path] [--name <id>] [--force]  # register + index (primary command)
 trusty-search query <text> [--index <id>] [--top-k N] [--json]
-trusty-search status                                 # daemon + index stats
-trusty-search watch <path> [--name <id>]             # foreground watcher
+trusty-search status                                 # daemon + index overview (alias: health)
+trusty-search doctor [--fix]                         # 6-check diagnostic + auto-repair
+trusty-search ui [--port N]                          # open web management UI in browser
+trusty-search convert project|all [--dry-run]        # migrate from mcp-vector-search
+trusty-search serve [--http <addr>]                  # MCP stdio (default) or HTTP/SSE
+# Aliases preserved for backward compatibility:
+trusty-search init [path]                            # alias for index
+trusty-search reindex [path]                         # alias for index --force
 ```
 
 ## The ONE Seam from open-mpm
@@ -160,15 +177,27 @@ Everything else (the orchestrator, agent runners, REPL, ctrl) stays in open-mpm.
 trusty-search/
 ├── Cargo.toml                       workspace + bin manifest
 ├── CLAUDE.md                        this file
+├── CHANGELOG.md
 ├── README.md
 ├── .open-mpm/agents/                pm.toml, engineer.toml
 ├── crates/
 │   ├── trusty-search-core/          CodeIndexer, BM25, HNSW, chunking, classifier
-│   ├── trusty-search-service/       axum daemon, FileWatcher, client
+│   ├── trusty-search-service/       axum daemon, FileWatcher, client, Svelte UI
 │   └── trusty-search-mcp/           MCP server (stdio + HTTP/SSE)
 ├── src/main.rs                      CLI binary
 └── tests/integration_tests.rs
 ```
+
+### Shared Crates (external, `../trusty-common`)
+
+Three crates extracted from this repo and published at
+`github.com/bobmatnyc/trusty-common` (pinned via git tags in `Cargo.toml`):
+
+| Crate | Contents |
+|-------|----------|
+| `trusty-mcp-core` | `McpRequest`/`McpResponse`/`JsonRpcError`, `run_stdio_loop`, CORS/Trace axum helpers |
+| `trusty-embedder` | `Embedder` trait, `FastEmbedder` (LRU + persistent model cache), `MockEmbedder` |
+| `trusty-common` | `bind_with_auto_port`, `resolve_data_dir`/`cache_dir`, `ConcurrentRegistry`, `init_tracing`, `daemon_http_client` |
 
 ## Development
 
@@ -180,7 +209,7 @@ cargo build
 cargo test
 
 # Run daemon with debug logging
-RUST_LOG=debug cargo run -- daemon
+RUST_LOG=debug cargo run -- start
 
 # Query a registered index
 cargo run -- query "fn authenticate" --index myproject
@@ -191,26 +220,38 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Project Status
 
-**Phase**: Initial scaffolding. Workspace compiles, tests pass, classifier and BM25
-are functional. HNSW indexing, KG expansion, FileWatcher, and MCP server stubs
-are placeholders for the next implementation phases.
+**Phase**: Production-ready. Full hybrid search pipeline, web UI, MCP server, and
+robust CLI are all functional. The project is installable as a machine-wide service
+via `cargo install trusty-search`.
 
 **Working**:
-- Workspace builds (`cargo check` passes)
-- Query classifier (regex-based intent detection)
-- BM25 lexical index (ported from open-mpm)
-- Sliding-window chunker
-- IndexRegistry with DashMap + Arc<RwLock<CodeIndexer>>
-- axum router skeleton (`/health`, `/indexes`, `/indexes/:id/search`, `/indexes/:id/status`)
-- CLI subcommands wired with clap
+- `FastEmbedder` with fastembed-rs, LRU cache, persistent model cache (`~/Library/Caches/trusty-search/models/`)
+- `UsearchStore` wired to real usearch HNSW index (add/search/remove)
+- `CodeIndexer::search` end-to-end (HNSW + BM25 + RRF fusion)
+- Tree-sitter AST-aware chunker (rust, python, js, ts, go, java, c, cpp)
+- `EntityExtractor` Phase A structural entities (functions, classes, imports)
+- `SymbolGraph` KG expansion (callers_of / callees_of, 1–2 hop, EdgeKind multipliers)
+- `FileWatcher` with notify-debouncer-mini, 500ms debounce
+- MCP server: full JSON-RPC 2.0 stdio + HTTP/SSE transport, 10 tools
+- Daemon: auto-port, fs4 PID lockfile, graceful shutdown, persistent model cache
+- Svelte 5 admin UI embedded in binary via `include_dir`
+- OpenRouter chat proxy with search context injection
+- SSE reindex progress streaming with replay buffer
+- Incremental reindex skip via sha2 content fingerprinting
+- Parallel batch indexing (rayon + 256-chunk ONNX batches)
+- HNSW capacity hinting for large codebases (> 50k chunks)
+- Minified JS / build-dir exclusion from indexing
+- `trusty-search doctor` 6-check diagnostic with `--fix` auto-repair
+- `trusty-search convert` migration from mcp-vector-search
+- `indicatif` progress bars for reindex
+- HTTP timeouts (2s connect / 5s request) on all daemon calls
+- GitHub Actions CI + Dependabot
+- 170+ tests passing; clippy clean
 
-**Next**:
-1. Implement `FastEmbedder` with real fastembed-rs `TextEmbedding`
-2. Wire `UsearchStore` to actual usearch `Index` (add/search/remove)
-3. Implement `CodeIndexer::search` end-to-end (HNSW + BM25 + RRF)
-4. Tree-sitter chunker (replace sliding-window with AST-aware chunks)
-5. KG: build `SymbolGraph` from tree-sitter, add KG expansion to query pipeline
-6. FileWatcher with notify-debouncer-mini + tokio channel
-7. MCP server: stdio + HTTP/SSE tool dispatch
-8. Daemon: TCP auto-port, fs4 PID lockfile, graceful shutdown
-9. CI workflow + `cargo install trusty-search` smoke test
+**Potential next steps**:
+- KG Phase B: IMPORTS/INHERITS edge propagation across file boundaries
+- SCIP ingest: complete `from_refs` wiring for IDE-grade symbol resolution
+- ONNX NER: enable doc comment entity extraction when model file is present
+- Benchmark regression CI gate (MRR@5 / Recall@10)
+- `cargo install trusty-search` smoke test in CI
+- Windows / Linux daemon path support in `trusty-common`
