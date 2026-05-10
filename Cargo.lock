@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "anyhow",
  "axum",
@@ -4275,7 +4275,6 @@ version = "0.1.7"
 dependencies = [
  "anyhow",
  "axum",
- "crossbeam-utils",
  "dashmap",
  "dirs 5.0.1",
  "fs4",
