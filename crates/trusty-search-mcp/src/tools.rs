@@ -16,6 +16,10 @@
 //! | `list_indexes`  | `GET  /indexes`                           |
 //! | `create_index`  | `POST /indexes`                           |
 //! | `search_health` | `GET  /health`                            |
+//! | `delete_index`  | `DELETE /indexes/:id`                     |
+//! | `reindex`       | `POST /indexes/:id/reindex`               |
+//! | `index_status`  | `GET  /indexes/:id/status`                |
+//! | `chat`          | `POST /chat`                              |
 //!
 //! Test: `cargo test -p trusty-search-mcp` covers JSON-RPC parsing, error
 //! shapes (-32600 invalid request, -32601 method not found, -32602 invalid
@@ -318,6 +322,36 @@ impl McpServer {
                     .await
             }
             "search_health" => self.get("/health").await,
+            "delete_index" => {
+                let index_id = require_str(args, "index_id")?;
+                self.delete(&format!("/indexes/{index_id}")).await
+            }
+            "reindex" => {
+                let index_id = require_str(args, "index_id")?;
+                // Accept optional root_path override (mirrors the HTTP body).
+                let mut body = serde_json::json!({});
+                if let Some(rp) = args.get("root_path").and_then(Value::as_str) {
+                    body["root_path"] = Value::String(rp.to_string());
+                }
+                self.post(&format!("/indexes/{index_id}/reindex"), &body)
+                    .await
+            }
+            "index_status" => {
+                let index_id = require_str(args, "index_id")?;
+                self.get(&format!("/indexes/{index_id}/status")).await
+            }
+            "chat" => {
+                let index_id = require_str(args, "index_id")?;
+                let message = require_str(args, "message")?;
+                let mut body = serde_json::json!({
+                    "index_id": index_id,
+                    "message": message,
+                });
+                if let Some(history) = args.get("history") {
+                    body["history"] = history.clone();
+                }
+                self.post("/chat", &body).await
+            }
             "complexity_hotspots" => {
                 let index_id = args
                     .get("index")
@@ -363,6 +397,27 @@ impl McpServer {
         if !status.is_success() {
             return Err(DispatchError::Transport(format!(
                 "GET {url} returned {status}: {body}"
+            )));
+        }
+        Ok(body)
+    }
+
+    async fn delete(&self, path: &str) -> Result<Value, DispatchError> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| DispatchError::Transport(format!("DELETE {url}: {e}")))?;
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DispatchError::Transport(format!("decode {url}: {e}")))?;
+        if !status.is_success() {
+            return Err(DispatchError::Transport(format!(
+                "DELETE {url} returned {status}: {body}"
             )));
         }
         Ok(body)
@@ -545,6 +600,53 @@ pub fn tool_descriptors() -> Value {
                     "index": { "type": "string" }
                 }
             }
+        },
+        {
+            "name": "delete_index",
+            "description": "Delete a registered index and all its data",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id"],
+                "properties": {
+                    "index_id": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "reindex",
+            "description": "Trigger a full reindex of a collection (async, returns immediately)",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id"],
+                "properties": {
+                    "index_id":  { "type": "string" },
+                    "root_path": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "index_status",
+            "description": "Get stats for an index (chunk count, root path)",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id"],
+                "properties": {
+                    "index_id": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "chat",
+            "description": "Ask a question about code using OpenRouter LLM with search context (requires OPENROUTER_API_KEY)",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id", "message"],
+                "properties": {
+                    "index_id": { "type": "string" },
+                    "message":  { "type": "string" },
+                    "history":  { "type": "array", "items": { "type": "object" } }
+                }
+            }
         }
     ])
 }
@@ -698,6 +800,38 @@ mod tests {
         };
         let resp = server.dispatch(r).await;
         assert!(resp.suppress, "notifications must be suppressed");
+    }
+
+    /// Parity gate: every HTTP endpoint reachable via REST must also be callable
+    /// as an MCP tool. This guards the "MCP and HTTP are functionally equivalent"
+    /// invariant — if a new HTTP route lands without a matching tool, this fails.
+    #[tokio::test]
+    async fn test_tools_list_complete() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server.dispatch(req("tools/list", Value::Null)).await;
+        let result = resp.result.expect("expected result");
+        let tools = result.get("tools").and_then(Value::as_array).expect("array");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        for required in [
+            "search_code",
+            "index_file",
+            "remove_file",
+            "list_indexes",
+            "create_index",
+            "search_health",
+            "delete_index",
+            "reindex",
+            "index_status",
+            "chat",
+        ] {
+            assert!(
+                names.contains(&required),
+                "tools/list missing '{required}' (got {names:?})"
+            );
+        }
     }
 
     #[tokio::test]
