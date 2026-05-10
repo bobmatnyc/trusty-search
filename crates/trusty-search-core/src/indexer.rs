@@ -87,6 +87,10 @@ pub struct CodeChunk {
     // non-git workflows and older serialized payloads round-trip cleanly.
     #[serde(default)]
     pub blame: Option<crate::blame::ChunkBlame>,
+
+    // Issue #32 — per-chunk complexity & code-quality metrics.
+    #[serde(default)]
+    pub complexity: crate::complexity::ComplexityMetrics,
 }
 
 /// Halstead-proxy complexity score: unique alphanumeric identifiers (operands)
@@ -314,12 +318,44 @@ impl CodeIndexer {
                 complexity_score: compute_complexity(&raw.content),
                 chunk_depth,
                 blame: None,
+                complexity: crate::complexity::compute_complexity(&raw.content),
             });
             if out.len() >= top_k {
                 break;
             }
         }
         Ok(out)
+    }
+
+    /// Snapshot every chunk in the corpus as a `CodeChunk`. Used by the
+    /// quality / complexity endpoints (issue #32) which need to materialize
+    /// per-chunk metrics without going through the search pipeline.
+    pub async fn all_chunks(&self) -> Vec<CodeChunk> {
+        let chunks = self.chunks.read().await;
+        chunks
+            .values()
+            .map(|raw| {
+                let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
+                CodeChunk {
+                    id: raw.id.clone(),
+                    file: raw.file.clone(),
+                    start_line: raw.start_line,
+                    end_line: raw.end_line,
+                    content: raw.content.clone(),
+                    function_name: raw.function_name.clone(),
+                    score: 0.0,
+                    compact_snippet: None,
+                    match_reason: "all".to_string(),
+                    chunk_type: raw.chunk_type.clone(),
+                    calls: raw.calls.clone(),
+                    inherits_from: raw.inherits_from.clone(),
+                    complexity_score: compute_complexity(&raw.content),
+                    chunk_depth,
+                    blame: None,
+                    complexity: crate::complexity::compute_complexity(&raw.content),
+                }
+            })
+            .collect()
     }
 
     /// Number of chunks currently held in the corpus.
@@ -813,6 +849,7 @@ impl CodeIndexer {
                 complexity_score: compute_complexity(&raw.content),
                 chunk_depth,
                 blame: None,
+                complexity: crate::complexity::compute_complexity(&raw.content),
             });
         }
         Ok(out)

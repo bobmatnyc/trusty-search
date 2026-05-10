@@ -2,6 +2,7 @@ pub mod blame;
 pub mod bm25;
 pub mod chunker;
 pub mod classifier;
+pub mod complexity;
 pub mod embed;
 pub mod entity;
 pub mod facts;
