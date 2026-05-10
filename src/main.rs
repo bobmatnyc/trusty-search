@@ -23,6 +23,7 @@ use colored::Colorize;
 use detect::{detect_project, DetectionMethod};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io;
+use std::time::Duration;
 
 /// Machine-wide hybrid code search — BM25 + vector + knowledge graph.
 ///
@@ -421,6 +422,20 @@ fn daemon_port_path() -> Option<std::path::PathBuf> {
     dirs::data_local_dir().map(|d| d.join("trusty-search").join("daemon.port"))
 }
 
+/// Build a reqwest client with short connect + total timeouts.
+///
+/// Why: every CLI command that talks to the daemon must fail fast when the
+/// daemon is not running.  Without timeouts, reqwest waits for the OS TCP
+/// stack (minutes on some platforms), freezing the terminal.
+/// What: 2 s connect timeout, 5 s total request timeout.  All daemon calls
+/// must use this instead of `reqwest::Client::new()`.
+fn daemon_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+}
+
 /// Index a single file via the daemon's `/indexes/:id/index-file` endpoint.
 async fn index_single_file(
     client: &reqwest::Client,
@@ -447,7 +462,7 @@ async fn index_single_file(
 /// a directory walks `walk_source_files` and indexes every match.
 async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
     let base = daemon_base_url();
-    let client = reqwest::Client::new();
+    let client = daemon_client()?;
 
     if path.is_dir() {
         let walk = trusty_search_service::walker::walk_source_files(path);
@@ -520,7 +535,7 @@ fn make_reindex_progress_bar(index_id: &str, total_files: u64) -> ProgressBar {
 /// progress with an indicatif progress bar.
 async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
     let base = daemon_base_url();
-    let client = reqwest::Client::new();
+    let client = daemon_client()?;
 
     let kickoff_url = format!("{}/indexes/{}/reindex", base, index_id);
     let kickoff_body = serde_json::json!({ "root_path": root_path });
@@ -719,7 +734,7 @@ async fn register_index_with_daemon(
     project_path: &std::path::Path,
 ) -> Result<(bool, bool)> {
     let base = daemon_base_url();
-    let client = reqwest::Client::new();
+    let client = daemon_client()?;
     let create_url = format!("{}/indexes", base);
     let create_body = serde_json::json!({
         "id": index_name,
@@ -747,7 +762,8 @@ async fn register_index_with_daemon(
 async fn fetch_chunk_count(index_id: &str) -> Option<u64> {
     let base = daemon_base_url();
     let url = format!("{}/indexes/{}/status", base, index_id);
-    let resp = reqwest::get(&url).await.ok()?;
+    let client = daemon_client().ok()?;
+    let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -903,7 +919,16 @@ async fn convert_one(
         };
     }
 
-    let client = reqwest::Client::new();
+    let client = match daemon_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return ConvertResult {
+                name: index_name,
+                path: project_root,
+                status: ConvertStatus::Failed(format!("failed to build HTTP client: {e}")),
+            };
+        }
+    };
 
     // 1. Register the index. 200 with body.created=false means it already
     //    existed — still proceed to reindex so the user gets a fresh build.
@@ -1037,7 +1062,7 @@ fn format_with_commas(n: u64) -> String {
 /// or emits JSON. Exits 1 when the daemon is not reachable.
 async fn run_status(json: bool) -> Result<()> {
     let base = daemon_base_url();
-    let client = reqwest::Client::new();
+    let client = daemon_client()?;
 
     let health = client.get(format!("{}/health", base)).send().await;
     let health_body: serde_json::Value = match health {
@@ -1046,8 +1071,10 @@ async fn run_status(json: bool) -> Result<()> {
             if json {
                 println!(r#"{{"daemon":"not_running"}}"#);
             } else {
-                eprintln!("{} Daemon not running ({})", "✗".red(), base);
-                eprintln!("  Start with: {}", "trusty-search start".cyan());
+                eprintln!(
+                    "{} Daemon not running  (start with `trusty-search start`)",
+                    "✗".red()
+                );
             }
             std::process::exit(1);
         }
@@ -1278,11 +1305,16 @@ async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
     // ── 1. Daemon liveness ────────────────────────────────────────────────
     let port = read_daemon_port();
     let base = daemon_base_url();
-    let client = reqwest::Client::new();
+    let client = match daemon_client() {
+        Ok(c) => c,
+        Err(e) => {
+            checks.push(CheckResult::Error(format!("failed to build HTTP client: {e}")));
+            return (checks, empty_indexes);
+        }
+    };
 
     let health_result = client
         .get(format!("{}/health", base))
-        .timeout(std::time::Duration::from_secs(2))
         .send()
         .await;
 
@@ -1753,7 +1785,7 @@ async fn main() -> Result<()> {
             print_index_header(&index_id, warned);
             let base = daemon_base_url();
             let url = format!("{}/indexes/{}/remove-file", base, index_id);
-            let client = reqwest::Client::new();
+            let client = daemon_client()?;
             let body = serde_json::json!({ "path": file.display().to_string() });
             match client.post(&url).json(&body).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -1783,7 +1815,8 @@ async fn main() -> Result<()> {
         Commands::List => {
             let base = daemon_base_url();
             let url = format!("{}/indexes", base);
-            match reqwest::get(&url).await {
+            let list_client = daemon_client()?;
+            match list_client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value =
                         resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
@@ -1829,7 +1862,7 @@ async fn main() -> Result<()> {
             // For multi-index "*" with several indexes registered, require explicit choice
             // because the daemon's search endpoint is single-index-scoped.
             let base = daemon_base_url();
-            let client = reqwest::Client::new();
+            let client = daemon_client()?;
 
             let target_id: String = if let Some(id) = cli.index.as_ref() {
                 id.clone()
@@ -2291,7 +2324,10 @@ async fn main() -> Result<()> {
             // Probe the daemon — if it's not running, surface a friendly
             // hint instead of a confusing browser error page.
             let probe_url = format!("http://127.0.0.1:{port}/health");
-            let healthy = reqwest::get(&probe_url)
+            let ui_probe_client = daemon_client()?;
+            let healthy = ui_probe_client
+                .get(&probe_url)
+                .send()
                 .await
                 .ok()
                 .map(|r| r.status().is_success())
