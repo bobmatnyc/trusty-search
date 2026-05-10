@@ -3,7 +3,7 @@
 //! Why: Single entry point that exposes both project-scoped commands
 //! (`search`, `watch`, `status`, `init`, `add`, `remove`, `reindex`) which
 //! auto-detect the index from the current working directory, and global
-//! commands (`list`, `query`, `health`, `daemon`, `serve`, `completions`)
+//! commands (`list`, `query`, `health`, `start`, `stop`, `serve`, `completions`)
 //! that operate across the registry or manage the daemon.
 //!
 //! What: Parses CLI args via clap, resolves the active index via
@@ -26,7 +26,7 @@ use std::io;
 /// Machine-wide hybrid code search — BM25 + vector + knowledge graph.
 ///
 /// Run from inside any project and trusty-search auto-detects the index.
-/// Use `trusty-search daemon` to start the background service first.
+/// Use `trusty-search start` to start the background service first.
 #[derive(Parser)]
 #[command(
     name = "trusty-search",
@@ -203,29 +203,33 @@ enum Commands {
     Health,
 
     // ── Service commands ──────────────────────────────────────────────────
-    /// Start background HTTP daemon
+    /// Start the background HTTP daemon
     ///
     /// Examples:
-    ///   trusty-search daemon
-    ///   trusty-search daemon --port 7878
-    ///   trusty-search daemon --stop
+    ///   trusty-search start
+    ///   trusty-search start --port 7878
     #[command(display_order = 20)]
-    Daemon {
-        /// Port to listen on (0 = auto-select)
+    Start {
+        /// Port to listen on (default: 7878, auto-selects next if busy)
         #[arg(long, default_value = "7878")]
         port: u16,
-
-        /// Stop the running daemon
-        #[arg(long)]
-        stop: bool,
     },
+
+    /// Stop the running background daemon
+    ///
+    /// Sends SIGTERM to the daemon process and waits for clean shutdown.
+    ///
+    /// Examples:
+    ///   trusty-search stop
+    #[command(display_order = 21)]
+    Stop,
 
     /// Start MCP stdio server for Claude Code integration
     ///
     /// Examples:
     ///   trusty-search serve
     ///   trusty-search serve --http 0.0.0.0:8080
-    #[command(display_order = 21)]
+    #[command(display_order = 22)]
     Serve {
         /// Start HTTP/SSE mode instead of stdio
         #[arg(long)]
@@ -293,7 +297,7 @@ fn print_index_header(index_id: &str, warned: bool) {
 }
 
 /// Resolve the daemon's base URL from the port file written by
-/// `trusty-search daemon`. Falls back to `7878` when the file is missing,
+/// `trusty-search start`. Falls back to `7878` when the file is missing,
 /// so `serve` works out-of-the-box if the user starts the daemon on its
 /// default port.
 ///
@@ -789,14 +793,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Daemon { port, stop } => {
-            if stop {
-                eprintln!(
-                    "{} `daemon --stop` is not implemented — send SIGTERM/SIGINT instead",
-                    "·".dimmed()
-                );
-                std::process::exit(2);
-            }
+        Commands::Start { port } => {
             // Open the canonical facts store next to the daemon lockfile.
             // Why: facts persist across daemon restarts and are scoped per-machine
             // (single install). Falling back to `None` keeps the daemon usable if
@@ -836,6 +833,58 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     eprintln!("{} daemon failed: {e}", "✗".red());
                     std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Stop => {
+            // The daemon writes its PID into the fs4 lockfile at startup
+            // (see trusty-search-service/src/daemon.rs). Read the PID, send
+            // SIGTERM, then poll for the port file to disappear as a signal
+            // that shutdown completed cleanly.
+            let lock_path = dirs::data_local_dir()
+                .map(|d| d.join("trusty-search").join("daemon.lock"));
+            let port_path = daemon_port_path();
+
+            let pid = lock_path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| s.trim().parse::<u32>().ok());
+
+            match pid {
+                None => {
+                    eprintln!("{} No daemon running (no PID file)", "✗".red());
+                    std::process::exit(1);
+                }
+                Some(pid) => {
+                    println!("{} Stopping daemon (PID {})…", "⟳".cyan(), pid);
+                    let status = std::process::Command::new("kill")
+                        .arg("-TERM")
+                        .arg(pid.to_string())
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => {
+                            // Poll up to 5s for the port file to disappear.
+                            for _ in 0..50 {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                if port_path.as_ref().map(|p| !p.exists()).unwrap_or(true) {
+                                    println!("{} Daemon stopped", "✓".green());
+                                    return Ok(());
+                                }
+                            }
+                            println!(
+                                "{} Daemon may still be shutting down",
+                                "⚠".yellow()
+                            );
+                        }
+                        _ => {
+                            eprintln!(
+                                "{} Failed to send SIGTERM (process may already be gone)",
+                                "✗".red()
+                            );
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }
