@@ -236,6 +236,31 @@ enum Commands {
         http: Option<String>,
     },
 
+    /// Migrate mcp-vector-search project(s) to trusty-search
+    ///
+    /// Reads `.mcp-vector-search/config.json` from each project, derives an
+    /// index name from the project root's basename, and POSTs to the daemon
+    /// to create + reindex the project.
+    ///
+    /// Examples:
+    ///   trusty-search convert project           # convert current project
+    ///   trusty-search convert all               # convert every project on this machine
+    ///   trusty-search convert all --dry-run     # preview without changes
+    #[command(display_order = 25)]
+    Convert {
+        /// What to convert: "project" (CWD) or "all" (machine-wide scan)
+        #[arg(value_name = "TARGET")]
+        target: ConvertTarget,
+
+        /// Show what would be converted without contacting the daemon
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Maximum concurrent conversions for "all"
+        #[arg(long, default_value = "4")]
+        concurrency: usize,
+    },
+
     /// Generate shell completion script
     ///
     /// Examples:
@@ -260,6 +285,19 @@ enum IntentArg {
     Conceptual,
     Bugdebt,
     Unknown,
+}
+
+/// Why: `convert` accepts a discrete operating mode, so model it as an enum
+/// rather than a free-form string. Validated at parse time by clap.
+/// What: `Project` operates on the CWD; `All` walks the user's home tree
+/// looking for `.mcp-vector-search/config.json` files.
+/// Test: `cargo run -- convert bogus` → clap rejects with usage hint.
+#[derive(Debug, Clone, ValueEnum)]
+enum ConvertTarget {
+    /// Convert the project in the current directory (or any parent)
+    Project,
+    /// Convert every mcp-vector-search project on this machine
+    All,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -536,6 +574,261 @@ async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> 
     }
 
     Ok(())
+}
+
+// ── Convert helpers (mcp-vector-search → trusty-search migration) ─────────
+
+/// Subset of mcp-vector-search's `config.json` we care about.
+///
+/// Why: only `project_root` is needed to derive an index name and reindex
+/// path. Every other field (file_extensions, embedding_model, ...) is
+/// re-derived from the project tree at index time.
+/// What: serde-deserialized from the JSON config.
+/// Test: parse a config containing extra unknown fields → succeeds.
+#[derive(Debug, serde::Deserialize)]
+struct MvsConfig {
+    project_root: std::path::PathBuf,
+}
+
+/// Walk up from `start` looking for `.mcp-vector-search/config.json`.
+///
+/// Why: the user may invoke `convert project` from a subdirectory of the
+/// project; mirror git's discovery behaviour.
+/// What: returns `Some(path)` of the first config found, else `None`.
+/// Test: in a directory with no config and no `.mcp-vector-search` ancestors
+/// → returns `None`.
+fn find_mvs_config(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let candidate = dir.join(".mcp-vector-search").join("config.json");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Find every `*/.mcp-vector-search/config.json` under the user's home dir.
+///
+/// Why: `convert all` needs to enumerate every project that mcp-vector-search
+/// has ever indexed. Capping depth at 6 keeps the scan well under a second
+/// even on dense home directories while covering typical repo layouts
+/// (`~/Projects/foo`, `~/Clients/x/projects/y`, etc.).
+/// What: returns absolute paths to each `config.json`. Skips errors silently.
+/// Test: scan home → returns >0 paths on a machine with mcp-vector-search
+/// installed; deterministic for a given filesystem state.
+fn find_all_mvs_configs() -> Vec<std::path::PathBuf> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let mut configs = Vec::new();
+    for entry in walkdir::WalkDir::new(&home)
+        .max_depth(6)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            // Skip obvious noise that can't contain user projects but bloats
+            // the walk: hidden caches, language toolchains, OS junk.
+            let name = e.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | ".git"
+                    | "target"
+                    | "Library"
+                    | ".cache"
+                    | ".cargo"
+                    | ".rustup"
+                    | ".npm"
+                    | ".pnpm"
+                    | ".pyenv"
+                    | ".nvm"
+                    | "venv"
+                    | ".venv"
+                    | "__pycache__"
+            )
+        })
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_name() == "config.json"
+            && entry
+                .path()
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n == ".mcp-vector-search")
+                .unwrap_or(false)
+        {
+            configs.push(entry.path().to_path_buf());
+        }
+    }
+    configs
+}
+
+/// Parse a mcp-vector-search config and derive `(project_root, index_name)`.
+///
+/// Why: the trusty-search index id is the lowercased basename of the project
+/// root with spaces replaced by hyphens — same convention used by `init`.
+/// What: returns the canonical pair. Errors propagate as anyhow.
+/// Test: project_root="/Users/x/My Project" → ("/Users/x/My Project", "my-project").
+fn parse_mvs_config(config_path: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", config_path.display()))?;
+    let config: MvsConfig = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("parse {}: {e}", config_path.display()))?;
+    let name = config
+        .project_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase().replace(' ', "-"))
+        .unwrap_or_else(|| "project".to_string());
+    Ok((config.project_root, name))
+}
+
+#[derive(Debug)]
+enum ConvertStatus {
+    Queued,
+    AlreadyRegistered,
+    DryRun,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct ConvertResult {
+    name: String,
+    path: std::path::PathBuf,
+    status: ConvertStatus,
+}
+
+/// Convert one project: register it with the daemon (idempotent) and trigger
+/// a reindex.
+///
+/// Why: the daemon's `POST /indexes` returns `{created: false, reason: "already exists"}`
+/// for known indexes and `{created: true}` for new ones — both are 200 OK,
+/// so we read the body to distinguish the cases for reporting.
+/// What: returns a `ConvertResult` capturing the outcome. Network errors
+/// surface as `Failed`.
+/// Test: dry_run=true → returns `DryRun` without any HTTP traffic.
+async fn convert_one(
+    project_root: std::path::PathBuf,
+    index_name: String,
+    base_url: &str,
+    dry_run: bool,
+) -> ConvertResult {
+    if dry_run {
+        return ConvertResult {
+            name: index_name,
+            path: project_root,
+            status: ConvertStatus::DryRun,
+        };
+    }
+
+    let client = reqwest::Client::new();
+
+    // 1. Register the index. 200 with body.created=false means it already
+    //    existed — still proceed to reindex so the user gets a fresh build.
+    let create_url = format!("{base_url}/indexes");
+    let create_resp = client
+        .post(&create_url)
+        .json(&serde_json::json!({
+            "id": index_name,
+            "root_path": project_root,
+        }))
+        .send()
+        .await;
+
+    let already_existed = match create_resp {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+            !body.get("created").and_then(|v| v.as_bool()).unwrap_or(true)
+        }
+        Ok(resp) => {
+            return ConvertResult {
+                name: index_name,
+                path: project_root,
+                status: ConvertStatus::Failed(format!("create returned {}", resp.status())),
+            };
+        }
+        Err(e) => {
+            return ConvertResult {
+                name: index_name,
+                path: project_root,
+                status: ConvertStatus::Failed(format!("create error: {e}")),
+            };
+        }
+    };
+
+    // 2. Kick off reindex (fire-and-forget — we don't follow the SSE stream
+    //    here because `convert all` may have many parallel migrations).
+    let reindex_url = format!("{base_url}/indexes/{index_name}/reindex");
+    let reindex_resp = client
+        .post(&reindex_url)
+        .json(&serde_json::json!({ "root_path": project_root }))
+        .send()
+        .await;
+
+    match reindex_resp {
+        Ok(resp) if resp.status().is_success() => ConvertResult {
+            name: index_name,
+            path: project_root,
+            status: if already_existed {
+                ConvertStatus::AlreadyRegistered
+            } else {
+                ConvertStatus::Queued
+            },
+        },
+        Ok(resp) => ConvertResult {
+            name: index_name,
+            path: project_root,
+            status: ConvertStatus::Failed(format!("reindex returned {}", resp.status())),
+        },
+        Err(e) => ConvertResult {
+            name: index_name,
+            path: project_root,
+            status: ConvertStatus::Failed(format!("reindex error: {e}")),
+        },
+    }
+}
+
+/// Render one ConvertResult line for the `convert all` table.
+fn print_convert_line(idx: usize, total: usize, r: &ConvertResult) {
+    let prefix = format!("[{}/{}]", idx, total);
+    let path = r.path.display().to_string();
+    match &r.status {
+        ConvertStatus::Queued => {
+            println!(
+                "  {} {} {:<24} → {}",
+                prefix.dimmed(),
+                "✓".green(),
+                r.name,
+                path.dimmed()
+            );
+        }
+        ConvertStatus::AlreadyRegistered => {
+            println!(
+                "  {} {} {:<24} → {} {}",
+                prefix.dimmed(),
+                "↻".cyan(),
+                r.name,
+                path.dimmed(),
+                "(already registered, reindexing)".dimmed()
+            );
+        }
+        ConvertStatus::DryRun => {
+            println!("  {} {:<24} {}", prefix.dimmed(), r.name, path.dimmed());
+        }
+        ConvertStatus::Failed(msg) => {
+            println!(
+                "  {} {} {:<24} → {} {}",
+                prefix.dimmed(),
+                "✗".red(),
+                r.name,
+                path.dimmed(),
+                format!("({})", msg).red()
+            );
+        }
+    }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────
@@ -909,6 +1202,168 @@ async fn main() -> Result<()> {
                     daemon_url.dimmed()
                 );
                 trusty_search_mcp::stdio::run(server).await?;
+            }
+        }
+
+        Commands::Convert {
+            target,
+            dry_run,
+            concurrency,
+        } => {
+            let base = daemon_base_url();
+
+            match target {
+                ConvertTarget::Project => {
+                    let cwd = std::env::current_dir()?;
+                    let config_path = find_mvs_config(&cwd).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No .mcp-vector-search/config.json found in {} or any parent directory",
+                            cwd.display()
+                        )
+                    })?;
+                    let (root, name) = parse_mvs_config(&config_path)?;
+                    if dry_run {
+                        println!(
+                            "{} Dry run — would convert '{}' ({})",
+                            "·".dimmed(),
+                            name.bold(),
+                            root.display()
+                        );
+                    } else {
+                        println!(
+                            "{} Converting '{}' ({})…",
+                            "⟳".cyan(),
+                            name.bold(),
+                            root.display()
+                        );
+                        let result = convert_one(root, name, &base, false).await;
+                        match &result.status {
+                            ConvertStatus::Queued => {
+                                println!(
+                                    "{} Queued for reindex — watch progress with: {}",
+                                    "✓".green(),
+                                    "trusty-search status".cyan()
+                                );
+                            }
+                            ConvertStatus::AlreadyRegistered => {
+                                println!(
+                                    "{} Already registered — reindex queued",
+                                    "↻".cyan()
+                                );
+                            }
+                            ConvertStatus::Failed(msg) => {
+                                eprintln!("{} Conversion failed: {}", "✗".red(), msg);
+                                std::process::exit(1);
+                            }
+                            ConvertStatus::DryRun => unreachable!(),
+                        }
+                    }
+                }
+
+                ConvertTarget::All => {
+                    let home_display = dirs::home_dir()
+                        .map(|h| h.display().to_string())
+                        .unwrap_or_else(|| "$HOME".to_string());
+                    println!(
+                        "🔍 Scanning for mcp-vector-search projects under {}…",
+                        home_display
+                    );
+                    let configs = find_all_mvs_configs();
+                    if configs.is_empty() {
+                        println!("{} No mcp-vector-search projects found.", "·".dimmed());
+                        return Ok(());
+                    }
+
+                    if dry_run {
+                        println!(
+                            "{} Dry run — would convert {} projects:\n",
+                            "·".dimmed(),
+                            configs.len()
+                        );
+                    } else {
+                        println!(
+                            "{} Found {} projects. Converting (max {} concurrent)…\n",
+                            "·".dimmed(),
+                            configs.len(),
+                            concurrency
+                        );
+                    }
+
+                    let total = configs.len();
+                    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+                    let base = std::sync::Arc::new(base);
+                    let mut tasks = tokio::task::JoinSet::new();
+
+                    for (i, config_path) in configs.into_iter().enumerate() {
+                        let sem = sem.clone();
+                        let base = base.clone();
+                        tasks.spawn(async move {
+                            // Acquire permit inside the task so JoinSet limits
+                            // concurrency cleanly without us pre-allocating
+                            // futures that all immediately try to fire.
+                            let _permit = sem.acquire_owned().await.ok();
+                            let parsed = parse_mvs_config(&config_path);
+                            let result = match parsed {
+                                Ok((root, name)) => {
+                                    convert_one(root, name, &base, dry_run).await
+                                }
+                                Err(e) => ConvertResult {
+                                    name: config_path.display().to_string(),
+                                    path: config_path.clone(),
+                                    status: ConvertStatus::Failed(format!("parse: {e}")),
+                                },
+                            };
+                            (i + 1, result)
+                        });
+                    }
+
+                    let mut queued = 0usize;
+                    let mut already = 0usize;
+                    let mut dry = 0usize;
+                    let mut failed = 0usize;
+
+                    // Collect-then-sort so output is deterministic instead of
+                    // racy. For 69 projects this is trivially small.
+                    let mut results: Vec<(usize, ConvertResult)> = Vec::with_capacity(total);
+                    while let Some(joined) = tasks.join_next().await {
+                        match joined {
+                            Ok((i, r)) => results.push((i, r)),
+                            Err(e) => eprintln!("{} task panicked: {e}", "✗".red()),
+                        }
+                    }
+                    results.sort_by_key(|(i, _)| *i);
+
+                    for (i, r) in &results {
+                        print_convert_line(*i, total, r);
+                        match r.status {
+                            ConvertStatus::Queued => queued += 1,
+                            ConvertStatus::AlreadyRegistered => already += 1,
+                            ConvertStatus::DryRun => dry += 1,
+                            ConvertStatus::Failed(_) => failed += 1,
+                        }
+                    }
+
+                    println!();
+                    if dry_run {
+                        println!(
+                            "{} Dry run complete: {} projects",
+                            "·".dimmed(),
+                            dry
+                        );
+                    } else {
+                        println!(
+                            "{} Summary: {} queued, {} already registered (reindexing), {} failed",
+                            "✓".green(),
+                            queued,
+                            already,
+                            failed
+                        );
+                        println!(
+                            "  Reindexing in background. Run {} to see progress.",
+                            "trusty-search list".cyan()
+                        );
+                    }
+                }
             }
         }
 
