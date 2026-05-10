@@ -16,8 +16,7 @@
 use crate::walker::{should_skip_content, walk_source_files};
 use dashmap::DashMap;
 use serde::Serialize;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -39,23 +38,33 @@ const REINDEX_BATCH_SIZE: usize = 128;
 /// lifetime. Survives across `POST /indexes/:id/reindex` calls but not daemon
 /// restarts (acceptable: cold start re-embeds everything anyway, and on warm
 /// daemons the user expects "skip unchanged" behaviour).
-fn file_hashes() -> &'static DashMap<IndexId, Arc<DashMap<PathBuf, u64>>> {
-    static FILE_HASHES: OnceLock<DashMap<IndexId, Arc<DashMap<PathBuf, u64>>>> =
+fn file_hashes() -> &'static DashMap<IndexId, Arc<DashMap<PathBuf, String>>> {
+    static FILE_HASHES: OnceLock<DashMap<IndexId, Arc<DashMap<PathBuf, String>>>> =
         OnceLock::new();
     FILE_HASHES.get_or_init(DashMap::new)
 }
 
-fn hashes_for(id: &IndexId) -> Arc<DashMap<PathBuf, u64>> {
+fn hashes_for(id: &IndexId) -> Arc<DashMap<PathBuf, String>> {
     file_hashes()
         .entry(id.clone())
         .or_insert_with(|| Arc::new(DashMap::new()))
         .clone()
 }
 
-fn hash_content(content: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    content.hash(&mut h);
-    h.finish()
+/// Stable content fingerprint for the "skip unchanged file" optimization.
+///
+/// Why: SHA-256 is collision-resistant and stable across processes, builds,
+/// and Rust versions. `DefaultHasher` (SipHash) is randomized per build and
+/// has weaker collision properties — fine for `HashMap` keys but unsafe for
+/// content fingerprinting where a false negative silently skips a real edit.
+/// What: SHA-256 of the file's UTF-8 bytes, hex-encoded.
+/// Test: see `reindex_walks_directory_and_emits_events` — a re-run of the
+/// reindex with unchanged files must mark them as skipped (proves the hash
+/// is stable across two invocations within the same process).
+fn hash_content(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Capacity of the per-reindex broadcast channel. Lagged subscribers will
@@ -211,7 +220,7 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>) {
             // 2) Build the batch payload, applying hash-skip.
             let mut to_index: Vec<(String, String)> = Vec::with_capacity(batch.len());
             let mut to_index_paths: Vec<PathBuf> = Vec::with_capacity(batch.len());
-            let mut new_hashes: Vec<(PathBuf, u64)> = Vec::with_capacity(batch.len());
+            let mut new_hashes: Vec<(PathBuf, String)> = Vec::with_capacity(batch.len());
             for (path, content_res) in read_results {
                 let rel = path
                     .strip_prefix(&root)
