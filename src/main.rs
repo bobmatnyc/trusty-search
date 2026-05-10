@@ -261,6 +261,21 @@ enum Commands {
         concurrency: usize,
     },
 
+    /// Open the web management UI in the default browser
+    ///
+    /// Why: One-command access to the embedded admin panel — auto-detects
+    /// a running daemon (or asks the user to start one) and pops the
+    /// browser at `/ui`.
+    /// Examples:
+    ///   trusty-search ui
+    ///   trusty-search ui --port 7878
+    #[command(display_order = 23)]
+    Ui {
+        /// Port the daemon is listening on (default: read port file or 7878)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+
     /// Generate shell completion script
     ///
     /// Examples:
@@ -1640,6 +1655,45 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+        }
+
+        Commands::Ui { port } => {
+            // Resolve port: explicit > port file > 7878.
+            let port = port
+                .or_else(|| {
+                    daemon_port_path()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .and_then(|s| s.trim().parse::<u16>().ok())
+                })
+                .unwrap_or(7878);
+            let url = format!("http://127.0.0.1:{port}/ui");
+
+            // Probe the daemon — if it's not running, surface a friendly
+            // hint instead of a confusing browser error page.
+            let probe_url = format!("http://127.0.0.1:{port}/health");
+            let healthy = reqwest::get(&probe_url)
+                .await
+                .ok()
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if !healthy {
+                eprintln!(
+                    "{} Daemon not reachable at {}. Run {} first.",
+                    "✗".red(),
+                    format!("http://127.0.0.1:{port}").cyan(),
+                    "trusty-search start".cyan(),
+                );
+                std::process::exit(1);
+            }
+
+            println!("{} Opening {} …", "◉".green(), url.cyan());
+            if let Err(e) = open::that(&url) {
+                eprintln!(
+                    "{} could not launch browser ({e}). Open this URL manually: {}",
+                    "⚠".yellow(),
+                    url
+                );
             }
         }
 

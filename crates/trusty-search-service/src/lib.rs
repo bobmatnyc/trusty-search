@@ -3,6 +3,7 @@ pub mod daemon;
 pub mod indexed_files;
 pub mod reindex;
 pub mod server;
+pub mod ui;
 pub mod walker;
 pub mod watch_loop;
 pub mod watcher;

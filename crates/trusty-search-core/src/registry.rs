@@ -46,6 +46,18 @@ impl IndexRegistry {
         self.indexes.iter().map(|r| r.key().clone()).collect()
     }
 
+    /// Drop an index from the registry. Returns true if the entry existed.
+    ///
+    /// Why: `DELETE /indexes/:id` (admin UI) needs a way to evict an index
+    /// without restarting the daemon.
+    /// What: shard-locked remove via DashMap; the previous `Arc<IndexHandle>`
+    /// is dropped when the last reader finishes (RwLock readers from in-flight
+    /// search requests keep it alive briefly, which is safe).
+    /// Test: register → unregister → get returns None.
+    pub fn unregister(&self, id: &IndexId) -> bool {
+        self.indexes.remove(id).is_some()
+    }
+
     pub fn len(&self) -> usize { self.indexes.len() }
     pub fn is_empty(&self) -> bool { self.indexes.is_empty() }
 }

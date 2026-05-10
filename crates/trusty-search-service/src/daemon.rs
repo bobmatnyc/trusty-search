@@ -159,6 +159,10 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     // Atomically write the port file (write + rename).
     write_port_file(&port_path, port)?;
 
+    // Why: The embedded UI needs to know the actual port at runtime so it
+    // can call back to the daemon (window.__DAEMON_PORT__). Stamp it onto
+    // the state right before building the router.
+    let state = state.with_daemon_port(port);
     let router = build_router(state);
     let listener = TcpListener::from_std(std_listener)?;
 
