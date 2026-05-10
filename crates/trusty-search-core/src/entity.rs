@@ -160,6 +160,15 @@ impl RawEntity {
     }
 }
 
+/// Short, stable hex hash of a string. Used by ingest sources (e.g. SCIP) to
+/// derive readable, collision-resistant entity IDs from opaque symbol strings.
+pub fn fact_hash_str(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:08x}", h.finish())
+}
+
 /// Slice the source text for a node and return it as an owned string.
 fn node_text(node: Node<'_>, src: &[u8]) -> String {
     std::str::from_utf8(&src[node.start_byte()..node.end_byte()])
