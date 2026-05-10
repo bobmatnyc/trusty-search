@@ -11,12 +11,20 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Source file extensions that the indexer can handle.
+///
+/// Java-heavy build files (`.gradle`, `.groovy`) and Kotlin (`.kt`, `.kts`)
+/// fall back to the unknown-language sliding-window chunker since their
+/// tree-sitter grammars aren't compiled in.
 pub const SOURCE_EXTS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h", "hpp",
-    "cs", "rb", "swift", "kt", "scala", "sh", "yaml", "yml", "toml", "json", "md",
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c", "cpp",
+    "h", "hpp", "cs", "rb", "swift", "kt", "kts", "scala", "groovy", "gradle",
+    "sh", "yaml", "yml", "toml", "json", "md",
 ];
 
 /// Directory names to skip when walking. Matched on basename only.
+///
+/// Java/Gradle and JS/TS build outputs are aggressively pruned — these directories
+/// contain machine-generated code that bloats the index without adding signal.
 pub const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -33,6 +41,17 @@ pub const SKIP_DIRS: &[&str] = &[
     "coverage",
     ".pytest_cache",
     ".mypy_cache",
+    // Java / Gradle build artefacts
+    ".gradle",
+    "out",
+    "bin",
+    "classes",
+    "generated",
+    "generated-sources",
+    "generated-test-sources",
+    // IDE / metadata
+    ".idea",
+    ".vscode",
 ];
 
 /// Result of a walk. `skipped_dirs` reports how many entries were pruned by

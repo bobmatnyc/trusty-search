@@ -66,19 +66,35 @@ impl UsearchStore {
     /// reserves `INITIAL_CAPACITY` slots, and wires up the bidirectional ID map.
     /// Test: `test_len` constructs a fresh store and asserts `len() == 0`.
     pub fn new(dim: usize) -> Result<Self> {
+        Self::with_capacity_hint(dim, INITIAL_CAPACITY)
+    }
+
+    /// Construct with an estimated final size. When `expected_chunks > 50_000`
+    /// we tune the HNSW graph for higher recall (higher `connectivity` /
+    /// `expansion_add`) at the cost of more memory and slower build —
+    /// worthwhile on large monorepos where the default `connectivity=16`
+    /// produces noisier neighbour lists. Smaller indexes keep usearch's
+    /// auto-defaults (0 = library-chosen).
+    pub fn with_capacity_hint(dim: usize, expected_chunks: usize) -> Result<Self> {
+        let (connectivity, expansion_add, expansion_search) = if expected_chunks > 50_000 {
+            (32, 128, 64)
+        } else {
+            (0, 0, 0)
+        };
         let options = IndexOptions {
             dimensions: dim,
             metric: MetricKind::Cos,
             quantization: ScalarKind::F32,
-            connectivity: 0,
-            expansion_add: 0,
-            expansion_search: 0,
+            connectivity,
+            expansion_add,
+            expansion_search,
             multi: false,
         };
         let index = Index::new(&options)
             .map_err(|e| anyhow!("usearch Index::new failed: {e}"))?;
+        let initial = expected_chunks.max(INITIAL_CAPACITY);
         index
-            .reserve(INITIAL_CAPACITY)
+            .reserve(initial)
             .map_err(|e| anyhow!("usearch reserve failed: {e}"))?;
 
         Ok(Self {
