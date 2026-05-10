@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use std::path::PathBuf;
 use lru::LruCache;
 
 /// Embedding dimensionality for the all-MiniLM-L6-v2 model.
@@ -20,6 +21,23 @@ pub trait Embedder: Send + Sync {
     fn dimension(&self) -> usize;
 }
 
+/// Resolve the persistent model cache directory: `~/.cache/trusty-search/models/`.
+///
+/// Why: fastembed defaults to `.fastembed_cache` relative to the current working
+/// directory, so the model is re-downloaded whenever `trusty-search start` is run
+/// from a different directory. An absolute, user-scoped cache path guarantees a
+/// single download per machine.
+/// What: creates the directory if absent, then returns the `PathBuf`.
+/// Test: see `tests::model_cache_dir_is_absolute`.
+fn model_cache_dir() -> Result<PathBuf> {
+    let base = dirs::cache_dir()
+        .context("could not determine platform cache directory (HOME not set?)")?;
+    let dir = base.join("trusty-search").join("models");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create model cache dir {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// FastEmbedder: fastembed-rs ONNX runtime (all-MiniLM-L6-v2, 384-dim, SIMD-accelerated).
 ///
 /// Why: provides local embeddings with no API key requirement, AVX2/NEON-accelerated,
@@ -34,13 +52,19 @@ pub struct FastEmbedder {
 }
 
 impl FastEmbedder {
-    /// Initialize the embedder, downloading the model on first run (~23MB into
-    /// the fastembed cache directory under `~/.cache/`).
+    /// Initialize the embedder, downloading the model on first run (~23 MB into
+    /// `~/.cache/trusty-search/models/`). Subsequent runs load from that cache
+    /// directory and skip the download entirely.
     pub async fn new() -> Result<Self> {
+        let cache_dir = model_cache_dir()?;
+
         // fastembed's `try_new` is blocking (downloads + ONNX session init),
         // so run it on the blocking pool to keep the async runtime responsive.
-        let model = tokio::task::spawn_blocking(|| {
-            TextEmbedding::try_new(TextInitOptions::new(EmbeddingModel::AllMiniLML6V2))
+        let model = tokio::task::spawn_blocking(move || {
+            TextEmbedding::try_new(
+                TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                    .with_cache_dir(cache_dir),
+            )
         })
         .await
         .context("fastembed init task panicked")?
@@ -194,8 +218,14 @@ impl Embedder for MockEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    /// Tests that construct `FastEmbedder::new()` are serialised with `#[serial]`
+    /// because fastembed/hf_hub uses a per-blob `.lock` file when loading the
+    /// ONNX model. Running three concurrent constructors on the same model
+    /// causes lock-acquisition failures on macOS and Linux.
     #[tokio::test]
+    #[serial]
     async fn test_embed_returns_384_dims() {
         // This will download the model on first run (~23MB)
         let embedder = FastEmbedder::new().await.expect("embedder init");
@@ -209,6 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_embed_batch() {
         let embedder = FastEmbedder::new().await.expect("embedder init");
         let texts = vec!["hello world", "fn main() {}", "struct Foo;"];
@@ -218,6 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_lru_cache_hit() {
         let embedder = FastEmbedder::new().await.expect("embedder init");
         let text = "cached query";

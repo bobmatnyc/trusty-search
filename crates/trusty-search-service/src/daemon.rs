@@ -99,6 +99,36 @@ fn bind_with_auto_port(start_port: u16, max_attempts: u16) -> Result<StdTcpListe
     Err(DaemonError::NoFreePort(start_port))
 }
 
+/// Check whether a daemon is already running without starting one.
+///
+/// Why: callers that need to fail-fast (e.g. before loading a 86 MB embedding
+/// model) can call this before doing any expensive work. Returns the lock-file
+/// path when a running daemon is detected, `None` when the lock is free.
+///
+/// What: opens the lockfile (if it exists) and attempts a non-blocking
+/// exclusive lock. If the attempt fails the lock is held by another process.
+pub fn is_already_running() -> Option<PathBuf> {
+    let lock_path = daemon_lock_path().ok()?;
+    // If the lockfile doesn't exist there is definitely no daemon.
+    if !lock_path.exists() {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .create(false)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    if file.try_lock_exclusive().is_err() {
+        // Lock is held — another daemon is alive.
+        Some(lock_path)
+    } else {
+        // We acquired it; release immediately (lock drops here).
+        None
+    }
+}
+
 /// Acquire an exclusive advisory lock on the daemon lockfile. The returned
 /// `File` must outlive the daemon — drop releases the lock.
 fn acquire_lock(lock_path: &PathBuf) -> Result<File, DaemonError> {
