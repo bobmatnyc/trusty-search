@@ -1359,6 +1359,18 @@ async fn main() -> Result<()> {
         }
 
         Commands::Start { port } => {
+            // Fast-path: bail before loading the 86 MB embedding model when
+            // another daemon is already running.  The lock check is ~1 ms;
+            // FastEmbedder::new() can take several seconds on first run.
+            if let Some(lock_path) = trusty_search_service::is_already_running() {
+                eprintln!(
+                    "{} another trusty-search daemon is already running (lock at {})",
+                    "✗".red(),
+                    lock_path.display()
+                );
+                std::process::exit(1);
+            }
+
             // Open the canonical facts store next to the daemon lockfile.
             // Why: facts persist across daemon restarts and are scoped per-machine
             // (single install). Falling back to `None` keeps the daemon usable if
