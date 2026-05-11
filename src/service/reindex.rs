@@ -13,6 +13,7 @@
 //!
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
+use crate::core::indexer::CommitTimings;
 use crate::core::registry::{IndexHandle, IndexId};
 use crate::service::walker::{should_skip_content, walk_source_files};
 use crossbeam_utils::atomic::AtomicCell;
@@ -275,6 +276,19 @@ pub fn spawn_reindex_with_cleanup(
             hashes.clear();
         }
 
+        // Per-subsystem timing accumulators. Each phase (parse, embed, BM25,
+        // vector upsert) is measured inside the indexer (see `ParsedBatch` /
+        // `CommitTimings`) and summed across all batches here. KG is measured
+        // separately at the end. Together with `vector_count`, this gives
+        // operators per-subsystem visibility — and crucially, a non-zero
+        // `embed_ms` with `vector_count == 0` is the smoking-gun signal for the
+        // "embedder silently fell back to BM25" failure mode.
+        let mut total_parse_ms: u64 = 0;
+        let mut total_embed_ms: u64 = 0;
+        let mut total_bm25_ms: u64 = 0;
+        let mut total_vector_upsert_ms: u64 = 0;
+        let mut total_vector_count: usize = 0;
+
         // Process files in batches. Each batch:
         //  1. Reads files concurrently (tokio::fs::read_to_string).
         //  2. Skips files whose content hash matches the previous reindex.
@@ -368,17 +382,32 @@ pub fn spawn_reindex_with_cleanup(
             //        the minimum window needed to install the new chunks.
             //    The graph rebuild is deferred to the very end of the reindex
             //    (one rebuild instead of one per batch).
-            let result: anyhow::Result<usize> = async {
+            // Each batch returns both the `ParsedBatch` timings (parse_ms,
+            // embed_ms, vector_count) and the `CommitTimings` (bm25_ms,
+            // vector_upsert_ms). We capture both so the orchestrator can
+            // accumulate per-subsystem totals across the whole reindex.
+            let result: anyhow::Result<(u64, u64, usize, CommitTimings)> = async {
                 let parsed = {
                     let indexer = handle.indexer.read().await;
                     indexer.parse_and_embed_files(to_index.clone()).await?
                 };
+                let parse_ms = parsed.parse_ms;
+                let embed_ms = parsed.embed_ms;
+                let vector_count = parsed.vector_count;
                 let indexer = handle.indexer.write().await;
-                indexer.commit_parsed_batch(parsed, true).await
+                let commit = indexer.commit_parsed_batch(parsed, true).await?;
+                Ok((parse_ms, embed_ms, vector_count, commit))
             }
             .await;
             match result {
-                Ok(new_chunks) => {
+                Ok((parse_ms, embed_ms, vector_count, commit)) => {
+                    let new_chunks = commit.chunks;
+                    total_parse_ms = total_parse_ms.saturating_add(parse_ms);
+                    total_embed_ms = total_embed_ms.saturating_add(embed_ms);
+                    total_bm25_ms = total_bm25_ms.saturating_add(commit.bm25_ms);
+                    total_vector_upsert_ms =
+                        total_vector_upsert_ms.saturating_add(commit.vector_upsert_ms);
+                    total_vector_count = total_vector_count.saturating_add(vector_count);
                     progress
                         .total_chunks
                         .fetch_add(new_chunks, Ordering::Release);
@@ -438,10 +467,14 @@ pub fn spawn_reindex_with_cleanup(
         // per-batch rebuilds above because each rebuild is O(N + E) over the
         // entire corpus and would scale quadratically with file count if run
         // per batch. One rebuild at the end gives the same final state.
-        {
+        let kg_start = Instant::now();
+        let (symbol_count, edge_count) = {
             let indexer = handle.indexer.read().await;
             indexer.rebuild_symbol_graph_now().await;
-        }
+            let g = indexer.symbol_graph().await;
+            (g.node_count(), g.edge_count())
+        };
+        let kg_ms = kg_start.elapsed().as_millis() as u64;
 
         progress.status.store(ReindexStatus::Complete);
         let total_chunks = progress.total_chunks.load(Ordering::Acquire);
@@ -458,6 +491,16 @@ pub fn spawn_reindex_with_cleanup(
                 "errors": progress.errors.load(Ordering::Acquire),
                 "elapsed_ms": elapsed_ms,
                 "chunks_per_sec": chunks_per_sec,
+                "timings": {
+                    "parse_ms": total_parse_ms,
+                    "embed_ms": total_embed_ms,
+                    "bm25_ms": total_bm25_ms,
+                    "vector_upsert_ms": total_vector_upsert_ms,
+                    "kg_ms": kg_ms,
+                    "vector_count": total_vector_count,
+                    "symbol_count": symbol_count,
+                    "edge_count": edge_count,
+                },
             }))
             .await;
 

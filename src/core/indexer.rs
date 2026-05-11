@@ -259,6 +259,35 @@ pub struct ParsedBatch {
     /// Always the same length as `chunks`.
     pub embeddings: Vec<Option<Vec<f32>>>,
     pub entities_by_file: Vec<(String, Vec<RawEntity>)>,
+    /// Wall-clock time spent in `parse_files_parallel` (tree-sitter chunking).
+    pub parse_ms: u64,
+    /// Wall-clock time spent in `embed_chunks_in_batches` (ONNX embedding).
+    /// `0` when no embedder was wired (BM25-only mode).
+    pub embed_ms: u64,
+    /// Number of chunks for which `Some(embedding)` was produced. `0` means
+    /// the embedder was unavailable and the index degraded to BM25-only mode.
+    pub vector_count: usize,
+}
+
+/// Per-batch timings emitted by [`CodeIndexer::commit_parsed_batch`]. Captures
+/// the cost of the commit-phase work (BM25 ingest, vector upsert, KG rebuild).
+///
+/// Why: surfaced to the reindex orchestrator so it can accumulate per-subsystem
+/// totals across all batches and emit them in the SSE `complete` event. This
+/// gives operators visibility into where indexing time was actually spent and
+/// is the smoking-gun signal for the "embedder silently fell back to BM25"
+/// failure mode (`vector_count == 0` while `chunks > 0`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CommitTimings {
+    /// Chunks added by this commit. May be 0 if the batch was empty.
+    pub chunks: usize,
+    /// Time spent under the BM25 write lock ingesting tokens for this batch.
+    pub bm25_ms: u64,
+    /// Time spent in the HNSW `upsert_batch` call (vectors only).
+    pub vector_upsert_ms: u64,
+    /// Time spent rebuilding the symbol graph at the end of this commit. `0`
+    /// when `defer_graph_rebuild=true` (the reindex orchestrator path).
+    pub kg_ms: u64,
 }
 
 /// `CodeIndexer`: hybrid search engine for one named index.
@@ -701,10 +730,10 @@ impl CodeIndexer {
             return Ok(0);
         }
         let parsed = self.parse_and_embed_files(files.to_vec()).await?;
-        let total = self
+        let timings = self
             .commit_parsed_batch(parsed, defer_graph_rebuild)
             .await?;
-        Ok(total)
+        Ok(timings.chunks)
     }
 
     /// Phase 1+2 of the bulk pipeline: parse files into chunks and embed them.
@@ -724,6 +753,7 @@ impl CodeIndexer {
             return Ok(ParsedBatch::default());
         }
 
+        let parse_start = std::time::Instant::now();
         let parsed = Self::parse_files_parallel(files).await?;
 
         let mut all_chunks: Vec<RawChunk> = Vec::new();
@@ -732,13 +762,20 @@ impl CodeIndexer {
             all_chunks.extend(chunks);
             entities_by_file.push((path, entities));
         }
+        let parse_ms = parse_start.elapsed().as_millis() as u64;
 
+        let embed_start = std::time::Instant::now();
         let embeddings = self.embed_chunks_in_batches(&all_chunks).await?;
+        let embed_ms = embed_start.elapsed().as_millis() as u64;
+        let vector_count = embeddings.iter().filter(|e| e.is_some()).count();
 
         Ok(ParsedBatch {
             chunks: all_chunks,
             embeddings,
             entities_by_file,
+            parse_ms,
+            embed_ms,
+            vector_count,
         })
     }
 
@@ -824,28 +861,46 @@ impl CodeIndexer {
         &self,
         parsed: ParsedBatch,
         defer_graph_rebuild: bool,
-    ) -> Result<usize> {
+    ) -> Result<CommitTimings> {
         let ParsedBatch {
             chunks: mut all_chunks,
             embeddings,
             entities_by_file,
+            parse_ms: _,
+            embed_ms: _,
+            vector_count: _,
         } = parsed;
         let chunk_total = all_chunks.len();
         if chunk_total == 0 {
             self.commit_entities(entities_by_file).await;
-            return Ok(0);
+            return Ok(CommitTimings::default());
         }
 
+        let vec_start = std::time::Instant::now();
         self.commit_vectors_batch(&all_chunks, &embeddings).await?;
+        let vector_upsert_ms = vec_start.elapsed().as_millis() as u64;
+
+        let bm25_start = std::time::Instant::now();
         self.commit_bm25_batch(&all_chunks).await;
+        let bm25_ms = bm25_start.elapsed().as_millis() as u64;
+
         self.commit_embeddings_cache(&all_chunks, embeddings).await;
         self.commit_corpus(&mut all_chunks).await;
         self.commit_entities(entities_by_file).await;
 
-        if !defer_graph_rebuild {
+        let kg_ms = if defer_graph_rebuild {
+            0
+        } else {
+            let kg_start = std::time::Instant::now();
             self.rebuild_symbol_graph().await;
-        }
-        Ok(chunk_total)
+            kg_start.elapsed().as_millis() as u64
+        };
+        Ok(CommitTimings {
+            chunks: chunk_total,
+            bm25_ms,
+            vector_upsert_ms,
+            kg_ms,
+        })
     }
 
     /// Single batched HNSW upsert across all chunks that have an embedding.

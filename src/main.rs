@@ -618,6 +618,49 @@ fn fmt_secs(secs: u64) -> String {
     }
 }
 
+/// Print per-subsystem indexing time breakdown after a successful reindex.
+///
+/// Why: gives the operator proof that each subsystem (parse, embed, BM25, KG)
+/// actually ran and how long each took. The vector-count check is the
+/// smoking-gun signal for the "embedder silently fell back to BM25" failure
+/// mode — printed as a loud warning so it can never go unnoticed.
+/// What: 4-line breakdown, plus a 5th warning line when `vector_count == 0`
+/// despite non-zero chunks (the BM25-only-mode signal).
+/// Test: call with synthetic timings where vector_count==0 and total_chunks>0;
+/// assert the warning line is printed.
+fn print_timing_breakdown(t: &ReindexTimings, total_chunks: u64) {
+    println!(
+        "  {} {:>7}  ({} chunks)",
+        "Parse+chunk:".dimmed(),
+        fmt_elapsed(t.parse_ms),
+        format_with_commas(total_chunks),
+    );
+    if t.vector_count == 0 && total_chunks > 0 {
+        println!(
+            "  {} {}",
+            "Embed (HNSW):".dimmed(),
+            "SKIPPED (embedder unavailable — BM25-only mode)"
+                .yellow()
+                .bold(),
+        );
+    } else {
+        println!(
+            "  {} {:>7}  ({} vectors)",
+            "Embed (HNSW):".dimmed(),
+            fmt_elapsed(t.embed_ms),
+            format_with_commas(t.vector_count),
+        );
+    }
+    println!("  {} {:>7}", "BM25:".dimmed(), fmt_elapsed(t.bm25_ms));
+    println!(
+        "  {} {:>7}  ({} symbols, {} edges)",
+        "KG:".dimmed(),
+        fmt_elapsed(t.kg_ms),
+        format_with_commas(t.symbol_count),
+        format_with_commas(t.edge_count),
+    );
+}
+
 /// Multi-line live progress display for a reindex.
 ///
 /// Why: a single-line `ProgressBar` can't simultaneously show file progress,
@@ -745,6 +788,29 @@ struct ReindexOutcome {
     errors: u64,
     elapsed_ms: u64,
     completed: bool,
+    /// Per-subsystem timings captured from the daemon's `complete` event
+    /// `timings` payload. `None` when the daemon is an older version that
+    /// didn't emit timings — caller renders a single-line summary in that case.
+    timings: Option<ReindexTimings>,
+}
+
+/// Per-subsystem indexing timings parsed from the SSE `complete` event.
+///
+/// Why: gives the user proof that each subsystem ran and how long each took.
+/// `vector_count == 0` with `total_chunks > 0` is the smoking-gun signal that
+/// the embedder silently fell back to BM25-only — surfaced as a warning in the
+/// CLI breakdown so this regression can never go unnoticed.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReindexTimings {
+    parse_ms: u64,
+    embed_ms: u64,
+    bm25_ms: u64,
+    #[allow(dead_code)]
+    vector_upsert_ms: u64,
+    kg_ms: u64,
+    vector_count: u64,
+    symbol_count: u64,
+    edge_count: u64,
 }
 
 /// Plain reindex (no post-verify). Used by the non-force `index` command, the
@@ -975,6 +1041,22 @@ async fn run_reindex_with(
                     .unwrap_or_else(|| skipped_now.load(Ordering::Acquire));
                 outcome.errors = evt.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
                 outcome.elapsed_ms = evt.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                // Per-subsystem timings (added in 0.3.11). Absent when talking
+                // to an older daemon — outcome.timings stays `None` and the
+                // CLI falls back to the legacy single-line summary.
+                if let Some(t) = evt.get("timings") {
+                    let get = |k: &str| t.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                    outcome.timings = Some(ReindexTimings {
+                        parse_ms: get("parse_ms"),
+                        embed_ms: get("embed_ms"),
+                        bm25_ms: get("bm25_ms"),
+                        vector_upsert_ms: get("vector_upsert_ms"),
+                        kg_ms: get("kg_ms"),
+                        vector_count: get("vector_count"),
+                        symbol_count: get("symbol_count"),
+                        edge_count: get("edge_count"),
+                    });
+                }
                 outcome.completed = true;
                 ui.set_position(outcome.indexed);
                 done = true;
@@ -1042,6 +1124,15 @@ async fn run_reindex_with(
         )
     };
     ui.finish(final_msg);
+
+    // ── Per-subsystem timing breakdown (issue: silent BM25 fallback) ──────
+    // We render this AFTER `ui.finish` so the indicatif `MultiProgress`
+    // doesn't redraw over our printed lines. Skipped entirely when talking
+    // to a daemon older than 0.3.11 (no `timings` block in the SSE
+    // `complete` event).
+    if let Some(t) = outcome.timings {
+        print_timing_breakdown(&t, outcome.total_chunks);
+    }
 
     // ── Post-reindex health check (blue-green safety net) ─────────────────
     if opts.verify_after {
