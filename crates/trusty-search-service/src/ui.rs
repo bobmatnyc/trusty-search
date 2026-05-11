@@ -30,13 +30,13 @@ use crate::server::SearchAppState;
 use trusty_common::{openrouter_chat, ChatMessage as CommonChatMessage};
 
 /// Why: `include_dir!` walks at compile time and embeds every byte. We point
-/// it at `../../../ui/dist` (relative to this crate's `src/`).
-/// What: `UI_DIR` is a static reference to the compiled tree. If `ui/dist`
-/// doesn't exist at compile time, the macro embeds an empty directory and
-/// the handlers return 404 — the daemon still builds and runs.
-/// Test: `cargo build` after `npm run build` produces a binary that, when
-/// run, serves `/ui` with the SPA shell.
-static UI_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
+/// it at `ui-dist/` inside this crate's directory (committed alongside the
+/// source so it is available during `cargo publish` packaging).
+/// What: `UI_DIR` is a static reference to the compiled tree.
+/// Test: `cargo build` produces a binary that, when run, serves `/ui` with
+/// the SPA shell. To regenerate: `npm run build` in `ui/`, then
+/// `cp -r ui/dist crates/trusty-search-service/ui-dist`.
+static UI_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui-dist");
 
 /// Inject runtime configuration into index.html before serving.
 ///
