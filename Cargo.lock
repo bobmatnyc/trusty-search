@@ -4245,6 +4245,7 @@ name = "trusty-search"
 version = "0.1.59"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "clap_complete",

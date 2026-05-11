@@ -16,6 +16,9 @@
 
 mod commands;
 mod detect;
+mod doctor;
+
+pub(crate) use doctor::run_doctor_checks;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -1695,53 +1698,6 @@ struct EmptyIndex {
     root_path: String,
 }
 
-/// Run the full doctor diagnostic suite and return (checks, empty_indexes).
-///
-/// Why: keeping this as a thin orchestrator over per-check helpers keeps each
-/// branch's cyclomatic complexity low and makes individual checks unit-testable.
-/// What: builds an HTTP client, then dispatches six independent checks in order
-/// (daemon, model cache, data dir, lock file, indexes, port).
-/// Test: `cargo run -- doctor` — all six headings appear, exit code 0 on a
-/// healthy install.
-async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
-    let mut checks: Vec<CheckResult> = Vec::new();
-    let mut empty_indexes: Vec<EmptyIndex> = Vec::new();
-
-    let port = read_daemon_port();
-    let base = daemon_base_url();
-    let client = match trusty_common::server::daemon_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            checks.push(CheckResult::Error(format!(
-                "failed to build HTTP client: {e}"
-            )));
-            return (checks, empty_indexes);
-        }
-    };
-
-    let (daemon_running, daemon_version) = probe_daemon_health(&client, &base).await;
-    checks.push(check_daemon_running(daemon_running, &base, &daemon_version));
-
-    checks.push(check_model_cache());
-
-    let data_dir = doctor_data_dir();
-    checks.push(check_data_dir(&data_dir));
-    checks.push(check_lock_file(&data_dir, daemon_running));
-
-    check_indexes(
-        &client,
-        &base,
-        daemon_running,
-        &mut checks,
-        &mut empty_indexes,
-    )
-    .await;
-
-    checks.push(check_port_reachable(port).await);
-
-    (checks, empty_indexes)
-}
-
 /// Why: separates the network probe from the result-formatting so the
 /// formatting check can be tested without async/HTTP.
 /// What: returns `(running, version)` by hitting `/health`.
@@ -1877,45 +1833,6 @@ fn check_lock_file(data_dir: &std::path::Path, daemon_running: bool) -> CheckRes
             pid
         ))
     }
-}
-
-/// Why: index status involves a list call plus a fan-out of per-index status
-/// calls; isolating it makes the orchestrator readable and complies with the
-/// "no function over CC 20" budget.
-/// What: when the daemon is up, fetches `/indexes` then concurrently queries
-/// each `/indexes/:name/status`, prints a per-index breakdown line, pushes a
-/// summary CheckResult, and records empty indexes for `--fix` to repair.
-/// Test: with a daemon serving one populated index, pushes one Ok summary;
-/// with a daemon down, pushes one Warn ("Indexes: skipped …").
-async fn check_indexes(
-    client: &reqwest::Client,
-    base: &str,
-    daemon_running: bool,
-    checks: &mut Vec<CheckResult>,
-    empty_indexes: &mut Vec<EmptyIndex>,
-) {
-    if !daemon_running {
-        checks.push(CheckResult::Warn(
-            "Indexes: skipped (daemon not running)".into(),
-        ));
-        return;
-    }
-
-    let names = fetch_index_names(client, base).await;
-    if names.is_empty() {
-        checks.push(CheckResult::Warn(
-            "No indexes registered — run `trusty-search index` to add a project".into(),
-        ));
-        return;
-    }
-
-    let per_index = fetch_index_statuses(client, base, &names).await;
-    let zero_count = per_index
-        .iter()
-        .filter(|(_, b)| b.get("chunk_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0)
-        .count();
-    checks.push(summarize_indexes(per_index.len(), zero_count));
-    print_index_breakdown(&per_index, empty_indexes);
 }
 
 /// Why: parsing the `/indexes` listing is its own concern — failure to reach
