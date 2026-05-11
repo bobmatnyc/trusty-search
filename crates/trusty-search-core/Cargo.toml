@@ -83,3 +83,7 @@ test-support = []
 # Compile in the ONNX NER extractor. Even with this feature on, NER stays
 # inert at runtime unless `~/.trusty-search/models/ner.onnx` is present.
 ner = ["dep:ort", "dep:tokenizers"]
+# GPU-accelerated embedding via fastembed-rs CUDA backend. Forwarded to
+# `trusty-embedder/cuda`. Default builds stay CPU-only; opt in with
+# `--features cuda` (requires CUDA toolkit + compatible NVIDIA GPU).
+cuda = ["trusty-embedder/cuda"]

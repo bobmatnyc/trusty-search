@@ -530,6 +530,31 @@ cargo run -- query "fn authenticate" --index myproject
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+### GPU-accelerated embedding (CUDA, optional)
+
+Default builds and installs are CPU-only and require no GPU drivers. To enable
+GPU-accelerated embedding via fastembed-rs's CUDA (candle) backend, opt in
+with the `cuda` Cargo feature:
+
+```bash
+# Install with CUDA support (machine must have CUDA toolkit + NVIDIA GPU)
+cargo install trusty-search --features cuda
+
+# Dev build with GPU support
+cargo build --features cuda
+```
+
+Requirements when compiling with `--features cuda`:
+- NVIDIA CUDA toolkit installed (`nvcc` on PATH, or `CUDA_PATH` env set)
+- Compatible NVIDIA GPU available at runtime
+- Builds on CPU-only machines (including macOS) **will fail** the `cudarc`
+  build script — this is expected, not a bug. Omit `--features cuda` for
+  CPU-only environments.
+
+The feature flag chain is:
+`trusty-search/cuda` → `trusty-search-core/cuda` → `trusty-embedder/cuda` →
+`fastembed/cuda`.
+
 ## Project Status
 
 **Phase**: Production-ready. Full hybrid search pipeline, web UI, MCP server, and

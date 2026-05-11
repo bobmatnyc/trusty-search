@@ -31,25 +31,25 @@ include_dir = "0.7"
 open = "5"
 libc = "0.2"
 trusty-mcp-core = { version = "0.1.0" }
-trusty-embedder = { version = "0.1.0" }
+trusty-embedder = { version = "0.1.1" }
 trusty-common = { version = "0.1.2" }
 
-# Local development override: use the in-tree trusty-common workspace so
-# changes here are picked up without a release cycle. Cargo requires every
-# crate exported from the patched source to be listed, even if not all are
-# consumed.
+# Local development override: use the in-tree `../trusty-common` workspace so
+# unreleased changes are picked up without a release cycle. Cargo requires
+# every crate exported from the patched source to be listed even if not all
+# are consumed.
 #
-# NOTE: Disabled because the in-tree `../trusty-common` workspace has moved to
-# axum 0.8 while trusty-search still pins axum 0.7. With the patch active,
-# both versions are pulled into the dependency graph and
-# `with_standard_middleware` no longer type-checks (Router<S> from two
-# different axum versions). Re-enable once trusty-search migrates to axum 0.8
-# (see follow-up ticket). Until then, builds resolve to the published
-# `trusty-common-v0.1.2` git tag which remains on axum 0.7.
-# [patch."https://github.com/bobmatnyc/trusty-common"]
-# trusty-common = { path = "../trusty-common/crates/trusty-common" }
-# trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
-# trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+# Re-enabled (commit ac13d01 finished the axum 0.7 → 0.8 migration that
+# previously blocked this override). Required so the `cuda` feature on
+# `trusty-search-core` resolves against the in-tree `trusty-embedder 0.1.1`
+# (which adds `cuda`) until that version is published to crates.io.
+#
+# To build trusty-search standalone (without `../trusty-common` checked out),
+# comment this block out AND ensure trusty-embedder >=0.1.1 is published.
+[patch.crates-io]
+trusty-common = { path = "../trusty-common/crates/trusty-common" }
+trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
 
 [package]
 name = "trusty-search"
@@ -96,3 +96,10 @@ futures-util = "0.3"
 [dev-dependencies]
 walkdir = "2"
 tokio = { workspace = true }
+
+[features]
+default = []
+# GPU-accelerated embedding via fastembed-rs CUDA backend.
+# Requires CUDA toolkit + compatible NVIDIA GPU. Install with:
+#   cargo install trusty-search --features cuda
+cuda = ["trusty-search-core/cuda"]
