@@ -1,19 +1,18 @@
 # trusty-search Makefile
 #
 # Why: `cargo publish` requires the embedded Svelte UI assets to live inside
-# the `trusty-search-service` crate at `crates/trusty-search-service/ui-dist/`.
-# The UI source lives at `ui/` (workspace root); without an explicit sync step
-# a developer who rebuilds the UI can easily publish stale assets. These
-# targets make the sync step a single, well-named command.
+# the crate-root `ui-dist/` (post-consolidation single-crate layout).
+# The UI source lives at `ui/`; without an explicit sync step a developer who
+# rebuilds the UI can easily publish stale assets. These targets make the sync
+# step a single, well-named command.
 # What: `build-ui` runs the Svelte/Vite build; `sync-ui` mirrors `ui/dist/`
-# into the service crate's `ui-dist/`; `release-prep` chains the two and is
-# the documented prerequisite for `cargo publish`.
-# Test: `make release-prep` populates
-# `crates/trusty-search-service/ui-dist/index.html` and the `assets/` tree.
+# into `ui-dist/`; `release-prep` chains the two and is the documented
+# prerequisite for `cargo publish`.
+# Test: `make release-prep` populates `ui-dist/index.html` and the `assets/` tree.
 
 UI_DIR      := ui
 UI_DIST     := $(UI_DIR)/dist
-UI_EMBED    := crates/trusty-search-service/ui-dist
+UI_EMBED    := ui-dist
 
 .PHONY: ui build-ui sync-ui release-prep check clippy test
 
@@ -27,7 +26,7 @@ build-ui:
 		cd $(UI_DIR) && npm ci && npm run build; \
 	fi
 
-## Sync ui/dist → crates/trusty-search-service/ui-dist (no rebuild)
+## Sync ui/dist → ui-dist (no rebuild)
 sync-ui:
 	@test -d $(UI_DIST) || (echo "ERROR: $(UI_DIST) missing — run 'make build-ui' first" && exit 1)
 	rm -rf $(UI_EMBED)

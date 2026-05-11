@@ -23,9 +23,9 @@ jobs:
             pnpm install
           fi
           pnpm build
-      - name: Diff ui/dist against crates/trusty-search-service/ui-dist
+      - name: Diff ui/dist against ui-dist
         run: |
-          if diff -rq --exclude="*.map" ui/dist crates/trusty-search-service/ui-dist; then
+          if diff -rq --exclude="*.map" ui/dist ui-dist; then
             echo "ui-dist is up to date"
           else
             echo "ERROR: ui-dist is stale. Run 'make release-prep' and commit the result." >&2
@@ -38,6 +38,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout trusty-common (for [patch.crates-io] path deps)
+        uses: actions/checkout@v4
+        with:
+          repository: bobmatnyc/trusty-common
+          path: ../trusty-common
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
@@ -47,6 +52,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout trusty-common (for [patch.crates-io] path deps)
+        uses: actions/checkout@v4
+        with:
+          repository: bobmatnyc/trusty-common
+          path: ../trusty-common
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install --path . --locked
