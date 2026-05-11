@@ -1,6 +1,6 @@
 [package]
 name = "trusty-search-mcp"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-search hybrid code search"
 license = "MIT"
@@ -10,8 +10,8 @@ keywords = ["mcp", "search", "code-search", "ai", "json-rpc"]
 categories = ["development-tools", "network-programming"]
 
 [dependencies]
-trusty-search-core = { version = "0.1.7", path = "../trusty-search-core" }
-trusty-search-service = { version = "0.1.7", path = "../trusty-search-service" }
+trusty-search-core = { version = "0.2.0", path = "../trusty-search-core" }
+trusty-search-service = { version = "0.2.0", path = "../trusty-search-service" }
 trusty-mcp-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

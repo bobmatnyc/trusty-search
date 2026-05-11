@@ -55,7 +55,7 @@ trusty-contracts = { path = "../trusty-common/crates/trusty-contracts" }
 
 [package]
 name = "trusty-search"
-version = "0.1.63"
+version = "0.2.0"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -69,9 +69,9 @@ name = "trusty-search"
 path = "src/main.rs"
 
 [dependencies]
-trusty-search-core = { version = "0.1.7", path = "crates/trusty-search-core" }
-trusty-search-service = { version = "0.1.7", path = "crates/trusty-search-service" }
-trusty-search-mcp = { version = "0.1.7", path = "crates/trusty-search-mcp" }
+trusty-search-core = { version = "0.2.0", path = "crates/trusty-search-core" }
+trusty-search-service = { version = "0.2.0", path = "crates/trusty-search-service" }
+trusty-search-mcp = { version = "0.2.0", path = "crates/trusty-search-mcp" }
 trusty-common = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
