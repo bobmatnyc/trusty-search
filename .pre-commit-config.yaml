@@ -8,9 +8,9 @@ repos:
     rev: v4.5.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^(.*\.md|.*\.txt)$
+        exclude: ^(.*\.md|.*\.txt|ui-dist/.*|ui/dist/.*)$
       - id: end-of-file-fixer
-        exclude: ^(.*\.md|.*\.txt)$
+        exclude: ^(.*\.md|.*\.txt|ui-dist/.*|ui/dist/.*)$
       - id: check-yaml
         args: ['--unsafe']  # Allow custom YAML tags
       - id: check-json
