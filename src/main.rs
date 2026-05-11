@@ -241,16 +241,31 @@ enum Commands {
     Health,
 
     // ── Service commands ──────────────────────────────────────────────────
-    /// Start the background HTTP daemon
+    /// Start the HTTP daemon
+    ///
+    /// By default, runs the daemon inline in the current process (blocks until
+    /// SIGTERM/SIGINT). The `--foreground` flag is accepted for clarity when the
+    /// process is supervised by launchd, systemd, or Docker — these supervisors
+    /// require the managed binary to remain in the foreground rather than forking.
     ///
     /// Examples:
     ///   trusty-search start
     ///   trusty-search start --port 7878
+    ///   trusty-search start --foreground --port 7878   # launchd / systemd
     #[command(display_order = 20)]
     Start {
         /// Port to listen on (default: 7878, auto-selects next if busy)
         #[arg(long, default_value = "7878")]
         port: u16,
+
+        /// Run in the foreground instead of forking a background daemon.
+        ///
+        /// Use this when the process is managed by launchd, systemd, or Docker.
+        /// Note: the daemon already runs inline by default (no fork is performed),
+        /// so this flag is currently a no-op accepted for forward-compatibility
+        /// and to make the launchd/systemd contract explicit in ProgramArguments.
+        #[arg(long, default_value_t = false)]
+        foreground: bool,
     },
 
     /// Stop the running background daemon
@@ -2288,7 +2303,13 @@ async fn main() -> Result<()> {
             run_status(cli.json).await?;
         }
 
-        Commands::Start { port } => {
+        Commands::Start { port, foreground } => {
+            // `foreground` is currently a no-op: `run_daemon` already runs inline
+            // and never forks. The flag is accepted so launchd/systemd plists can
+            // declare the supervised contract explicitly in ProgramArguments
+            // (see ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist).
+            // If a background-fork path is ever added, gate it on `!foreground`.
+            let _ = foreground;
             // Fast-path: bail before loading the 86 MB embedding model when
             // another daemon is already running.  The lock check is ~1 ms;
             // FastEmbedder::new() can take several seconds on first run.
