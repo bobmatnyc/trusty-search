@@ -4764,11 +4764,10 @@ dependencies = [
 
 [[package]]
 name = "trusty-common"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2eff22f03d088890813d9ca0e704cb0db6601945bf05dd6ccd6d7cbd620f670"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "colored",
  "dirs 5.0.1",
@@ -4816,7 +4815,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4847,7 +4846,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4899,7 +4898,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search-mcp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -4916,7 +4915,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search-service"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -5978,7 +5977,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "trusty-common"
-version = "0.2.0"

@@ -1,6 +1,6 @@
 [package]
 name = "trusty-search-service"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Axum HTTP daemon, file watcher, and client for trusty-search"
 license = "MIT"
@@ -12,7 +12,7 @@ build = "build.rs"
 include = ["src/**/*", "build.rs", "ui-dist/**/*", "Cargo.toml", "README.md"]
 
 [dependencies]
-trusty-search-core = { version = "0.2.1", path = "../trusty-search-core" }
+trusty-search-core = { version = "0.2.2", path = "../trusty-search-core" }
 trusty-common = { workspace = true, features = ["axum-server"] }
 tokio = { workspace = true }
 serde = { workspace = true }
