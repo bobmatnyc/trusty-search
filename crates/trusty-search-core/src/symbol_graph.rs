@@ -92,113 +92,207 @@ impl SymbolGraph {
         let mut g = Self::new();
 
         // Pass 1: register all defining symbols.
-        for (chunk_id, file, name, _calls, _inh, _ct) in chunks {
-            let Some(name) = name else { continue };
-            if name.is_empty() {
-                continue;
-            }
-            // First-write-wins so chunk_to_symbol stays stable.
-            if g.by_symbol.contains_key(name) {
-                g.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
-                continue;
-            }
-            let idx = g.graph.add_node(SymbolNode {
-                symbol: name.clone(),
-                chunk_id: chunk_id.clone(),
-                file: file.clone(),
-            });
-            g.by_symbol.insert(name.clone(), idx);
-            g.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
-        }
+        g.register_symbol_nodes(chunks);
 
         // Build a `simple_name → first-NodeIndex` lookup for qualified-symbol
         // resolution. Replaces the per-edge `O(symbols)` linear suffix scan
         // that used to live inside `resolve_callee`. On a 115k-chunk corpus
         // with thousands of qualified methods this collapses what was an
         // O(N²) build pass into O(N).
-        let mut by_suffix: HashMap<&str, NodeIndex> = HashMap::new();
-        for (sym, &idx) in g.by_symbol.iter() {
+        let by_suffix = g.build_suffix_lookup();
+
+        // Pass 2: add CallsFunction + Implements edges.
+        g.add_call_and_inherit_edges(chunks, &by_suffix);
+
+        // Pass 3: ModuleContains edges from container chunks.
+        g.add_module_contains_edges(chunks);
+
+        g
+    }
+
+    /// Pass 1: register one `SymbolNode` per unique `function_name` in the corpus.
+    ///
+    /// Why: every later pass keys on `by_symbol`, so symbols must exist before
+    /// any edges are drawn. Splitting this out keeps `build_from_chunks` flat.
+    /// What: inserts a node for each first-seen name; later duplicates only
+    /// update `chunk_to_symbol` (first-write-wins).
+    /// Test: covered by `test_build_simple_graph` and
+    /// `test_chunk_with_no_function_name_is_skipped`.
+    fn register_symbol_nodes(&mut self, chunks: &[ChunkTuple]) {
+        for (chunk_id, file, name, _calls, _inh, _ct) in chunks {
+            let Some(name) = name else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            // First-write-wins so chunk_to_symbol stays stable.
+            if self.by_symbol.contains_key(name) {
+                self.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
+                continue;
+            }
+            let idx = self.graph.add_node(SymbolNode {
+                symbol: name.clone(),
+                chunk_id: chunk_id.clone(),
+                file: file.clone(),
+            });
+            self.by_symbol.insert(name.clone(), idx);
+            self.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
+        }
+    }
+
+    /// Build a `simple_name → NodeIndex` map for fast qualified-callee resolution.
+    ///
+    /// Why: callers often write `bar()` even when only `Foo::bar` is defined;
+    /// looking up by trailing identifier avoids an O(N) per-edge scan.
+    /// What: for every symbol `A::B::name`, registers `name → idx` (first-write-wins).
+    /// Test: covered by `test_simple_callee_resolves_to_qualified_definition`.
+    fn build_suffix_lookup(&self) -> HashMap<String, NodeIndex> {
+        let mut by_suffix: HashMap<String, NodeIndex> = HashMap::new();
+        for (sym, &idx) in self.by_symbol.iter() {
             if let Some(suffix) = sym.rsplit("::").next() {
                 // First-write-wins to match the original semantics (the old
                 // `find` returned the first qualified hit).
-                by_suffix.entry(suffix).or_insert(idx);
+                by_suffix.entry(suffix.to_string()).or_insert(idx);
             }
         }
+        by_suffix
+    }
 
-        // Pass 2: add CallsFunction + Implements edges. For each call, also
-        // try the simple-name suffix of a qualified caller's symbol, so
-        // `Foo::bar` calling `baz` resolves even when only `baz` is in the
-        // index.
+    /// Pass 2: add `CallsFunction` and `Implements` edges for each chunk.
+    ///
+    /// Why: separates edge construction from node construction so each pass
+    /// reads top-to-bottom in `build_from_chunks`.
+    /// What: for each named chunk, draws one edge per resolvable callee and
+    /// one per resolvable parent type. Self-edges are filtered to prevent
+    /// recursive functions from polluting their own KG-expansion results.
+    /// Test: covered by `test_calls_function_edges_present_in_graph`,
+    /// `test_inherits_from_emits_implements_edges`, and
+    /// `test_self_call_does_not_create_self_loop`.
+    fn add_call_and_inherit_edges(
+        &mut self,
+        chunks: &[ChunkTuple],
+        by_suffix: &HashMap<String, NodeIndex>,
+    ) {
         for (_chunk_id, _file, name, calls, inherits_from, _ct) in chunks {
             let Some(name) = name else { continue };
-            let Some(&from) = g.by_symbol.get(name) else {
+            let Some(&from) = self.by_symbol.get(name) else {
                 continue;
             };
-            for callee in calls {
-                if let Some(to) = g.resolve_callee_fast(callee, &by_suffix) {
-                    if from != to {
-                        g.graph.add_edge(from, to, EdgeKind::CallsFunction);
-                    }
-                }
-            }
+            self.add_edges_for_targets(from, calls, by_suffix, EdgeKind::CallsFunction);
             // Issue #33: INHERITS / Implements edges from `inherits_from`.
-            for parent in inherits_from {
-                if let Some(to) = g.resolve_callee_fast(parent, &by_suffix) {
-                    if from != to {
-                        g.graph.add_edge(from, to, EdgeKind::Implements);
-                    }
+            self.add_edges_for_targets(from, inherits_from, by_suffix, EdgeKind::Implements);
+        }
+    }
+
+    /// Add one edge of `kind` from `from` to each resolvable target name.
+    ///
+    /// Why: the call-edge and inherit-edge loops were structurally identical;
+    /// extracting this helper removes a branch from
+    /// `add_call_and_inherit_edges` and concentrates the self-edge filter.
+    /// What: resolves each target through `resolve_callee_fast` and appends an
+    /// edge if it doesn't form a self-loop.
+    /// Test: indirectly covered by the same tests as
+    /// `add_call_and_inherit_edges`.
+    fn add_edges_for_targets(
+        &mut self,
+        from: NodeIndex,
+        targets: &[String],
+        by_suffix: &HashMap<String, NodeIndex>,
+        kind: EdgeKind,
+    ) {
+        for target in targets {
+            let Some(to) = self.resolve_callee_fast(target, by_suffix) else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            self.graph.add_edge(from, to, kind.clone());
+        }
+    }
+
+    /// Pass 3: emit `ModuleContains` edges from container chunks to siblings.
+    ///
+    /// Why: structural relationships (an `impl` block "contains" its methods)
+    /// drive intent-gated KG expansion for definition-style queries.
+    /// What: if any container chunk exists, group all symbols by file, then
+    /// for each container emit one edge per other symbol in the same file.
+    /// Test: covered by `test_module_contains_edges_from_container_chunks`.
+    fn add_module_contains_edges(&mut self, chunks: &[ChunkTuple]) {
+        if !Self::has_any_container(chunks) {
+            return;
+        }
+        let by_file = self.group_symbols_by_file(chunks);
+        for (_chunk_id, file, name, _calls, _inh, ct) in chunks {
+            if !Self::is_container(ct) {
+                continue;
+            }
+            let Some(name) = name else { continue };
+            let Some(&from) = self.by_symbol.get(name) else {
+                continue;
+            };
+            let Some(siblings) = by_file.get(file.as_str()) else {
+                continue;
+            };
+            for (sib_name, sib_idx) in siblings {
+                if *sib_idx == from || *sib_name == name.as_str() {
+                    continue;
+                }
+                self.graph.add_edge(from, *sib_idx, EdgeKind::ModuleContains);
+            }
+        }
+    }
+
+    /// Returns true if any chunk is a container (Impl/Class/Struct/Module) with a name.
+    ///
+    /// Why: pass 3 builds a `by_file` map that's expensive to materialize for
+    /// codebases without any container chunks (e.g. pure-function corpora).
+    /// What: short-circuits the first qualifying chunk.
+    /// Test: indirectly covered — when no container exists, pass 3 is a no-op
+    /// (see `test_build_simple_graph`).
+    fn has_any_container(chunks: &[ChunkTuple]) -> bool {
+        chunks.iter().any(|(_, _, name, _, _, ct)| {
+            name.is_some() && Self::is_container(ct)
+        })
+    }
+
+    /// Returns true if a chunk type owns sibling symbols (impl/class/struct/module).
+    ///
+    /// Why: the same `matches!` predicate appeared twice in pass 3; extracting
+    /// it removes a duplicated branching expression.
+    /// What: pattern-matches the four container variants.
+    /// Test: indirectly covered by
+    /// `test_module_contains_edges_from_container_chunks`.
+    fn is_container(ct: &ChunkType) -> bool {
+        matches!(
+            ct,
+            ChunkType::Impl | ChunkType::Class | ChunkType::Struct | ChunkType::Module
+        )
+    }
+
+    /// Group all defined symbols by their source file.
+    ///
+    /// Why: pass 3 needs O(1) "what else is in this file?" lookups; building
+    /// the map once is cheaper than re-scanning the corpus per container.
+    /// What: returns `file → [(symbol, NodeIndex)]` covering every chunk whose
+    /// `function_name` resolves to a registered node.
+    /// Test: indirectly covered by
+    /// `test_module_contains_edges_from_container_chunks` (cross-file leak check).
+    fn group_symbols_by_file<'a>(
+        &self,
+        chunks: &'a [ChunkTuple],
+    ) -> HashMap<&'a str, Vec<(&'a str, NodeIndex)>> {
+        let mut by_file: HashMap<&str, Vec<(&str, NodeIndex)>> = HashMap::new();
+        for (_chunk_id, file, name, _calls, _inh, _ct) in chunks {
+            if let Some(name) = name {
+                if let Some(&idx) = self.by_symbol.get(name) {
+                    by_file
+                        .entry(file.as_str())
+                        .or_default()
+                        .push((name.as_str(), idx));
                 }
             }
         }
-
-        // Pass 3: ModuleContains edges from container chunks (Impl / Class /
-        // Struct / Module) to other defining symbols in the same file.
-        // `by_file` is built lazily here so we only pay when there's at least
-        // one container in the corpus.
-        let has_container = chunks.iter().any(|(_, _, name, _, _, ct)| {
-            name.is_some()
-                && matches!(
-                    ct,
-                    ChunkType::Impl | ChunkType::Class | ChunkType::Struct | ChunkType::Module
-                )
-        });
-        if has_container {
-            // file → list of (symbol, NodeIndex) for everything defined there.
-            let mut by_file: HashMap<&str, Vec<(&str, NodeIndex)>> = HashMap::new();
-            for (_chunk_id, file, name, _calls, _inh, _ct) in chunks {
-                if let Some(name) = name {
-                    if let Some(&idx) = g.by_symbol.get(name) {
-                        by_file
-                            .entry(file.as_str())
-                            .or_default()
-                            .push((name.as_str(), idx));
-                    }
-                }
-            }
-            for (_chunk_id, file, name, _calls, _inh, ct) in chunks {
-                if !matches!(
-                    ct,
-                    ChunkType::Impl | ChunkType::Class | ChunkType::Struct | ChunkType::Module
-                ) {
-                    continue;
-                }
-                let Some(name) = name else { continue };
-                let Some(&from) = g.by_symbol.get(name) else {
-                    continue;
-                };
-                let Some(siblings) = by_file.get(file.as_str()) else {
-                    continue;
-                };
-                for (sib_name, sib_idx) in siblings {
-                    if *sib_idx == from || *sib_name == name.as_str() {
-                        continue;
-                    }
-                    g.graph.add_edge(from, *sib_idx, EdgeKind::ModuleContains);
-                }
-            }
-        }
-
-        g
+        by_file
     }
 
     /// O(1) callee lookup using a precomputed `simple_name → NodeIndex` map.
@@ -210,7 +304,7 @@ impl SymbolGraph {
     fn resolve_callee_fast(
         &self,
         callee: &str,
-        by_suffix: &HashMap<&str, NodeIndex>,
+        by_suffix: &HashMap<String, NodeIndex>,
     ) -> Option<NodeIndex> {
         if let Some(&idx) = self.by_symbol.get(callee) {
             return Some(idx);

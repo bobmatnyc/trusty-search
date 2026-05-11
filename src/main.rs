@@ -1696,11 +1696,17 @@ struct EmptyIndex {
 }
 
 /// Run the full doctor diagnostic suite and return (checks, empty_indexes).
+///
+/// Why: keeping this as a thin orchestrator over per-check helpers keeps each
+/// branch's cyclomatic complexity low and makes individual checks unit-testable.
+/// What: builds an HTTP client, then dispatches six independent checks in order
+/// (daemon, model cache, data dir, lock file, indexes, port).
+/// Test: `cargo run -- doctor` — all six headings appear, exit code 0 on a
+/// healthy install.
 async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
     let mut checks: Vec<CheckResult> = Vec::new();
     let mut empty_indexes: Vec<EmptyIndex> = Vec::new();
 
-    // ── 1. Daemon liveness ────────────────────────────────────────────────
     let port = read_daemon_port();
     let base = daemon_base_url();
     let client = match trusty_common::server::daemon_http_client() {
@@ -1713,9 +1719,29 @@ async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
         }
     };
 
-    let health_result = client.get(format!("{}/health", base)).send().await;
+    let (daemon_running, daemon_version) = probe_daemon_health(&client, &base).await;
+    checks.push(check_daemon_running(daemon_running, &base, &daemon_version));
 
-    let (daemon_running, daemon_version) = match health_result {
+    checks.push(check_model_cache());
+
+    let data_dir = doctor_data_dir();
+    checks.push(check_data_dir(&data_dir));
+    checks.push(check_lock_file(&data_dir, daemon_running));
+
+    check_indexes(&client, &base, daemon_running, &mut checks, &mut empty_indexes).await;
+
+    checks.push(check_port_reachable(port).await);
+
+    (checks, empty_indexes)
+}
+
+/// Why: separates the network probe from the result-formatting so the
+/// formatting check can be tested without async/HTTP.
+/// What: returns `(running, version)` by hitting `/health`.
+/// Test: with daemon running, returns `(true, "x.y.z")`; without, `(false, "")`.
+async fn probe_daemon_health(client: &reqwest::Client, base: &str) -> (bool, String) {
+    let health_result = client.get(format!("{}/health", base)).send().await;
+    match health_result {
         Ok(r) if r.status().is_success() => {
             let body: serde_json::Value = r.json().await.unwrap_or_else(|_| serde_json::json!({}));
             let ver = body
@@ -1726,233 +1752,308 @@ async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
             (true, ver)
         }
         _ => (false, String::new()),
-    };
-
-    if daemon_running {
-        checks.push(CheckResult::Ok(format!(
-            "Daemon running at {} (v{})",
-            base, daemon_version
-        )));
-    } else {
-        checks.push(CheckResult::Error(
-            "Daemon not running — run `trusty-search start`".to_string(),
-        ));
     }
+}
 
-    // ── 2. Model cache ────────────────────────────────────────────────────
+/// Why: pure formatting of the daemon liveness verdict.
+/// What: Ok with version string when running, Error otherwise.
+/// Test: pass `(true, "1.2")` — get Ok variant; `(false, "")` — get Error.
+fn check_daemon_running(running: bool, base: &str, version: &str) -> CheckResult {
+    if running {
+        CheckResult::Ok(format!("Daemon running at {} (v{})", base, version))
+    } else {
+        CheckResult::Error("Daemon not running — run `trusty-search start`".to_string())
+    }
+}
+
+/// Why: model-cache detection is independent of network state, so isolating
+/// it lets the doctor produce useful output even with the daemon down.
+/// What: inspects `~/Library/Caches/...` for the ONNX model subdir and
+/// returns Ok with size / Warn otherwise.
+/// Test: with model present, returns Ok and message contains "Model cache:";
+/// without, returns Warn.
+fn check_model_cache() -> CheckResult {
     let model_cache = fastembed_cache_dir();
     let model_name = "all-MiniLM-L6-v2";
     let model_subdir = model_cache.join("models--Qdrant--all-MiniLM-L6-v2-onnx");
     if model_subdir.exists() {
         let size = dir_size_bytes(&model_cache);
-        checks.push(CheckResult::Ok(format!(
+        CheckResult::Ok(format!(
             "Model cache: {} ({}, {})",
             model_cache.display(),
             fmt_bytes(size),
             model_name
-        )));
+        ))
     } else if model_cache.exists() {
-        checks.push(CheckResult::Warn(format!(
+        CheckResult::Warn(format!(
             "Model cache directory exists ({}) but {} not found — will download on first start",
             model_cache.display(),
             model_name
-        )));
+        ))
     } else {
-        checks.push(CheckResult::Warn(
+        CheckResult::Warn(
             "Model not cached — will download on first `trusty-search start`".to_string(),
-        ));
+        )
     }
+}
 
-    // ── 3. Data directory ─────────────────────────────────────────────────
-    let data_dir = dirs::data_local_dir()
+/// Why: data-dir path is used by multiple checks; centralizing the resolution
+/// keeps the path logic in one place.
+/// What: returns the per-user data dir (`~/Library/Application Support/...` on
+/// macOS, falling back to a placeholder string on platforms with no default).
+/// Test: on macOS/Linux, returns a path ending in `trusty-search`.
+fn doctor_data_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
         .map(|d| d.join("trusty-search"))
-        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/trusty-search"));
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/trusty-search"))
+}
 
-    if data_dir.exists() {
-        // Probe writability with a temp file.
-        let probe = data_dir.join(".write_probe");
-        let writable = std::fs::write(&probe, b"").is_ok();
-        let _ = std::fs::remove_file(&probe);
-        if writable {
-            checks.push(CheckResult::Ok(format!(
-                "Data directory: {} (writable)",
-                data_dir.display()
-            )));
-        } else {
-            checks.push(CheckResult::Error(format!(
-                "Data directory {} is not writable",
-                data_dir.display()
-            )));
-        }
-    } else {
-        checks.push(CheckResult::Warn(format!(
+/// Why: data-dir writability is required for daemon startup, so a dedicated
+/// check makes the failure mode visible at doctor time.
+/// What: probes existence + writability via a temp file; returns Ok/Error/Warn.
+/// Test: a writable temp dir yields Ok; a non-existent path yields Warn.
+fn check_data_dir(data_dir: &std::path::Path) -> CheckResult {
+    if !data_dir.exists() {
+        return CheckResult::Warn(format!(
             "Data directory {} does not exist (will be created on first start)",
             data_dir.display()
-        )));
+        ));
     }
+    let probe = data_dir.join(".write_probe");
+    let writable = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    if writable {
+        CheckResult::Ok(format!(
+            "Data directory: {} (writable)",
+            data_dir.display()
+        ))
+    } else {
+        CheckResult::Error(format!(
+            "Data directory {} is not writable",
+            data_dir.display()
+        ))
+    }
+}
 
-    // ── 4. Lock file ──────────────────────────────────────────────────────
+/// Why: stale lockfiles block daemon startup; surfacing them at doctor time
+/// (with PID liveness info) lets `--fix` clean them up automatically.
+/// What: reads `daemon.lock`, parses PID, checks if alive via `kill(pid, 0)`,
+/// and emits Ok/Warn accordingly. Cross-references `daemon_running` to flag
+/// suspicious "alive PID but /health fails" states.
+/// Test: an absent lockfile returns Ok ("no stale lock"); a lockfile with a
+/// dead PID returns Warn ("Stale lock file: ...").
+fn check_lock_file(data_dir: &std::path::Path, daemon_running: bool) -> CheckResult {
     let lock_path = data_dir.join("daemon.lock");
-    if lock_path.exists() {
-        // Read the PID stored in the lockfile and check if that process is alive.
-        let pid_opt = std::fs::read_to_string(&lock_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        match pid_opt {
-            Some(pid) => {
-                // POSIX: kill(pid, 0) — check existence without sending a signal.
-                let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-                if alive {
-                    if daemon_running {
-                        checks.push(CheckResult::Ok(format!(
-                            "Lock file: healthy (PID {} is running)",
-                            pid
-                        )));
-                    } else {
-                        checks.push(CheckResult::Warn(format!(
-                            "Lock file contains PID {} which is alive but /health failed",
-                            pid
-                        )));
-                    }
-                } else {
-                    checks.push(CheckResult::Warn(format!(
-                        "Stale lock file: PID {} is not running ({})",
-                        pid,
-                        lock_path.display()
-                    )));
-                }
-            }
-            None => {
-                checks.push(CheckResult::Warn(format!(
-                    "Lock file exists but contains no valid PID ({})",
-                    lock_path.display()
-                )));
-            }
-        }
-    } else {
-        checks.push(CheckResult::Ok("Lock file: healthy (no stale lock)".into()));
+    if !lock_path.exists() {
+        return CheckResult::Ok("Lock file: healthy (no stale lock)".into());
     }
-
-    // ── 5. Indexes ────────────────────────────────────────────────────────
+    let pid_opt = std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let Some(pid) = pid_opt else {
+        return CheckResult::Warn(format!(
+            "Lock file exists but contains no valid PID ({})",
+            lock_path.display()
+        ));
+    };
+    // POSIX: kill(pid, 0) — check existence without sending a signal.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    if !alive {
+        return CheckResult::Warn(format!(
+            "Stale lock file: PID {} is not running ({})",
+            pid,
+            lock_path.display()
+        ));
+    }
     if daemon_running {
-        let list = client.get(format!("{}/indexes", base)).send().await;
-        let list_body: serde_json::Value = match list {
-            Ok(r) if r.status().is_success() => {
-                r.json().await.unwrap_or_else(|_| serde_json::json!({}))
-            }
-            _ => serde_json::json!({"indexes": []}),
-        };
-        let empty_arr: Vec<serde_json::Value> = Vec::new();
-        let names: Vec<String> = list_body
-            .get("indexes")
-            .and_then(|v| v.as_array())
-            .unwrap_or(&empty_arr)
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect();
-
-        if names.is_empty() {
-            checks.push(CheckResult::Warn(
-                "No indexes registered — run `trusty-search index` to add a project".into(),
-            ));
-        } else {
-            // Fetch status for each index concurrently.
-            let mut joinset = tokio::task::JoinSet::new();
-            for name in &names {
-                let n = name.clone();
-                let url = format!("{}/indexes/{}/status", base, n);
-                let c = client.clone();
-                joinset.spawn(async move {
-                    let body: serde_json::Value = match c.get(&url).send().await {
-                        Ok(r) if r.status().is_success() => {
-                            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
-                        }
-                        _ => serde_json::json!({}),
-                    };
-                    (n, body)
-                });
-            }
-            let mut per_index: Vec<(String, serde_json::Value)> = Vec::new();
-            while let Some(j) = joinset.join_next().await {
-                if let Ok(pair) = j {
-                    per_index.push(pair);
-                }
-            }
-            per_index.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let zero_count = per_index
-                .iter()
-                .filter(|(_, b)| b.get("chunk_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0)
-                .count();
-
-            if zero_count == 0 {
-                checks.push(CheckResult::Ok(format!(
-                    "{} index{} registered, all have chunks",
-                    per_index.len(),
-                    if per_index.len() == 1 { "" } else { "es" }
-                )));
-            } else {
-                checks.push(CheckResult::Warn(format!(
-                    "{} index{} registered, {} {} no chunks yet:",
-                    per_index.len(),
-                    if per_index.len() == 1 { "" } else { "es" },
-                    zero_count,
-                    if zero_count == 1 { "has" } else { "have" }
-                )));
-            }
-
-            // Print per-index breakdown (indented).
-            for (name, body) in &per_index {
-                let chunks = body
-                    .get("chunk_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let root = body
-                    .get("root_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let chunks_fmt = format_with_commas(chunks);
-                if chunks == 0 {
-                    println!(
-                        "    {} {:<16} {:>12} chunks  {} — run `trusty-search index` to populate",
-                        "⚠".yellow(),
-                        name.bold(),
-                        chunks_fmt,
-                        root.dimmed()
-                    );
-                    empty_indexes.push(EmptyIndex {
-                        name: name.clone(),
-                        root_path: root,
-                    });
-                } else {
-                    println!(
-                        "    {} {:<16} {:>12} chunks  {}",
-                        "✓".green(),
-                        name.bold(),
-                        chunks_fmt,
-                        root.dimmed()
-                    );
-                }
-            }
-        }
+        CheckResult::Ok(format!("Lock file: healthy (PID {} is running)", pid))
     } else {
+        CheckResult::Warn(format!(
+            "Lock file contains PID {} which is alive but /health failed",
+            pid
+        ))
+    }
+}
+
+/// Why: index status involves a list call plus a fan-out of per-index status
+/// calls; isolating it makes the orchestrator readable and complies with the
+/// "no function over CC 20" budget.
+/// What: when the daemon is up, fetches `/indexes` then concurrently queries
+/// each `/indexes/:name/status`, prints a per-index breakdown line, pushes a
+/// summary CheckResult, and records empty indexes for `--fix` to repair.
+/// Test: with a daemon serving one populated index, pushes one Ok summary;
+/// with a daemon down, pushes one Warn ("Indexes: skipped …").
+async fn check_indexes(
+    client: &reqwest::Client,
+    base: &str,
+    daemon_running: bool,
+    checks: &mut Vec<CheckResult>,
+    empty_indexes: &mut Vec<EmptyIndex>,
+) {
+    if !daemon_running {
         checks.push(CheckResult::Warn(
             "Indexes: skipped (daemon not running)".into(),
         ));
+        return;
     }
 
-    // ── 6. Port reachability ──────────────────────────────────────────────
-    if port_reachable("127.0.0.1", port).await {
-        checks.push(CheckResult::Ok(format!("Port {} is reachable", port)));
+    let names = fetch_index_names(client, base).await;
+    if names.is_empty() {
+        checks.push(CheckResult::Warn(
+            "No indexes registered — run `trusty-search index` to add a project".into(),
+        ));
+        return;
+    }
+
+    let per_index = fetch_index_statuses(client, base, &names).await;
+    let zero_count = per_index
+        .iter()
+        .filter(|(_, b)| b.get("chunk_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0)
+        .count();
+    checks.push(summarize_indexes(per_index.len(), zero_count));
+    print_index_breakdown(&per_index, empty_indexes);
+}
+
+/// Why: parsing the `/indexes` listing is its own concern — failure to reach
+/// the daemon should silently degrade to an empty list (the index summary
+/// will then report "no indexes").
+/// What: GETs `/indexes` and extracts the `indexes: [..]` string array.
+/// Test: a 200 with `{"indexes": ["a", "b"]}` returns `["a", "b"]`; any error
+/// returns `[]`.
+async fn fetch_index_names(client: &reqwest::Client, base: &str) -> Vec<String> {
+    let list = client.get(format!("{}/indexes", base)).send().await;
+    let list_body: serde_json::Value = match list {
+        Ok(r) if r.status().is_success() => {
+            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+        }
+        _ => serde_json::json!({"indexes": []}),
+    };
+    let empty_arr: Vec<serde_json::Value> = Vec::new();
+    list_body
+        .get("indexes")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty_arr)
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+/// Why: fan-out of status calls keeps doctor responsive on installs with many
+/// indexes; doing this serially would multiply latency by N.
+/// What: concurrently fetches `/indexes/:name/status` for each name and
+/// returns the results sorted by name.
+/// Test: with three indexes registered, returns three entries sorted
+/// alphabetically.
+async fn fetch_index_statuses(
+    client: &reqwest::Client,
+    base: &str,
+    names: &[String],
+) -> Vec<(String, serde_json::Value)> {
+    let mut joinset = tokio::task::JoinSet::new();
+    for name in names {
+        let n = name.clone();
+        let url = format!("{}/indexes/{}/status", base, n);
+        let c = client.clone();
+        joinset.spawn(async move {
+            let body: serde_json::Value = match c.get(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+                }
+                _ => serde_json::json!({}),
+            };
+            (n, body)
+        });
+    }
+    let mut per_index: Vec<(String, serde_json::Value)> = Vec::new();
+    while let Some(j) = joinset.join_next().await {
+        if let Ok(pair) = j {
+            per_index.push(pair);
+        }
+    }
+    per_index.sort_by(|a, b| a.0.cmp(&b.0));
+    per_index
+}
+
+/// Why: the summary line wording depends on multiple count-derived plurals;
+/// isolating the string-building keeps the orchestrator clean.
+/// What: returns Ok when all indexes have chunks, Warn when at least one is
+/// empty (with the count formatted).
+/// Test: `(2, 0)` → Ok "2 indexes registered, all have chunks"; `(2, 1)` →
+/// Warn "2 indexes registered, 1 has no chunks yet:".
+fn summarize_indexes(total: usize, zero_count: usize) -> CheckResult {
+    if zero_count == 0 {
+        CheckResult::Ok(format!(
+            "{} index{} registered, all have chunks",
+            total,
+            if total == 1 { "" } else { "es" }
+        ))
     } else {
-        checks.push(CheckResult::Error(format!(
-            "Port {} is not reachable",
-            port
-        )));
+        CheckResult::Warn(format!(
+            "{} index{} registered, {} {} no chunks yet:",
+            total,
+            if total == 1 { "" } else { "es" },
+            zero_count,
+            if zero_count == 1 { "has" } else { "have" }
+        ))
     }
+}
 
-    (checks, empty_indexes)
+/// Why: printing per-index detail is a side-effect distinct from the
+/// CheckResult summary; separating it keeps the summary function pure.
+/// What: prints one indented line per index (with chunk count and root path),
+/// and records empty indexes in `empty_indexes` so `--fix` can repair them.
+/// Test: with one populated and one empty index, two lines print and one
+/// `EmptyIndex` is pushed.
+fn print_index_breakdown(
+    per_index: &[(String, serde_json::Value)],
+    empty_indexes: &mut Vec<EmptyIndex>,
+) {
+    for (name, body) in per_index {
+        let chunks = body
+            .get("chunk_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let root = body
+            .get("root_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let chunks_fmt = format_with_commas(chunks);
+        if chunks == 0 {
+            println!(
+                "    {} {:<16} {:>12} chunks  {} — run `trusty-search index` to populate",
+                "⚠".yellow(),
+                name.bold(),
+                chunks_fmt,
+                root.dimmed()
+            );
+            empty_indexes.push(EmptyIndex {
+                name: name.clone(),
+                root_path: root,
+            });
+        } else {
+            println!(
+                "    {} {:<16} {:>12} chunks  {}",
+                "✓".green(),
+                name.bold(),
+                chunks_fmt,
+                root.dimmed()
+            );
+        }
+    }
+}
+
+/// Why: TCP-reachability probe is independent of HTTP and from the rest of
+/// the doctor logic; lifting it keeps the orchestrator's control flow flat.
+/// What: returns Ok when 127.0.0.1:port accepts a connection, Error otherwise.
+/// Test: with daemon listening on the read port, returns Ok; with daemon
+/// stopped, returns Error.
+async fn check_port_reachable(port: u16) -> CheckResult {
+    if port_reachable("127.0.0.1", port).await {
+        CheckResult::Ok(format!("Port {} is reachable", port))
+    } else {
+        CheckResult::Error(format!("Port {} is not reachable", port))
+    }
 }
 
 /// Remove a stale lock file and report the outcome.
