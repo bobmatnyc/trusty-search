@@ -17,9 +17,8 @@ use walkdir::WalkDir;
 /// fall back to the unknown-language sliding-window chunker since their
 /// tree-sitter grammars aren't compiled in.
 pub const SOURCE_EXTS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c", "cpp",
-    "h", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "scala", "groovy", "gradle",
-    "sh", "yaml", "yml", "toml", "json", "md",
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c", "cpp", "h", "hpp", "cs",
+    "rb", "php", "swift", "kt", "kts", "scala", "groovy", "gradle", "sh", "md",
 ];
 
 /// Directory names to skip when walking. Matched on basename only.
@@ -69,13 +68,9 @@ pub const SKIP_DIRS: &[&str] = &[
 /// File extensions that are always binary or non-parseable. These are skipped
 /// before the file is opened, so the walker never reads their bytes.
 const BINARY_EXTS: &[&str] = &[
-    "wasm", "so", "dylib", "dll", "exe",
-    "pdf", "png", "jpg", "jpeg", "gif", "ico", "webp",
-    "zip", "tar", "gz", "bz2", "xz", "7z", "rar",
-    "ttf", "otf", "woff", "woff2",
-    "mp3", "mp4", "mov", "avi", "mkv",
-    "db", "sqlite", "lock",
-    "pyc", "class", "o", "a",
+    "wasm", "so", "dylib", "dll", "exe", "pdf", "png", "jpg", "jpeg", "gif", "ico", "webp", "zip",
+    "tar", "gz", "bz2", "xz", "7z", "rar", "ttf", "otf", "woff", "woff2", "mp3", "mp4", "mov",
+    "avi", "mkv", "db", "sqlite", "lock", "pyc", "class", "o", "a",
 ];
 
 /// Files larger than this are silently skipped. 1 MiB is generous for a source
@@ -133,10 +128,7 @@ pub fn should_skip_path(path: &Path) -> bool {
     // Only applied to JS and CSS since other extensions (e.g. .ts) are never
     // emitted as hashed bundles by bundlers.
     if ext == "js" || ext == "css" {
-        if let Some(stem) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             if is_hashed_bundle_stem(stem) {
                 return true;
             }
@@ -176,9 +168,7 @@ pub fn should_skip_content(path: &Path, content: &str) -> bool {
         return false;
     }
 
-    content
-        .lines()
-        .any(|l| l.len() > MAX_LINE_LEN_FOR_MINIFIED)
+    content.lines().any(|l| l.len() > MAX_LINE_LEN_FOR_MINIFIED)
 }
 
 /// Helper: return `true` when `stem` ends with `-<8+ alnum chars>`, which is
@@ -251,7 +241,10 @@ pub fn walk_source_files(root: &Path) -> WalkResult {
         files.push(path.to_path_buf());
     }
 
-    WalkResult { files, skipped_dirs }
+    WalkResult {
+        files,
+        skipped_dirs,
+    }
 }
 
 #[cfg(test)]
@@ -340,7 +333,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         fs::create_dir_all(root.join("node_modules/lodash")).unwrap();
-        fs::write(root.join("node_modules/lodash/index.js"), "module.exports={}").unwrap();
+        fs::write(
+            root.join("node_modules/lodash/index.js"),
+            "module.exports={}",
+        )
+        .unwrap();
         fs::write(root.join("real.js"), "export const x = 1;").unwrap();
 
         let result = walk_source_files(root);
@@ -349,7 +346,10 @@ mod tests {
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect();
-        assert!(!names.contains(&"index.js".to_string()), "node_modules must be excluded");
+        assert!(
+            !names.contains(&"index.js".to_string()),
+            "node_modules must be excluded"
+        );
         assert!(names.contains(&"real.js".to_string()));
     }
 
@@ -404,10 +404,7 @@ mod tests {
     #[test]
     fn test_skip_content_multiline_js_not_skipped() {
         // 5+ lines, even if one line is long.
-        let content = format!(
-            "line1\nline2\nline3\nline4\nline5\n{}\n",
-            "x".repeat(600)
-        );
+        let content = format!("line1\nline2\nline3\nline4\nline5\n{}\n", "x".repeat(600));
         assert!(!should_skip_content(Path::new("ok.js"), &content));
     }
 }

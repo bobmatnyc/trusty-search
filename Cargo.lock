@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-search"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "anyhow",
  "axum",
@@ -4347,6 +4347,7 @@ dependencies = [
  "fs4",
  "futures",
  "include_dir",
+ "libc",
  "notify",
  "notify-debouncer-mini",
  "reqwest",

@@ -32,9 +32,9 @@ use crate::server::{build_router, SearchAppState};
 use fs4::FileExt;
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -97,11 +97,12 @@ async fn bind_with_auto_port(
     start_port: u16,
     max_attempts: u16,
 ) -> Result<TcpListener, DaemonError> {
-    let addr: SocketAddr = format!("127.0.0.1:{start_port}")
-        .parse()
-        .map_err(|e: std::net::AddrParseError| {
-            DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        })?;
+    let addr: SocketAddr =
+        format!("127.0.0.1:{start_port}")
+            .parse()
+            .map_err(|e: std::net::AddrParseError| {
+                DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+            })?;
     trusty_common::bind_with_auto_port(addr, max_attempts)
         .await
         .map_err(|e| {
@@ -140,8 +141,53 @@ pub fn is_already_running() -> Option<PathBuf> {
     }
 }
 
+/// Read the PID stored in the lockfile (if any). Returns `None` on parse failure.
+///
+/// Why: the lockfile records the daemon PID so callers can detect stale
+/// lockfiles left over from SIGKILL'd or crashed daemons (where the OS may
+/// not have released the advisory lock cleanly, or the file persisted with
+/// a dead PID written inside).
+fn read_lockfile_pid(lock_path: &Path) -> Option<u32> {
+    let mut s = String::new();
+    File::open(lock_path).ok()?.read_to_string(&mut s).ok()?;
+    s.trim().parse::<u32>().ok()
+}
+
+/// Check whether a process with the given PID is currently alive.
+///
+/// Why: a stale lockfile (from a SIGKILL'd or crashed daemon) records a PID
+/// that no longer exists. Treat such lockfiles as removable so the next
+/// daemon can start on the preferred port instead of bumping.
+///
+/// What: on Unix, `kill(pid, 0)` returns 0 if the process exists, ESRCH if
+/// not, EPERM if it exists but is owned by another user (still alive). On
+/// non-Unix targets we conservatively assume the PID is alive.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: `kill` is async-signal-safe and signal 0 performs no action,
+    // only error checking. We accept i32 narrowing — PIDs always fit on
+    // platforms we support.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // errno == EPERM means the process exists but we cannot signal it.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Acquire an exclusive advisory lock on the daemon lockfile. The returned
 /// `File` must outlive the daemon — drop releases the lock.
+///
+/// Why stale-lock handling: when a daemon is SIGKILL'd mid-run, the file
+/// may persist with the dead PID recorded inside. On some platforms or
+/// filesystems the advisory lock can also outlive the process. Before
+/// reporting `AlreadyRunning`, we check whether the PID stored in the file
+/// is still alive — if not, we remove the stale file and retry once.
 fn acquire_lock(lock_path: &PathBuf) -> Result<File, DaemonError> {
     let file = OpenOptions::new()
         .create(true)
@@ -149,10 +195,34 @@ fn acquire_lock(lock_path: &PathBuf) -> Result<File, DaemonError> {
         .write(true)
         .truncate(false)
         .open(lock_path)?;
-    if file.try_lock_exclusive().is_err() {
-        return Err(DaemonError::AlreadyRunning(lock_path.clone()));
+    if file.try_lock_exclusive().is_ok() {
+        return Ok(file);
     }
-    Ok(file)
+
+    // Lock is held — but is it stale? Inspect the PID written by the previous
+    // daemon. If the recorded PID is dead, treat the lockfile as abandoned
+    // and recreate it.
+    if let Some(prev_pid) = read_lockfile_pid(lock_path) {
+        if !pid_alive(prev_pid) {
+            tracing::warn!(
+                "stale lockfile at {} (pid {prev_pid} is dead) — removing and retrying",
+                lock_path.display()
+            );
+            drop(file);
+            let _ = std::fs::remove_file(lock_path);
+            let retry = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(lock_path)?;
+            if retry.try_lock_exclusive().is_ok() {
+                return Ok(retry);
+            }
+        }
+    }
+
+    Err(DaemonError::AlreadyRunning(lock_path.clone()))
 }
 
 /// Future that resolves on SIGTERM or SIGINT.

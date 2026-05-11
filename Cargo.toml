@@ -29,6 +29,7 @@ indicatif = "0.17"
 dotenvy = "0.15"
 include_dir = "0.7"
 open = "5"
+libc = "0.2"
 trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
 trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
 trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.0" }
@@ -44,7 +45,7 @@ trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
 
 [package]
 name = "trusty-search"
-version = "0.1.54"
+version = "0.1.55"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
