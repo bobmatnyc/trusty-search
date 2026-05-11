@@ -693,3 +693,42 @@ async fn reindex_stream_handler(
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Why: `/health` is consumed by external probes (open-mpm,
+    /// `ensure_daemon_running`) — the contract `{ status, version, indexes,
+    /// uptime_secs }` must remain stable.
+    /// What: Builds an AppState with N registered indexes and asserts the
+    /// HealthResponse JSON shape and counts.
+    /// Test: covers issue #34's acceptance (indexes counter + uptime_secs).
+    #[tokio::test]
+    async fn health_handler_reports_indexes_and_uptime() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        use trusty_search_core::{
+            indexer::CodeIndexer,
+            registry::{IndexHandle, IndexId, IndexRegistry},
+        };
+
+        let registry = IndexRegistry::new();
+        let id = IndexId::new("health-test");
+        registry.register(IndexHandle {
+            id: id.clone(),
+            indexer: Arc::new(RwLock::new(CodeIndexer::new(
+                "health-test",
+                "/tmp/health-test",
+            ))),
+            root_path: "/tmp/health-test".into(),
+        });
+        let state = Arc::new(SearchAppState::new(registry, None));
+        let Json(resp) = health_handler(State(state)).await;
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(resp.indexes, 1);
+        // uptime_secs is u64 — always >= 0 by type; just exercise the path.
+        let _ = resp.uptime_secs;
+    }
+}
