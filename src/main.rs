@@ -1728,7 +1728,14 @@ async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
     checks.push(check_data_dir(&data_dir));
     checks.push(check_lock_file(&data_dir, daemon_running));
 
-    check_indexes(&client, &base, daemon_running, &mut checks, &mut empty_indexes).await;
+    check_indexes(
+        &client,
+        &base,
+        daemon_running,
+        &mut checks,
+        &mut empty_indexes,
+    )
+    .await;
 
     checks.push(check_port_reachable(port).await);
 
@@ -1823,10 +1830,7 @@ fn check_data_dir(data_dir: &std::path::Path) -> CheckResult {
     let writable = std::fs::write(&probe, b"").is_ok();
     let _ = std::fs::remove_file(&probe);
     if writable {
-        CheckResult::Ok(format!(
-            "Data directory: {} (writable)",
-            data_dir.display()
-        ))
+        CheckResult::Ok(format!("Data directory: {} (writable)", data_dir.display()))
     } else {
         CheckResult::Error(format!(
             "Data directory {} is not writable",

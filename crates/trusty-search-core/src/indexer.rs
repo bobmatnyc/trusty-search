@@ -747,10 +747,7 @@ impl CodeIndexer {
     /// where `None` means "no embedder wired (BM25-only mode)". Fails
     /// fast if `embed_batch` returns a wrong-sized result.
     /// Test: covered indirectly by `test_index_files_batch_*`.
-    async fn embed_chunks_in_batches(
-        &self,
-        chunks: &[RawChunk],
-    ) -> Result<Vec<Option<Vec<f32>>>> {
+    async fn embed_chunks_in_batches(&self, chunks: &[RawChunk]) -> Result<Vec<Option<Vec<f32>>>> {
         let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
         let (Some(embedder), Some(_store)) = (&self.embedder, &self.store) else {
             return Ok(embeddings);
@@ -832,7 +829,9 @@ impl CodeIndexer {
         chunks: &[RawChunk],
         embeddings: &[Option<Vec<f32>>],
     ) -> Result<()> {
-        let Some(store) = &self.store else { return Ok(()) };
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
         let items: Vec<(String, Vec<f32>)> = chunks
             .iter()
             .zip(embeddings.iter())
@@ -1325,8 +1324,11 @@ impl CodeIndexer {
                 tracing::trace!("fused id {id} not in corpus — likely race; skipping");
                 continue;
             };
-            let match_reason =
-                compute_match_reason(in_hnsw.contains(&id), in_bm25.contains(&id), kg_ids.contains(&id));
+            let match_reason = compute_match_reason(
+                in_hnsw.contains(&id),
+                in_bm25.contains(&id),
+                kg_ids.contains(&id),
+            );
             let snippet = if query.compact {
                 Some(build_compact_snippet(&raw.content))
             } else {
@@ -1894,7 +1896,10 @@ mod tests {
         let (total_all, all) = idx.enumerate_chunks(0, 100).await;
         assert_eq!(total_all, 4);
         let ids: Vec<_> = all.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, vec!["a.rs:1:5", "a.rs:30:40", "b.rs:1:5", "b.rs:10:20"]);
+        assert_eq!(
+            ids,
+            vec!["a.rs:1:5", "a.rs:30:40", "b.rs:1:5", "b.rs:10:20"]
+        );
 
         // Page 1 (offset=0, limit=2) + Page 2 (offset=2, limit=2) cover all.
         let (total_p1, page1) = idx.enumerate_chunks(0, 2).await;

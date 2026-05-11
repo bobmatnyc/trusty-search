@@ -982,7 +982,9 @@ namespace MyApp {
             .filter(|c| c.chunk_type == ChunkType::Class)
             .collect();
         assert!(
-            classes.iter().any(|c| c.function_name.as_deref() == Some("Foo")),
+            classes
+                .iter()
+                .any(|c| c.function_name.as_deref() == Some("Foo")),
             "expected class Foo, got {chunks:#?}"
         );
         let traits: Vec<&RawChunk> = chunks
@@ -990,7 +992,9 @@ namespace MyApp {
             .filter(|c| c.chunk_type == ChunkType::Trait)
             .collect();
         assert!(
-            traits.iter().any(|c| c.function_name.as_deref() == Some("IThing")),
+            traits
+                .iter()
+                .any(|c| c.function_name.as_deref() == Some("IThing")),
             "expected interface IThing as Trait"
         );
         let bar = chunks
@@ -998,8 +1002,16 @@ namespace MyApp {
             .find(|c| c.function_name.as_deref() == Some("Bar"))
             .expect("Bar method chunk");
         assert_eq!(bar.chunk_type, ChunkType::Method);
-        assert!(bar.calls.contains(&"Baz".to_string()), "calls={:?}", bar.calls);
-        assert!(bar.calls.contains(&"Qux".to_string()), "calls={:?}", bar.calls);
+        assert!(
+            bar.calls.contains(&"Baz".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
+        assert!(
+            bar.calls.contains(&"Qux".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
     }
 
     #[test]
@@ -1018,8 +1030,10 @@ object Singleton {
 "#;
         let (chunks, _) = chunk_ast("a.kt", src);
         assert!(
-            chunks.iter().any(|c| c.function_name.as_deref() == Some("Foo")
-                && c.chunk_type == ChunkType::Class),
+            chunks
+                .iter()
+                .any(|c| c.function_name.as_deref() == Some("Foo")
+                    && c.chunk_type == ChunkType::Class),
             "expected class Foo, got {chunks:#?}"
         );
         let bar = chunks
@@ -1027,8 +1041,16 @@ object Singleton {
             .find(|c| c.function_name.as_deref() == Some("bar"))
             .expect("bar method chunk");
         assert_eq!(bar.chunk_type, ChunkType::Method);
-        assert!(bar.calls.contains(&"baz".to_string()), "calls={:?}", bar.calls);
-        assert!(bar.calls.contains(&"qux".to_string()), "calls={:?}", bar.calls);
+        assert!(
+            bar.calls.contains(&"baz".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
+        assert!(
+            bar.calls.contains(&"qux".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
     }
 
     #[test]
@@ -1046,14 +1068,18 @@ extension Foo { func ext() {} }
         let (chunks, _) = chunk_ast("a.swift", src);
         // class Foo
         assert!(
-            chunks.iter().any(|c| c.function_name.as_deref() == Some("Foo")
-                && c.chunk_type == ChunkType::Class),
+            chunks
+                .iter()
+                .any(|c| c.function_name.as_deref() == Some("Foo")
+                    && c.chunk_type == ChunkType::Class),
             "expected class Foo, got {chunks:#?}"
         );
         // struct S
         assert!(
-            chunks.iter().any(|c| c.function_name.as_deref() == Some("S")
-                && c.chunk_type == ChunkType::Struct),
+            chunks
+                .iter()
+                .any(|c| c.function_name.as_deref() == Some("S")
+                    && c.chunk_type == ChunkType::Struct),
             "expected struct S"
         );
         // enum E
@@ -1064,15 +1090,17 @@ extension Foo { func ext() {} }
         );
         // protocol P → Trait
         assert!(
-            chunks.iter().any(|c| c.function_name.as_deref() == Some("P")
-                && c.chunk_type == ChunkType::Trait),
+            chunks.iter().any(
+                |c| c.function_name.as_deref() == Some("P") && c.chunk_type == ChunkType::Trait
+            ),
             "expected protocol P as Trait"
         );
         // extension Foo → Module
         assert!(
             chunks
                 .iter()
-                .any(|c| c.chunk_type == ChunkType::Module && c.function_name.as_deref() == Some("Foo")),
+                .any(|c| c.chunk_type == ChunkType::Module
+                    && c.function_name.as_deref() == Some("Foo")),
             "expected extension Foo as Module"
         );
         // method calls
@@ -1080,8 +1108,16 @@ extension Foo { func ext() {} }
             .iter()
             .find(|c| c.function_name.as_deref() == Some("bar"))
             .expect("bar method chunk");
-        assert!(bar.calls.contains(&"baz".to_string()), "calls={:?}", bar.calls);
-        assert!(bar.calls.contains(&"qux".to_string()), "calls={:?}", bar.calls);
+        assert!(
+            bar.calls.contains(&"baz".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
+        assert!(
+            bar.calls.contains(&"qux".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
     }
 
     #[test]

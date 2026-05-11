@@ -26,8 +26,7 @@ async fn resolve_target_id(
     let resp = client.get(format!("{}/indexes", base)).send().await;
     match resp {
         Ok(r) if r.status().is_success() => {
-            let body: serde_json::Value =
-                r.json().await.unwrap_or_else(|_| serde_json::json!({}));
+            let body: serde_json::Value = r.json().await.unwrap_or_else(|_| serde_json::json!({}));
             let empty: Vec<serde_json::Value> = Vec::new();
             let names: Vec<String> = body
                 .get("indexes")
@@ -133,6 +132,7 @@ pub async fn handle_query(
     full: bool,
 ) -> Result<()> {
     let base = daemon_base_url();
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
     let client = trusty_common::server::daemon_http_client()?;
 
     let target_id = resolve_target_id(explicit_index, &indexes, &client, &base).await;
@@ -141,7 +141,9 @@ pub async fn handle_query(
     let body = serde_json::json!({"text": query, "top_k": top_k});
     let resp = client.post(&url).json(&body).send().await;
     let body_json: serde_json::Value = match resp {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+        Ok(r) if r.status().is_success() => {
+            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+        }
         Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
             eprintln!("{} index '{}' not found on daemon", "✗".red(), target_id);
             std::process::exit(1);

@@ -15,6 +15,7 @@
 
 pub mod add;
 pub mod convert;
+pub mod daemon_guard;
 pub mod dashboard;
 pub mod doctor;
 pub mod index;

@@ -34,9 +34,7 @@ async fn build_embedder() -> Option<std::sync::Arc<dyn trusty_search_core::Embed
     match trusty_search_core::FastEmbedder::new().await {
         Ok(e) => Some(std::sync::Arc::new(e)),
         Err(e) => {
-            tracing::warn!(
-                "FastEmbedder init failed ({e}); daemon falling back to BM25-only mode"
-            );
+            tracing::warn!("FastEmbedder init failed ({e}); daemon falling back to BM25-only mode");
             None
         }
     }

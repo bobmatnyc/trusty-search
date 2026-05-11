@@ -237,7 +237,8 @@ impl SymbolGraph {
                 if *sib_idx == from || *sib_name == name.as_str() {
                     continue;
                 }
-                self.graph.add_edge(from, *sib_idx, EdgeKind::ModuleContains);
+                self.graph
+                    .add_edge(from, *sib_idx, EdgeKind::ModuleContains);
             }
         }
     }
@@ -250,9 +251,9 @@ impl SymbolGraph {
     /// Test: indirectly covered — when no container exists, pass 3 is a no-op
     /// (see `test_build_simple_graph`).
     fn has_any_container(chunks: &[ChunkTuple]) -> bool {
-        chunks.iter().any(|(_, _, name, _, _, ct)| {
-            name.is_some() && Self::is_container(ct)
-        })
+        chunks
+            .iter()
+            .any(|(_, _, name, _, _, ct)| name.is_some() && Self::is_container(ct))
     }
 
     /// Returns true if a chunk type owns sibling symbols (impl/class/struct/module).
