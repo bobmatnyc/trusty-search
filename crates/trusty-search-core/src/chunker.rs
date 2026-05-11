@@ -101,7 +101,13 @@ pub struct RawChunk {
 
 impl RawChunk {
     /// Build a generic `Code` chunk — used by `chunk_text` and the unknown-extension fallback.
-    fn generic(id: String, file: String, start_line: usize, end_line: usize, content: String) -> Self {
+    fn generic(
+        id: String,
+        file: String,
+        start_line: usize,
+        end_line: usize,
+        content: String,
+    ) -> Self {
         Self {
             id,
             file,
@@ -174,6 +180,7 @@ fn language_for(file: &str) -> Option<(&'static str, Language)> {
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => ("cpp", tree_sitter_cpp::LANGUAGE),
         "rb" => ("ruby", tree_sitter_ruby::LANGUAGE),
         "php" => ("php", tree_sitter_php::LANGUAGE_PHP),
+        "scala" => ("scala", tree_sitter_scala::LANGUAGE),
         _ => return None,
     };
     Some((tag, lang_fn.into()))
@@ -199,7 +206,13 @@ fn build_line_offsets(src: &[u8]) -> Vec<usize> {
 }
 
 /// Stable, content-aware chunk ID. Falls back to position when no name is available.
-fn make_chunk_id(file: &str, chunk_type: &ChunkType, name: &str, start_line: usize, end_line: usize) -> String {
+fn make_chunk_id(
+    file: &str,
+    chunk_type: &ChunkType,
+    name: &str,
+    start_line: usize,
+    end_line: usize,
+) -> String {
     if name.is_empty() {
         format!("{file}:{start_line}:{end_line}")
     } else {
@@ -239,6 +252,7 @@ fn collect_calls(node: Node<'_>, src: &[u8], lang: &str) -> Vec<String> {
                 | ("ruby", "singleton_method")
                 | ("php", "function_definition")
                 | ("php", "method_declaration")
+                | ("scala", "function_definition")
         );
 
         // Don't descend into nested function bodies (we treat them as their own chunks).
@@ -260,6 +274,7 @@ fn collect_calls(node: Node<'_>, src: &[u8], lang: &str) -> Vec<String> {
                 | ("php", "member_call_expression")
                 | ("php", "scoped_call_expression")
                 | ("php", "nullsafe_member_call_expression")
+                | ("scala", "call_expression")
         );
 
         if is_call {
@@ -375,8 +390,11 @@ fn nlp_from_doc(doc: &str) -> (Vec<String>, Vec<String>) {
             continue;
         }
         let first = word.chars().next().unwrap();
-        let all_upper = word.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
-        let title = first.is_ascii_uppercase() && word.chars().skip(1).any(|c| c.is_ascii_lowercase());
+        let all_upper = word
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        let title =
+            first.is_ascii_uppercase() && word.chars().skip(1).any(|c| c.is_ascii_lowercase());
         if all_upper || title {
             keywords.push(word.to_string());
         }
@@ -448,6 +466,11 @@ fn classify_node(lang: &str, node: Node<'_>) -> Option<ChunkType> {
         ("php", "trait_declaration") => ChunkType::Trait,
         ("php", "namespace_definition") => ChunkType::Module,
 
+        ("scala", "function_definition") => ChunkType::Function,
+        ("scala", "class_definition") => ChunkType::Class,
+        ("scala", "object_definition") => ChunkType::Class,
+        ("scala", "trait_definition") => ChunkType::Trait,
+
         _ => return None,
     })
 }
@@ -483,7 +506,9 @@ pub fn chunk_ast(file: &str, content: &str) -> (Vec<RawChunk>, Vec<RawEntity>) {
 
     let mut parser = Parser::new();
     if parser.set_language(&language).is_err() {
-        tracing::warn!("failed to set tree-sitter language for {file}; falling back to sliding-window");
+        tracing::warn!(
+            "failed to set tree-sitter language for {file}; falling back to sliding-window"
+        );
         return (chunk_text(file, content, 150, 50), Vec::new());
     }
 
@@ -494,7 +519,15 @@ pub fn chunk_ast(file: &str, content: &str) -> (Vec<RawChunk>, Vec<RawEntity>) {
 
     let line_offsets = build_line_offsets(src);
     let mut chunks: Vec<RawChunk> = Vec::new();
-    walk_for_chunks(tree.root_node(), src, file, lang, &line_offsets, 0, &mut chunks);
+    walk_for_chunks(
+        tree.root_node(),
+        src,
+        file,
+        lang,
+        &line_offsets,
+        0,
+        &mut chunks,
+    );
 
     if chunks.is_empty() {
         // Source had no recognisable declarations: fall back to a single Code chunk.
@@ -661,7 +694,10 @@ mod tests {
 
     #[test]
     fn test_overlapping_chunks() {
-        let content = (1..=200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let chunks = chunk_text("test.txt", &content, 150, 50);
         assert!(chunks.len() >= 2);
         assert_eq!(chunks[0].start_line, 1);
@@ -729,8 +765,16 @@ fn bar(_a: i32, _b: i32) {}
             .iter()
             .find(|c| c.function_name.as_deref() == Some("main"))
             .expect("main chunk");
-        assert!(main_chunk.calls.contains(&"foo".to_string()), "calls={:?}", main_chunk.calls);
-        assert!(main_chunk.calls.contains(&"bar".to_string()), "calls={:?}", main_chunk.calls);
+        assert!(
+            main_chunk.calls.contains(&"foo".to_string()),
+            "calls={:?}",
+            main_chunk.calls
+        );
+        assert!(
+            main_chunk.calls.contains(&"bar".to_string()),
+            "calls={:?}",
+            main_chunk.calls
+        );
     }
 
     #[test]
@@ -765,9 +809,15 @@ fn f() {
             .iter()
             .filter(|c| c.parent_chunk_id.is_some())
             .collect();
-        assert!(!subs.is_empty(), "expected sub-chunks for 250-line fn, got {chunks:#?}");
+        assert!(
+            !subs.is_empty(),
+            "expected sub-chunks for 250-line fn, got {chunks:#?}"
+        );
         let parent_id = subs[0].parent_chunk_id.clone().unwrap();
-        let parent = chunks.iter().find(|c| c.id == parent_id).expect("parent retained");
+        let parent = chunks
+            .iter()
+            .find(|c| c.id == parent_id)
+            .expect("parent retained");
         assert!(!parent.child_chunk_ids.is_empty());
     }
 
@@ -787,7 +837,10 @@ fn f() {
 fn make() {}
 "#;
         let (chunks, _) = chunk_ast("d.rs", src);
-        let f = chunks.iter().find(|c| c.function_name.as_deref() == Some("make")).unwrap();
+        let f = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("make"))
+            .unwrap();
         assert!(
             f.nlp_code_refs.iter().any(|k| k == "CodeIndexer"),
             "code_refs={:?}",
@@ -821,7 +874,10 @@ fn f() -> Result<(), anyhow::Error> {
         let any_err = ents
             .iter()
             .any(|e| e.entity_type == crate::entity::EntityType::ErrorVariant);
-        assert!(any_err, "expected at least one ErrorVariant entity, got {ents:#?}");
+        assert!(
+            any_err,
+            "expected at least one ErrorVariant entity, got {ents:#?}"
+        );
     }
 
     #[test]
@@ -831,8 +887,15 @@ fn f() -> Result<(), anyhow::Error> {
 fn fuse() {}
 "#;
         let (chunks, _) = chunk_ast("d.rs", src);
-        let f = chunks.iter().find(|c| c.function_name.as_deref() == Some("fuse")).unwrap();
-        assert!(f.nlp_keywords.iter().any(|k| k == "RRF"), "keywords={:?}", f.nlp_keywords);
+        let f = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("fuse"))
+            .unwrap();
+        assert!(
+            f.nlp_keywords.iter().any(|k| k == "RRF"),
+            "keywords={:?}",
+            f.nlp_keywords
+        );
         assert!(
             f.nlp_keywords.iter().any(|k| k == "Implements"),
             "keywords={:?}",
