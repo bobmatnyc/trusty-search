@@ -395,6 +395,63 @@ impl CodeIndexer {
             .collect()
     }
 
+    /// Paginated snapshot of chunks in a stable order (file path, then
+    /// `start_line`). Used by `GET /indexes/:id/chunks?offset=&limit=` and the
+    /// `list_chunks` MCP tool for batch iteration over the corpus.
+    ///
+    /// Why: clients (sidecar analyzers, external tooling) need to page through
+    /// every chunk without loading the entire corpus into memory at once.
+    /// Deterministic ordering is required so successive pages don't overlap or
+    /// skip rows when the underlying `HashMap` re-shuffles between calls.
+    /// What: collects every `RawChunk`, sorts by `(file, start_line, end_line)`
+    /// for a total order, slices `[offset .. offset+limit]`, and materializes
+    /// each into a `CodeChunk` (same shape as `all_chunks`). Returns
+    /// `(total_chunks, page)` so the caller can serialize the `total` field
+    /// without a second pass.
+    /// Test: `test_enumerate_chunks_paginates_stable_order` indexes a couple of
+    /// files, pages through them, and asserts no overlap and full coverage.
+    pub async fn enumerate_chunks(&self, offset: usize, limit: usize) -> (usize, Vec<CodeChunk>) {
+        let chunks = self.chunks.read().await;
+        let total = chunks.len();
+        if limit == 0 || offset >= total {
+            return (total, Vec::new());
+        }
+        let mut ordered: Vec<&RawChunk> = chunks.values().collect();
+        ordered.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.end_line.cmp(&b.end_line))
+        });
+        let end = (offset + limit).min(total);
+        let page: Vec<CodeChunk> = ordered[offset..end]
+            .iter()
+            .map(|raw| {
+                let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
+                CodeChunk {
+                    id: raw.id.clone(),
+                    file: raw.file.clone(),
+                    language: raw.language.clone(),
+                    start_line: raw.start_line,
+                    end_line: raw.end_line,
+                    content: raw.content.clone(),
+                    function_name: raw.function_name.clone(),
+                    score: 0.0,
+                    compact_snippet: None,
+                    match_reason: "enumerate".to_string(),
+                    chunk_type: raw.chunk_type.clone(),
+                    calls: raw.calls.clone(),
+                    inherits_from: raw.inherits_from.clone(),
+                    complexity_score: compute_complexity(&raw.content),
+                    chunk_depth,
+                    blame: None,
+                    complexity: crate::complexity::compute_complexity(&raw.content),
+                }
+            })
+            .collect();
+        (total, page)
+    }
+
     /// Number of chunks currently held in the corpus.
     pub fn chunk_count(&self) -> usize {
         // blocking_read is fine on a tokio worker thread for a quick stat probe;
@@ -1667,5 +1724,65 @@ mod tests {
         assert!((a - 0.3).abs() < 1e-6 && (b - 0.7).abs() < 1e-6 && !kg);
         let (a, b, kg) = QueryIntent::Usage.weights();
         assert!((a - 0.5).abs() < 1e-6 && (b - 0.5).abs() < 1e-6 && kg);
+    }
+
+    #[tokio::test]
+    async fn test_enumerate_chunks_paginates_stable_order() {
+        // Why: pagination over an underlying HashMap must produce a stable
+        // total order so successive pages don't overlap or skip rows.
+        let idx = make_indexer();
+        // Helper: build a chunk whose `start_line`/`end_line` match the ID so
+        // the `(file, start_line, end_line)` sort exercised below has the
+        // expected total order (the bare `raw` helper hardcodes
+        // `start_line: 1` for every chunk).
+        fn raw_lines(id: &str, file: &str, start: usize, end: usize, content: &str) -> RawChunk {
+            let mut r = raw(id, file, content);
+            r.start_line = start;
+            r.end_line = end;
+            r
+        }
+        // Insert in an order that exercises the file/start_line sort.
+        idx.add_chunk(raw_lines("b.rs:10:20", "b.rs", 10, 20, "fn b_two() {}"))
+            .await
+            .unwrap();
+        idx.add_chunk(raw_lines("a.rs:1:5", "a.rs", 1, 5, "fn a_one() {}"))
+            .await
+            .unwrap();
+        idx.add_chunk(raw_lines("b.rs:1:5", "b.rs", 1, 5, "fn b_one() {}"))
+            .await
+            .unwrap();
+        idx.add_chunk(raw_lines("a.rs:30:40", "a.rs", 30, 40, "fn a_two() {}"))
+            .await
+            .unwrap();
+
+        // Full enumeration: sorted by (file, start_line).
+        let (total_all, all) = idx.enumerate_chunks(0, 100).await;
+        assert_eq!(total_all, 4);
+        let ids: Vec<_> = all.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["a.rs:1:5", "a.rs:30:40", "b.rs:1:5", "b.rs:10:20"]);
+
+        // Page 1 (offset=0, limit=2) + Page 2 (offset=2, limit=2) cover all.
+        let (total_p1, page1) = idx.enumerate_chunks(0, 2).await;
+        let (total_p2, page2) = idx.enumerate_chunks(2, 2).await;
+        assert_eq!(total_p1, 4);
+        assert_eq!(total_p2, 4);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 2);
+        let combined: Vec<_> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(combined, ids);
+
+        // Offset past the end returns empty, but total is preserved.
+        let (total_end, end) = idx.enumerate_chunks(10, 5).await;
+        assert_eq!(total_end, 4);
+        assert!(end.is_empty());
+
+        // limit=0 returns empty.
+        let (total_z, z) = idx.enumerate_chunks(0, 0).await;
+        assert_eq!(total_z, 4);
+        assert!(z.is_empty());
     }
 }

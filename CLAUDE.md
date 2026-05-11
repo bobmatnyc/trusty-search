@@ -3,6 +3,8 @@
 Machine-wide, blazingly fast hybrid code search service. Single install per machine,
 serves multiple named indexes (one per project) via HTTP daemon and MCP server.
 
+> **Coordination:** Shared library patterns, consistent conventions, and CI/CD configuration for this project are managed by [trusty-common](../trusty-common). See that repo's CLAUDE.md for cross-project guidelines.
+
 ## Project Goals
 
 - **Machine-wide service**: one install (`cargo install trusty-search`), one daemon
@@ -84,6 +86,7 @@ POST   /indexes/:id/remove-file      remove from index
 POST   /indexes/:id/reindex          full reindex (fire-and-forget)
 GET    /indexes/:id/reindex/stream   SSE progress stream (start/progress/complete/error)
 GET    /indexes/:id/status           index stats (chunks, last-updated)
+GET    /indexes/:id/chunks           paginated chunk enumeration (?offset, ?limit)
 DELETE /indexes/:id                  delete an index
 GET    /ui                           web management UI (Svelte, embedded)
 POST   /chat                         OpenRouter proxy with search context injection
@@ -100,6 +103,7 @@ POST   /chat                         OpenRouter proxy with search context inject
 - `delete_index` — delete an index
 - `reindex` — trigger full reindex
 - `index_status` — per-index stats
+- `list_chunks` — paginated enumeration of an index's chunks
 - `chat` — OpenRouter conversational Q&A
 
 ## Stack

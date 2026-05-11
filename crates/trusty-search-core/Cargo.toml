@@ -2,6 +2,12 @@
 name = "trusty-search-core"
 version = "0.1.7"
 edition = "2021"
+description = "Core library for trusty-search: BM25, HNSW vector search, tree-sitter chunking, KG expansion, query classification"
+license = "MIT"
+repository = "https://github.com/bobmatnyc/trusty-search"
+homepage = "https://github.com/bobmatnyc/trusty-search"
+keywords = ["search", "code-search", "bm25", "vector-search", "tree-sitter"]
+categories = ["development-tools", "algorithms"]
 
 [dependencies]
 tokio = { workspace = true }

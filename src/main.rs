@@ -14,6 +14,7 @@
 //! `cargo run -- status` from inside this repo → prints `[trusty-search]`
 //! detected via `.git`. `cargo test --workspace` → all tests pass.
 
+mod commands;
 mod detect;
 
 use anyhow::Result;
@@ -2269,42 +2270,15 @@ async fn main() -> Result<()> {
             offset: _,
             budget: _,
         } => {
-            let (index_id, warned) = resolve_index(&cli.index);
-            print_index_header(&index_id, warned);
-            println!(
-                "{} {} {} {}",
-                "→".cyan(),
-                format!("[{}]", index_id).dimmed(),
-                query.bold(),
-                format!("(top-{})", top_k).dimmed()
-            );
-            println!(
-                "{}",
-                "  Daemon connection not yet implemented — see issue #3".yellow()
-            );
+            commands::search::handle_search(&cli.index, query, top_k).await?;
         }
 
         Commands::Watch { path } => {
-            let (index_id, warned) = resolve_index(&cli.index);
-            print_index_header(&index_id, warned);
-            let watch_path = path.unwrap_or_else(|| {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                detect_project(&cwd).root_path
-            });
-            println!(
-                "{} Watching {} as index {}",
-                "◉".green(),
-                watch_path.display().to_string().cyan(),
-                format!("'{}'", index_id).bold()
-            );
-            println!(
-                "{}",
-                "  FileWatcher not yet implemented — see issue #6".yellow()
-            );
+            commands::watch::handle_watch(&cli.index, path).await?;
         }
 
         Commands::Status => {
-            run_status(cli.json).await?;
+            commands::status::handle_status(cli.json).await?;
         }
 
         Commands::Init {
@@ -2312,213 +2286,27 @@ async fn main() -> Result<()> {
             name,
             exclude,
         } => {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let project_path = path.unwrap_or(cwd);
-            let index_name = name.unwrap_or_else(|| {
-                project_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            });
-
-            let marker = project_path.join(".trusty-search");
-            if !marker.exists() {
-                std::fs::write(&marker, format!("index = \"{}\"\n", index_name))?;
-                println!("{} Created {}", "✓".green(), marker.display());
-            } else {
-                println!("{} {} already exists", "·".dimmed(), marker.display());
-            }
-
-            if !exclude.is_empty() {
-                println!("{} Extra exclusions: {}", "·".dimmed(), exclude.join(", "));
-            }
-
-            // Why: previously we printed "Registered" without contacting the daemon
-            // — misleading because the daemon had no idea about this index.
-            // Now: POST /indexes (idempotent) and report truthfully.
-            match register_index_with_daemon(&index_name, &project_path).await {
-                Ok((true, _)) => {
-                    println!(
-                        "{} Registered '{}' with daemon at {}",
-                        "✓".green(),
-                        index_name.bold(),
-                        project_path.display()
-                    );
-                    println!(
-                        "  Run {} to index this project.",
-                        "trusty-search index".cyan()
-                    );
-                }
-                Ok((false, true)) => {
-                    println!(
-                        "{} '{}' already registered with daemon",
-                        "↻".cyan(),
-                        index_name.bold()
-                    );
-                    println!(
-                        "  Run {} to index this project.",
-                        "trusty-search index".cyan()
-                    );
-                }
-                Ok((_, false)) => {
-                    println!(
-                        "{} Daemon not running — index will be created when daemon starts.",
-                        "·".dimmed()
-                    );
-                    println!(
-                        "  Start with {} then run {}.",
-                        "trusty-search start".cyan(),
-                        "trusty-search index".cyan()
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} {} — index will need to be re-registered when daemon is healthy",
-                        "⚠".yellow(),
-                        e
-                    );
-                }
-            }
+            commands::init::handle_init(path, name, exclude).await?;
         }
 
         Commands::Index { path, name, force } => {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let project_path = path.unwrap_or(cwd);
-            let index_name = name.unwrap_or_else(|| {
-                project_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            });
-
-            // 1. Register with daemon (idempotent). Surface a clear error if
-            //    the daemon is unreachable — `index` is useless without it.
-            let (created, daemon_reachable) =
-                match register_index_with_daemon(&index_name, &project_path).await {
-                    Ok(tuple) => tuple,
-                    Err(e) => {
-                        eprintln!("{} {}", "✗".red(), e);
-                        std::process::exit(1);
-                    }
-                };
-            if !daemon_reachable {
-                eprintln!(
-                    "{} Daemon not reachable at {}. Start it with {}.",
-                    "✗".red(),
-                    daemon_base_url().cyan(),
-                    "trusty-search start".cyan(),
-                );
-                std::process::exit(1);
-            }
-
-            if created {
-                println!(
-                    "{} '{}' registered at {}",
-                    "✓".green(),
-                    index_name.bold(),
-                    project_path.display()
-                );
-            }
-
-            // 2. Run the reindex. The daemon's hash-skip optimization
-            //    (see `reindex.rs::hash_content`) re-reads file content but
-            //    skips re-embedding when the SHA-256 matches the previous
-            //    run, so calling reindex even when nothing has changed is
-            //    cheap. The final summary line tells the user whether any
-            //    files actually changed (Improvement 3).
-            //
-            //    `--force` adds a post-reindex health check (chunk count +
-            //    sanity query) so the user gets immediate feedback if the
-            //    rebuild produced an empty/broken index.
-            if force {
-                run_reindex_force(&index_name, &project_path).await?;
-            } else {
-                run_reindex(&index_name, &project_path).await?;
-            }
+            commands::index::handle_index(path, name, force).await?;
         }
 
         Commands::Add { file } => {
-            let (index_id, warned) = resolve_index(&cli.index);
-            print_index_header(&index_id, warned);
-            add_path(&index_id, &file).await?;
+            commands::add::handle_add(&cli.index, file).await?;
         }
 
         Commands::Remove { file } => {
-            let (index_id, warned) = resolve_index(&cli.index);
-            print_index_header(&index_id, warned);
-            let base = daemon_base_url();
-            let url = format!("{}/indexes/{}/remove-file", base, index_id);
-            let client = trusty_common::server::daemon_http_client()?;
-            let body = serde_json::json!({ "path": file.display().to_string() });
-            match client.post(&url).json(&body).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    println!("{} [{}] removed {}", "−".red(), index_id, file.display());
-                }
-                Ok(resp) => {
-                    eprintln!(
-                        "{} daemon returned {} for {}",
-                        "✗".red(),
-                        resp.status(),
-                        url
-                    );
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
-                    std::process::exit(1);
-                }
-            }
+            commands::remove::handle_remove(&cli.index, file).await?;
         }
 
         Commands::Reindex { path } => {
-            let (index_id, warned) = resolve_index(&cli.index);
-            print_index_header(&index_id, warned);
-            let reindex_path = path.unwrap_or_else(|| {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                detect_project(&cwd).root_path
-            });
-            run_reindex(&index_id, &reindex_path).await?;
+            commands::reindex::handle_reindex(&cli.index, path).await?;
         }
 
         Commands::List => {
-            let base = daemon_base_url();
-            let url = format!("{}/indexes", base);
-            let list_client = trusty_common::server::daemon_http_client()?;
-            match list_client.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body: serde_json::Value =
-                        resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
-                    if cli.json {
-                        println!("{}", body);
-                    } else {
-                        println!("{}", "Registered indexes:".bold());
-                        let empty: Vec<serde_json::Value> = Vec::new();
-                        let arr = body
-                            .get("indexes")
-                            .and_then(|v| v.as_array())
-                            .unwrap_or(&empty);
-                        if arr.is_empty() {
-                            println!("  {}", "(none)".dimmed());
-                        } else {
-                            for v in arr {
-                                if let Some(s) = v.as_str() {
-                                    println!("  • {}", s);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(resp) => {
-                    eprintln!("{} daemon returned {}", "✗".red(), resp.status());
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
-                    std::process::exit(1);
-                }
-            }
+            commands::list::handle_list(cli.json).await?;
         }
 
         Commands::Query {
@@ -2527,273 +2315,23 @@ async fn main() -> Result<()> {
             top_k,
             full,
         } => {
-            // Why: resolve which index to search.
-            // Precedence: --index flag > --indexes (single name) > auto-detect (if "*" and one index).
-            // For multi-index "*" with several indexes registered, require explicit choice
-            // because the daemon's search endpoint is single-index-scoped.
-            let base = daemon_base_url();
-            let client = trusty_common::server::daemon_http_client()?;
-
-            let target_id: String = if let Some(id) = cli.index.as_ref() {
-                id.clone()
-            } else if indexes != "*" && !indexes.contains(',') {
-                indexes.clone()
-            } else {
-                // Try to resolve by listing.
-                let resp = client.get(format!("{}/indexes", base)).send().await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        let body: serde_json::Value =
-                            r.json().await.unwrap_or_else(|_| serde_json::json!({}));
-                        let empty: Vec<serde_json::Value> = Vec::new();
-                        let names: Vec<String> = body
-                            .get("indexes")
-                            .and_then(|v| v.as_array())
-                            .unwrap_or(&empty)
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect();
-                        if names.len() == 1 {
-                            names.into_iter().next().unwrap()
-                        } else {
-                            eprintln!(
-                                "{} Multiple indexes registered — please pass --index <id>: {}",
-                                "✗".red(),
-                                names.join(", ")
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                    _ => {
-                        eprintln!("{} could not reach daemon at {}", "✗".red(), base);
-                        std::process::exit(1);
-                    }
-                }
-            };
-
-            let url = format!("{}/indexes/{}/search", base, target_id);
-            let body = serde_json::json!({"text": query, "top_k": top_k});
-            let resp = client.post(&url).json(&body).send().await;
-            let body_json: serde_json::Value = match resp {
-                Ok(r) if r.status().is_success() => {
-                    r.json().await.unwrap_or_else(|_| serde_json::json!({}))
-                }
-                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-                    eprintln!("{} index '{}' not found on daemon", "✗".red(), target_id);
-                    std::process::exit(1);
-                }
-                Ok(r) => {
-                    eprintln!("{} daemon returned {}", "✗".red(), r.status());
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
-                    std::process::exit(1);
-                }
-            };
-
-            if cli.json {
-                println!("{}", body_json);
-            } else {
-                let empty: Vec<serde_json::Value> = Vec::new();
-                let results = body_json
-                    .get("results")
-                    .and_then(|v| v.as_array())
-                    .unwrap_or(&empty);
-                let intent = body_json
-                    .get("intent")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let latency = body_json
-                    .get("latency_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                println!(
-                    "{} [{}] {} {}",
-                    "→".cyan(),
-                    target_id.dimmed(),
-                    query.bold(),
-                    format!(
-                        "(intent={}, {}ms, {} results)",
-                        intent,
-                        latency,
-                        results.len()
-                    )
-                    .dimmed()
-                );
-                if results.is_empty() {
-                    println!("  {}", "(no matches)".dimmed());
-                }
-                for (i, r) in results.iter().enumerate() {
-                    let file = r.get("file").and_then(|v| v.as_str()).unwrap_or("?");
-                    let start = r.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let end = r.get("end_line").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let score = r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let reason = r
-                        .get("match_reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    println!(
-                        "[{}] {}:{}-{}  {}",
-                        i + 1,
-                        file,
-                        start,
-                        end,
-                        format!("(score: {:.3}, {})", score, reason).dimmed()
-                    );
-                    let snippet = if full {
-                        r.get("content").and_then(|v| v.as_str()).unwrap_or("")
-                    } else {
-                        r.get("compact_snippet")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| r.get("content").and_then(|v| v.as_str()))
-                            .unwrap_or("")
-                    };
-                    for line in snippet.lines().take(if full { usize::MAX } else { 7 }) {
-                        println!("    {}", line);
-                    }
-                    if !full && snippet.lines().count() > 7 {
-                        println!("    {}", "...".dimmed());
-                    }
-                }
-            }
+            commands::query::handle_query(&cli.index, cli.json, query, indexes, top_k, full)
+                .await?;
         }
 
         // `health` is an alias registered on the `status` subcommand, so
         // this arm catches the bare `Commands::Health` variant which is kept
         // for backward-compat with any scripts that invoke it directly.
         Commands::Health => {
-            run_status(cli.json).await?;
+            commands::status::handle_status(cli.json).await?;
         }
 
         Commands::Start { port, foreground } => {
-            // `foreground` is currently a no-op: `run_daemon` already runs inline
-            // and never forks. The flag is accepted so launchd/systemd plists can
-            // declare the supervised contract explicitly in ProgramArguments
-            // (see ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist).
-            // If a background-fork path is ever added, gate it on `!foreground`.
-            let _ = foreground;
-            // Fast-path: bail before loading the 86 MB embedding model when
-            // another daemon is already running.  The lock check is ~1 ms;
-            // FastEmbedder::new() can take several seconds on first run.
-            if let Some(lock_path) = trusty_search_service::is_already_running() {
-                eprintln!(
-                    "{} another trusty-search daemon is already running (lock at {})",
-                    "✗".red(),
-                    lock_path.display()
-                );
-                std::process::exit(1);
-            }
-
-            // Open the canonical facts store next to the daemon lockfile.
-            // Why: facts persist across daemon restarts and are scoped per-machine
-            // (single install). Falling back to `None` keeps the daemon usable if
-            // the data dir is read-only — `/facts` endpoints will return 503.
-            let facts = match dirs::data_local_dir() {
-                Some(d) => {
-                    let dir = d.join("trusty-search");
-                    if let Err(e) = std::fs::create_dir_all(&dir) {
-                        tracing::warn!("could not create facts dir {}: {e}", dir.display());
-                        None
-                    } else {
-                        match trusty_search_core::FactStore::open(&dir.join("facts.redb")) {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                tracing::warn!("could not open facts store: {e}");
-                                None
-                            }
-                        }
-                    }
-                }
-                None => None,
-            };
-            // Bug A fix: build a single FastEmbedder up front and share it
-            // across every index registered during the daemon's lifetime.
-            // Without this, `create_index_handler` constructs a BM25-only
-            // `CodeIndexer` and the HNSW lane silently contributes nothing
-            // — the symptom seen in the 115k-chunk benchmark where every
-            // result returned `match_reason: "bm25"`.
-            let embedder: Option<std::sync::Arc<dyn trusty_search_core::Embedder>> =
-                match trusty_search_core::FastEmbedder::new().await {
-                    Ok(e) => Some(std::sync::Arc::new(e)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "FastEmbedder init failed ({e}); daemon falling back to BM25-only mode"
-                        );
-                        None
-                    }
-                };
-            let mut state = trusty_search_service::SearchAppState::new(
-                trusty_search_core::registry::IndexRegistry::new(),
-                facts,
-            );
-            if let Some(e) = embedder {
-                state = state.with_embedder(e);
-            }
-            match trusty_search_service::run_daemon(state, port).await {
-                Ok(()) => {}
-                Err(trusty_search_service::DaemonError::AlreadyRunning(p)) => {
-                    eprintln!(
-                        "{} another trusty-search daemon is already running (lock at {})",
-                        "✗".red(),
-                        p.display()
-                    );
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("{} daemon failed: {e}", "✗".red());
-                    std::process::exit(1);
-                }
-            }
+            commands::start::handle_start(port, foreground).await?;
         }
 
         Commands::Stop => {
-            // The daemon writes its PID into the fs4 lockfile at startup
-            // (see trusty-search-service/src/daemon.rs). Read the PID, send
-            // SIGTERM, then poll for the port file to disappear as a signal
-            // that shutdown completed cleanly.
-            let lock_path =
-                dirs::data_local_dir().map(|d| d.join("trusty-search").join("daemon.lock"));
-            let port_path = daemon_port_path();
-
-            let pid = lock_path
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|s| s.trim().parse::<u32>().ok());
-
-            match pid {
-                None => {
-                    eprintln!("{} No daemon running (no PID file)", "✗".red());
-                    std::process::exit(1);
-                }
-                Some(pid) => {
-                    println!("{} Stopping daemon (PID {})…", "⟳".cyan(), pid);
-                    let status = std::process::Command::new("kill")
-                        .arg("-TERM")
-                        .arg(pid.to_string())
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => {
-                            // Poll up to 5s for the port file to disappear.
-                            for _ in 0..50 {
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                                if port_path.as_ref().map(|p| !p.exists()).unwrap_or(true) {
-                                    println!("{} Daemon stopped", "✓".green());
-                                    return Ok(());
-                                }
-                            }
-                            println!("{} Daemon may still be shutting down", "⚠".yellow());
-                        }
-                        _ => {
-                            eprintln!(
-                                "{} Failed to send SIGTERM (process may already be gone)",
-                                "✗".red()
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
+            commands::stop::handle_stop().await?;
         }
 
         Commands::Serve {
@@ -2801,89 +2339,15 @@ async fn main() -> Result<()> {
             port,
             http,
         } => {
-            let daemon_url = daemon_base_url();
-
-            // Resolve the HTTP bind address. Precedence:
-            //   1. `--no-http`              → disabled
-            //   2. legacy `--http <addr>`   → explicit bind
-            //   3. `--port <p>`             → 127.0.0.1:p (p=0 → OS picks)
-            let bind_addr: Option<String> = if no_http {
-                None
-            } else if let Some(addr) = http {
-                Some(addr)
-            } else {
-                Some(format!("127.0.0.1:{port}"))
-            };
-
-            let server = trusty_search_mcp::McpServer::new(daemon_url.clone());
-
-            match bind_addr {
-                Some(addr) => {
-                    // Bind first so we can report the OS-chosen port when 0.
-                    let listener = tokio::net::TcpListener::bind(&addr).await?;
-                    let local = listener.local_addr()?;
-
-                    // Write `~/.trusty-search/http_addr` so `trusty-search
-                    // dashboard` (and other clients) can find this MCP
-                    // server's HTTP transport. Best-effort: a missing $HOME
-                    // is reported but doesn't abort.
-                    let addr_file = http_addr_path();
-                    if let Some(ref path) = addr_file {
-                        if let Some(parent) = path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        match std::fs::write(path, format!("{local}\n")) {
-                            Ok(()) => {}
-                            Err(e) => {
-                                eprintln!(
-                                    "{} could not write {}: {e}",
-                                    "⚠".yellow(),
-                                    path.display()
-                                );
-                            }
-                        }
-                    }
-
-                    eprintln!(
-                        "trusty-search v{} — HTTP admin panel: http://{}",
-                        env!("CARGO_PKG_VERSION"),
-                        local,
-                    );
-                    eprintln!(
-                        "{} MCP HTTP/SSE on {} → daemon {}",
-                        "◉".green(),
-                        local.to_string().cyan(),
-                        daemon_url.dimmed()
-                    );
-
-                    let app = trusty_search_mcp::sse::router(server);
-                    let serve_result = axum::serve(listener, app).await;
-
-                    // Clean up the discovery file regardless of the serve
-                    // outcome so a crashed `serve` doesn't leave a stale
-                    // pointer.
-                    if let Some(path) = addr_file {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    serve_result?;
-                }
-                None => {
-                    eprintln!(
-                        "{} MCP stdio (no HTTP) → daemon {}",
-                        "◉".green(),
-                        daemon_url.dimmed()
-                    );
-                    trusty_search_mcp::stdio::run(server).await?;
-                }
-            }
+            commands::serve::handle_serve(no_http, port, http).await?;
         }
 
         Commands::Service { action } => {
-            run_service_action(&action)?;
+            commands::service::handle_service(&action)?;
         }
 
         Commands::Dashboard => {
-            run_dashboard()?;
+            commands::dashboard::handle_dashboard()?;
         }
 
         Commands::Convert {
@@ -2891,300 +2355,15 @@ async fn main() -> Result<()> {
             dry_run,
             concurrency,
         } => {
-            let base = daemon_base_url();
-
-            match target {
-                ConvertTarget::Project => {
-                    let cwd = std::env::current_dir()?;
-                    let config_path = find_mvs_config(&cwd).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "No .mcp-vector-search/config.json found in {} or any parent directory",
-                            cwd.display()
-                        )
-                    })?;
-                    let (root, name) = parse_mvs_config(&config_path)?;
-                    if dry_run {
-                        println!(
-                            "{} Dry run — would convert '{}' ({})",
-                            "·".dimmed(),
-                            name.bold(),
-                            root.display()
-                        );
-                    } else {
-                        println!(
-                            "{} Converting '{}' ({})…",
-                            "⟳".cyan(),
-                            name.bold(),
-                            root.display()
-                        );
-                        let result = convert_one(root, name, &base, false).await;
-                        match &result.status {
-                            ConvertStatus::Queued => {
-                                println!(
-                                    "{} Queued for reindex — watch progress with: {}",
-                                    "✓".green(),
-                                    "trusty-search status".cyan()
-                                );
-                            }
-                            ConvertStatus::AlreadyRegistered => {
-                                println!("{} Already registered — reindex queued", "↻".cyan());
-                            }
-                            ConvertStatus::Failed(msg) => {
-                                eprintln!("{} Conversion failed: {}", "✗".red(), msg);
-                                std::process::exit(1);
-                            }
-                            ConvertStatus::DryRun => unreachable!(),
-                        }
-                    }
-                }
-
-                ConvertTarget::All => {
-                    let home_display = dirs::home_dir()
-                        .map(|h| h.display().to_string())
-                        .unwrap_or_else(|| "$HOME".to_string());
-                    println!(
-                        "🔍 Scanning for mcp-vector-search projects under {}…",
-                        home_display
-                    );
-                    let configs = find_all_mvs_configs();
-                    if configs.is_empty() {
-                        println!("{} No mcp-vector-search projects found.", "·".dimmed());
-                        return Ok(());
-                    }
-
-                    if dry_run {
-                        println!(
-                            "{} Dry run — would convert {} projects:\n",
-                            "·".dimmed(),
-                            configs.len()
-                        );
-                    } else {
-                        println!(
-                            "{} Found {} projects. Converting (max {} concurrent)…\n",
-                            "·".dimmed(),
-                            configs.len(),
-                            concurrency
-                        );
-                    }
-
-                    let total = configs.len();
-                    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
-                    let base = std::sync::Arc::new(base);
-                    let mut tasks = tokio::task::JoinSet::new();
-
-                    for (i, config_path) in configs.into_iter().enumerate() {
-                        let sem = sem.clone();
-                        let base = base.clone();
-                        tasks.spawn(async move {
-                            // Acquire permit inside the task so JoinSet limits
-                            // concurrency cleanly without us pre-allocating
-                            // futures that all immediately try to fire.
-                            let _permit = sem.acquire_owned().await.ok();
-                            let parsed = parse_mvs_config(&config_path);
-                            let result = match parsed {
-                                Ok((root, name)) => convert_one(root, name, &base, dry_run).await,
-                                Err(e) => ConvertResult {
-                                    name: config_path.display().to_string(),
-                                    path: config_path.clone(),
-                                    status: ConvertStatus::Failed(format!("parse: {e}")),
-                                },
-                            };
-                            (i + 1, result)
-                        });
-                    }
-
-                    let mut queued = 0usize;
-                    let mut already = 0usize;
-                    let mut dry = 0usize;
-                    let mut failed = 0usize;
-
-                    // Collect-then-sort so output is deterministic instead of
-                    // racy. For 69 projects this is trivially small.
-                    let mut results: Vec<(usize, ConvertResult)> = Vec::with_capacity(total);
-                    while let Some(joined) = tasks.join_next().await {
-                        match joined {
-                            Ok((i, r)) => results.push((i, r)),
-                            Err(e) => eprintln!("{} task panicked: {e}", "✗".red()),
-                        }
-                    }
-                    results.sort_by_key(|(i, _)| *i);
-
-                    for (i, r) in &results {
-                        print_convert_line(*i, total, r);
-                        match r.status {
-                            ConvertStatus::Queued => queued += 1,
-                            ConvertStatus::AlreadyRegistered => already += 1,
-                            ConvertStatus::DryRun => dry += 1,
-                            ConvertStatus::Failed(_) => failed += 1,
-                        }
-                    }
-
-                    println!();
-                    if dry_run {
-                        println!("{} Dry run complete: {} projects", "·".dimmed(), dry);
-                    } else {
-                        println!(
-                            "{} Summary: {} queued, {} already registered (reindexing), {} failed",
-                            "✓".green(),
-                            queued,
-                            already,
-                            failed
-                        );
-                        println!(
-                            "  Reindexing in background. Run {} to see progress.",
-                            "trusty-search list".cyan()
-                        );
-                    }
-                }
-            }
+            commands::convert::handle_convert(target, dry_run, concurrency).await?;
         }
 
         Commands::Ui { port } => {
-            // Resolve port: explicit > port file > 7878.
-            let port = port
-                .or_else(|| {
-                    daemon_port_path()
-                        .and_then(|p| std::fs::read_to_string(p).ok())
-                        .and_then(|s| s.trim().parse::<u16>().ok())
-                })
-                .unwrap_or(7878);
-            let url = format!("http://127.0.0.1:{port}/ui");
-
-            // Probe the daemon — if it's not running, surface a friendly
-            // hint instead of a confusing browser error page.
-            let probe_url = format!("http://127.0.0.1:{port}/health");
-            let ui_probe_client = trusty_common::server::daemon_http_client()?;
-            let healthy = ui_probe_client
-                .get(&probe_url)
-                .send()
-                .await
-                .ok()
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
-            if !healthy {
-                eprintln!(
-                    "{} Daemon not reachable at {}. Run {} first.",
-                    "✗".red(),
-                    format!("http://127.0.0.1:{port}").cyan(),
-                    "trusty-search start".cyan(),
-                );
-                std::process::exit(1);
-            }
-
-            println!("{} Opening {} …", "◉".green(), url.cyan());
-            if let Err(e) = open::that(&url) {
-                eprintln!(
-                    "{} could not launch browser ({e}). Open this URL manually: {}",
-                    "⚠".yellow(),
-                    url
-                );
-            }
+            commands::ui::handle_ui(port).await?;
         }
 
         Commands::Doctor { fix } => {
-            println!("\ntrusty-search doctor\n");
-            println!("Checking configuration...\n");
-
-            let (checks, empty_indexes) = run_doctor_checks().await;
-
-            // Print all checks (index sub-lines were already printed inline
-            // by run_doctor_checks, so we skip the index summary line itself
-            // to avoid double-printing — it carries the per-index detail).
-            for check in &checks {
-                check.print();
-            }
-
-            let errors = checks.iter().filter(|c| c.is_error()).count();
-            let warnings = checks.iter().filter(|c| c.is_warn()).count();
-
-            // ── Fix mode ──────────────────────────────────────────────────
-            if fix {
-                let mut fixed_any = false;
-
-                // Fix 1: Stale lock file.
-                let data_dir = dirs::data_local_dir()
-                    .map(|d| d.join("trusty-search"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/trusty-search"));
-                let lock_path = data_dir.join("daemon.lock");
-                if lock_path.exists() {
-                    let pid_opt = std::fs::read_to_string(&lock_path)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u32>().ok());
-                    let stale = pid_opt
-                        .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) } != 0)
-                        .unwrap_or(true);
-                    if stale {
-                        println!("\nFixing issues...");
-                        fix_stale_lock(&data_dir);
-                        fixed_any = true;
-                    }
-                }
-
-                // Fix 2: Zero-chunk indexes — reindex each one.
-                if !empty_indexes.is_empty() {
-                    if !fixed_any {
-                        println!("\nFixing issues...");
-                        fixed_any = true;
-                    }
-                    for idx in &empty_indexes {
-                        let root = if idx.root_path.is_empty() {
-                            eprintln!(
-                                "  {} '{}' has no root_path — cannot auto-fix; run `trusty-search index` manually",
-                                "⚠".yellow(),
-                                idx.name
-                            );
-                            continue;
-                        } else {
-                            std::path::PathBuf::from(&idx.root_path)
-                        };
-                        println!("  Indexing '{}'...", idx.name);
-                        match run_reindex(&idx.name, &root).await {
-                            Ok(()) => println!("  {} '{}' done", "✓".green(), idx.name),
-                            Err(e) => println!("  {} '{}' failed: {e}", "✗".red(), idx.name),
-                        }
-                    }
-                }
-
-                // Fix 3: Missing model — cannot pre-download, just inform.
-                let has_model_warn = checks.iter().any(|c| {
-                    matches!(c, CheckResult::Warn(msg) if msg.contains("not cached") || msg.contains("not found"))
-                });
-                if has_model_warn {
-                    if !fixed_any {
-                        println!("\nFixing issues...");
-                    }
-                    println!(
-                        "  {} Model downloads automatically on `trusty-search start` — no manual action needed",
-                        "·".dimmed()
-                    );
-                }
-            }
-
-            // ── Summary ───────────────────────────────────────────────────
-            println!();
-            if errors == 0 && warnings == 0 {
-                println!("{}", "Everything looks good!".green().bold());
-            } else {
-                if errors > 0 || warnings > 0 {
-                    println!(
-                        "Issues found: {} warning{}, {} error{}",
-                        warnings,
-                        if warnings == 1 { "" } else { "s" },
-                        errors,
-                        if errors == 1 { "" } else { "s" }
-                    );
-                }
-                if !fix {
-                    println!(
-                        "Run {} to attempt automatic repair.",
-                        "trusty-search doctor --fix".cyan()
-                    );
-                }
-            }
-
-            if errors > 0 {
-                std::process::exit(1);
-            }
+            commands::doctor::handle_doctor(fix).await?;
         }
 
         Commands::Completions { shell } => {

@@ -2,10 +2,16 @@
 name = "trusty-search-mcp"
 version = "0.1.7"
 edition = "2021"
+description = "MCP server (stdio + HTTP/SSE) for trusty-search hybrid code search"
+license = "MIT"
+repository = "https://github.com/bobmatnyc/trusty-search"
+homepage = "https://github.com/bobmatnyc/trusty-search"
+keywords = ["mcp", "search", "code-search", "ai", "json-rpc"]
+categories = ["development-tools", "network-programming"]
 
 [dependencies]
-trusty-search-core = { path = "../trusty-search-core" }
-trusty-search-service = { path = "../trusty-search-service" }
+trusty-search-core = { version = "0.1.7", path = "../trusty-search-core" }
+trusty-search-service = { version = "0.1.7", path = "../trusty-search-service" }
 trusty-mcp-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

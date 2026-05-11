@@ -30,35 +30,46 @@ dotenvy = "0.15"
 include_dir = "0.7"
 open = "5"
 libc = "0.2"
-trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
-trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
-trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.0" }
+trusty-mcp-core = { version = "0.1.0", git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
+trusty-embedder = { version = "0.1.0", git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
+trusty-common = { version = "0.1.2", git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.2" }
 
 # Local development override: use the in-tree trusty-common workspace so
 # changes here are picked up without a release cycle. Cargo requires every
 # crate exported from the patched source to be listed, even if not all are
 # consumed.
-[patch."https://github.com/bobmatnyc/trusty-common"]
-trusty-common = { path = "../trusty-common/crates/trusty-common" }
-trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
-trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+#
+# NOTE: Disabled because the in-tree `../trusty-common` workspace has moved to
+# axum 0.8 while trusty-search still pins axum 0.7. With the patch active,
+# both versions are pulled into the dependency graph and
+# `with_standard_middleware` no longer type-checks (Router<S> from two
+# different axum versions). Re-enable once trusty-search migrates to axum 0.8
+# (see follow-up ticket). Until then, builds resolve to the published
+# `trusty-common-v0.1.2` git tag which remains on axum 0.7.
+# [patch."https://github.com/bobmatnyc/trusty-common"]
+# trusty-common = { path = "../trusty-common/crates/trusty-common" }
+# trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
+# trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
 
 [package]
 name = "trusty-search"
-version = "0.1.57"
+version = "0.1.58"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
 repository = "https://github.com/bobmatnyc/trusty-search"
+homepage = "https://github.com/bobmatnyc/trusty-search"
+keywords = ["search", "code-search", "mcp", "vector-search", "bm25"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "trusty-search"
 path = "src/main.rs"
 
 [dependencies]
-trusty-search-core = { path = "crates/trusty-search-core" }
-trusty-search-service = { path = "crates/trusty-search-service" }
-trusty-search-mcp = { path = "crates/trusty-search-mcp" }
+trusty-search-core = { version = "0.1.7", path = "crates/trusty-search-core" }
+trusty-search-service = { version = "0.1.7", path = "crates/trusty-search-service" }
+trusty-search-mcp = { version = "0.1.7", path = "crates/trusty-search-mcp" }
 trusty-common = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

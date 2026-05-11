@@ -448,26 +448,51 @@ fn default_hotspots_top_n() -> usize {
     20
 }
 
-/// `GET /indexes/:id/chunks` — bulk export of every chunk in an index.
+/// Query params for `GET /indexes/:id/chunks` (issue #54).
+#[derive(Deserialize)]
+pub struct ChunksParams {
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_chunks_limit")]
+    pub limit: usize,
+}
+
+fn default_chunks_limit() -> usize {
+    100
+}
+
+/// Hard ceiling on a single `chunks` page so a misconfigured client can't pull
+/// the entire corpus into one response. Mirrored in the `list_chunks` MCP tool.
+const MAX_CHUNKS_LIMIT: usize = 1_000;
+
+/// `GET /indexes/:id/chunks?offset=&limit=` — paginated enumeration of an index.
 ///
-/// Why: trusty-analyzer (sidecar daemon) needs the full corpus to run static
-/// analysis without round-tripping through the search pipeline. This endpoint
-/// is the single source of truth for the chunk corpus.
-/// What: Returns `{ index_id, count, chunks: [...] }` containing every
-/// `CodeChunk` currently held by the indexer for the given index id.
-/// Test: register an index, index a file, call this endpoint, assert chunks
-/// non-empty and contain the indexed file's content.
+/// Why: trusty-analyzer (sidecar daemon) and external tooling need to page
+/// through every chunk in batches without loading the whole corpus at once.
+/// Issue #54 introduces stable-order pagination on top of the existing bulk
+/// export.
+/// What: Returns
+/// `{ index_id, total, offset, limit, chunks: [...] }`. `chunks` is the slice
+/// `[offset .. offset+limit]` of the corpus sorted by `(file, start_line)`.
+/// `limit` is clamped to `MAX_CHUNKS_LIMIT` (1000); the value echoed back in
+/// the response is the post-clamp value so clients can detect the clamp.
+/// Test: `test_get_index_chunks_paginates` registers an index, indexes a few
+/// files, asserts page1 + page2 cover all chunks without overlap.
 async fn get_index_chunks_handler(
     State(state): State<Arc<SearchAppState>>,
     Path(id): Path<String>,
+    Query(params): Query<ChunksParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let index_id = IndexId::new(id);
     let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let limit = params.limit.min(MAX_CHUNKS_LIMIT);
     let indexer = handle.indexer.read().await;
-    let chunks = indexer.all_chunks().await;
+    let (total, chunks) = indexer.enumerate_chunks(params.offset, limit).await;
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,
-        "count": chunks.len(),
+        "total": total,
+        "offset": params.offset,
+        "limit": limit,
         "chunks": chunks,
     })))
 }

@@ -19,6 +19,7 @@
 //! | `delete_index`  | `DELETE /indexes/:id`                     |
 //! | `reindex`       | `POST /indexes/:id/reindex`               |
 //! | `index_status`  | `GET  /indexes/:id/status`                |
+//! | `list_chunks`   | `GET  /indexes/:id/chunks?offset=&limit=` |
 //! | `chat`          | `POST /chat`                              |
 //!
 //! Test: `cargo test -p trusty-search-mcp` covers JSON-RPC parsing, error
@@ -286,6 +287,17 @@ impl McpServer {
                     .unwrap_or("default");
                 self.get(&format!("/indexes/{index_id}/quality")).await
             }
+            "list_chunks" => {
+                // Issue #54 — paginated enumeration of an index's corpus.
+                // Mirrors `GET /indexes/:id/chunks?offset=&limit=`.
+                let index_id = require_str(args, "index_id")?;
+                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100);
+                self.get(&format!(
+                    "/indexes/{index_id}/chunks?offset={offset}&limit={limit}"
+                ))
+                .await
+            }
             _ => Err(DispatchError::UnknownTool),
         }
     }
@@ -545,6 +557,19 @@ pub fn tool_descriptors() -> Value {
             }
         },
         {
+            "name": "list_chunks",
+            "description": "Paginated enumeration of every chunk in an index (issue #54). Stable order by (file, start_line).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["index_id"],
+                "properties": {
+                    "index_id": { "type": "string" },
+                    "offset":   { "type": "integer", "default": 0 },
+                    "limit":    { "type": "integer", "default": 100 }
+                }
+            }
+        },
+        {
             "name": "chat",
             "description": "Ask a question about code using OpenRouter LLM with search context (requires OPENROUTER_API_KEY)",
             "inputSchema": {
@@ -752,6 +777,7 @@ mod tests {
             "delete_index",
             "reindex",
             "index_status",
+            "list_chunks",
             "chat",
         ] {
             assert!(
