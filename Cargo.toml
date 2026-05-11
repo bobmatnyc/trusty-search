@@ -48,7 +48,7 @@ trusty-symgraph = { version = "0.2.1", default-features = false }  # contracts s
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
 async-trait = "0.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }

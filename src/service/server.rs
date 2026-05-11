@@ -35,6 +35,7 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use std::time::Duration;
 use dashmap::DashMap;
 use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -219,6 +220,7 @@ pub fn build_router(state: SearchAppState) -> Router {
     let router = Router::new()
         .route("/", get(|| async { Redirect::permanent("/ui/") }))
         .route("/health", get(health_handler))
+        .route("/status/stream", get(status_stream_handler))
         .route(
             "/indexes",
             get(list_indexes_handler).post(create_index_handler),
@@ -260,6 +262,61 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
         indexes: state.registry.list().len(),
         uptime_secs: state.started_at.elapsed().as_secs(),
     })
+}
+
+/// Snapshot used by both `/health` (one-shot) and `/status/stream` (SSE tick).
+///
+/// Why: The dashboard needs live counts of registered indexes + total chunks
+/// across the whole daemon. Computing this requires acquiring a read-lock on
+/// every indexer, so the work is centralised here to keep the SSE loop tidy.
+/// What: Returns `(indexes_count, total_chunks)` summed across the registry.
+/// Test: Register two indexes seeded with one file each; the helper returns
+/// `(2, chunks_in_file_a + chunks_in_file_b)`.
+async fn collect_status_counts(state: &SearchAppState) -> (usize, usize) {
+    let ids = state.registry.list();
+    let indexes_count = ids.len();
+    let mut total_chunks: usize = 0;
+    for id in ids {
+        if let Some(handle) = state.registry.get(&id) {
+            let indexer = handle.indexer.read().await;
+            total_chunks = total_chunks.saturating_add(indexer.chunk_count());
+        }
+    }
+    (indexes_count, total_chunks)
+}
+
+/// `GET /status/stream` — Server-Sent Events stream of live daemon stats.
+///
+/// Why: The admin dashboard's headline stat cards (Indexes, Documents,
+/// Uptime, Version) previously required a manual refresh or periodic
+/// `setInterval` polling. Pushing updates from the daemon via SSE keeps the
+/// UI live without each tab hammering the REST API.
+/// What: Pushes an initial JSON payload immediately on connect, then a fresh
+/// payload every 2 seconds for the lifetime of the connection. Payload shape:
+/// `{ "indexes": <u64>, "total_chunks": <u64>, "uptime_secs": <u64>,
+/// "version": "<semver>" }`. Mirrors the existing
+/// `/indexes/:id/reindex/stream` SSE pattern (axum `Sse` + `KeepAlive`).
+/// Test: `curl -N http://127.0.0.1:7878/status/stream` shows an event every
+/// 2s; closing the curl cleanly drops the stream on the server side.
+async fn status_stream_handler(
+    State(state): State<Arc<SearchAppState>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let interval = tokio::time::interval(Duration::from_secs(2));
+    let ticks = tokio_stream::wrappers::IntervalStream::new(interval);
+    let stream = ticks.then(move |_| {
+        let state = Arc::clone(&state);
+        async move {
+            let (indexes, total_chunks) = collect_status_counts(&state).await;
+            let payload = serde_json::json!({
+                "indexes": indexes,
+                "total_chunks": total_chunks,
+                "uptime_secs": state.started_at.elapsed().as_secs(),
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            Ok::<Event, Infallible>(Event::default().data(payload.to_string()))
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn list_indexes_handler(State(state): State<Arc<SearchAppState>>) -> Json<IndexListResponse> {

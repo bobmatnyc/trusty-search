@@ -9,15 +9,36 @@
    * Test: `pnpm dev` in `ui/`, open http://127.0.0.1:7878/ui, confirm the
    * counters render and clicking a row navigates to /indexes.
    */
-  import { getHealth, getIndexes } from '../state.svelte.js';
+  import { onMount, onDestroy } from 'svelte';
+  import {
+    getHealth,
+    getIndexes,
+    getLiveStats,
+    subscribeStatusStream,
+    unsubscribeStatusStream
+  } from '../state.svelte.js';
   import { navigate } from '../router.svelte.js';
 
   let health = $derived(getHealth());
   let indexes = $derived(getIndexes());
+  let liveStats = $derived(getLiveStats());
 
+  // Prefer the live stream value (covers indexes the dashboard's per-index
+  // /status fetch hasn't refreshed yet); fall back to the locally computed
+  // sum so the first paint isn't blank.
   let totalDocuments = $derived(
-    indexes.reduce((sum, ix) => sum + (ix.chunk_count || 0), 0)
+    liveStats?.total_chunks ??
+      indexes.reduce((sum, ix) => sum + (ix.chunk_count || 0), 0)
   );
+
+  // Why: open one EventSource per mount, close on unmount so we never leak
+  // connections when the user navigates between views.
+  onMount(() => {
+    subscribeStatusStream();
+  });
+  onDestroy(() => {
+    unsubscribeStatusStream();
+  });
 
   let recent = $derived(
     [...indexes]

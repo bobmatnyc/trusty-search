@@ -14,9 +14,63 @@ let _health = $state(null);
 let _indexes = $state([]); // [{ id, chunk_count, root_path }]
 let _loading = $state(false);
 let _error = $state(null);
+let _liveStats = $state(null); // { indexes, total_chunks, uptime_secs, version }
+let _statusSource = null;
+let _statusRefcount = 0;
 
 export function getHealth() {
   return _health;
+}
+
+export function getLiveStats() {
+  return _liveStats;
+}
+
+/**
+ * Why: The dashboard's headline counters (Indexes / Documents / Uptime /
+ * Version) should update without a manual refresh. The daemon exposes
+ * `/status/stream` as a Server-Sent Events feed pushing
+ * `{ indexes, total_chunks, uptime_secs, version }` every 2 seconds.
+ * What: Opens a singleton EventSource (reference-counted across callers),
+ * merges each event into `_health` so existing `getHealth()` consumers keep
+ * working, and also exposes `getLiveStats()` for the full payload (including
+ * `total_chunks`).
+ * Test: Call `subscribeStatusStream()`, wait > 2s, assert
+ * `getLiveStats().total_chunks` is a number; call `unsubscribeStatusStream()`
+ * and assert no further messages arrive.
+ */
+export function subscribeStatusStream() {
+  _statusRefcount += 1;
+  if (_statusSource) return _statusSource;
+
+  const src = new EventSource('/status/stream');
+  src.onmessage = (ev) => {
+    try {
+      const payload = JSON.parse(ev.data);
+      _liveStats = payload;
+      // Mirror into _health so existing $derived(getHealth()) consumers
+      // keep updating live without code changes elsewhere.
+      _health = {
+        status: 'ok',
+        version: payload.version ?? _health?.version ?? '',
+        indexes: payload.indexes ?? 0,
+        uptime_secs: payload.uptime_secs ?? 0
+      };
+    } catch (_e) {
+      /* ignore malformed payload */
+    }
+  };
+  // EventSource auto-reconnects on transient errors; do not tear down here.
+  _statusSource = src;
+  return src;
+}
+
+export function unsubscribeStatusStream() {
+  _statusRefcount = Math.max(0, _statusRefcount - 1);
+  if (_statusRefcount === 0 && _statusSource) {
+    _statusSource.close();
+    _statusSource = null;
+  }
 }
 
 export function getIndexes() {

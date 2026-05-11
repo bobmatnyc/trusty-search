@@ -20,6 +20,7 @@ export default defineConfig({
     proxy: {
       // Forward API calls to the daemon during dev.
       '/health': 'http://127.0.0.1:7878',
+      '/status': 'http://127.0.0.1:7878',
       '/indexes': 'http://127.0.0.1:7878',
       '/search': 'http://127.0.0.1:7878',
       '/chat': 'http://127.0.0.1:7878',
