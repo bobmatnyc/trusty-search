@@ -65,6 +65,22 @@ pub fn daemon_port_path() -> Result<PathBuf, DaemonError> {
     Ok(daemon_dir()?.join("daemon.port"))
 }
 
+/// Path to `~/.trusty-search/http_addr` — the canonical address-discovery
+/// file used by `trusty-search dashboard` and other client tools to locate
+/// the running daemon. Distinct from the legacy `daemon.port` file (which
+/// stores only the port number under the platform-specific data-local dir).
+///
+/// Why: aligns trusty-search with the trusty-memory address-discovery
+/// contract — both daemons write a fully-qualified `host:port` line to
+/// `~/.trusty-*/http_addr`. Clients can read either file to discover the
+/// daemon without DNS or service registration.
+/// What: returns `$HOME/.trusty-search/http_addr` (creating the parent
+/// directory on demand is the caller's responsibility).
+/// Test: with HOME=/tmp/xyz → returns "/tmp/xyz/.trusty-search/http_addr".
+pub fn http_addr_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".trusty-search").join("http_addr"))
+}
+
 fn daemon_dir() -> Result<PathBuf, DaemonError> {
     // NB: We use `data_local_dir()` (not the shared `trusty_common::resolve_data_dir`
     // which uses `data_dir()`) because the lockfile path is replicated in `main.rs`
@@ -269,6 +285,31 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     // Atomically write the port file (write + rename).
     write_port_file(&port_path, port)?;
 
+    // Also write the canonical `~/.trusty-search/http_addr` discovery file
+    // (full `host:port` line) so `trusty-search dashboard` and other clients
+    // can locate the daemon without depending on the platform-specific
+    // data-local dir. Best-effort: a missing $HOME is not fatal — the legacy
+    // `daemon.port` file above is still authoritative for the local CLI.
+    let http_addr_written = match http_addr_path() {
+        Some(path) => match write_http_addr_file(&path, &addr) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                tracing::warn!("could not write {}: {e}", path.display());
+                None
+            }
+        },
+        None => None,
+    };
+
+    // Friendly startup banner (printed to stderr so it doesn't pollute stdout
+    // for callers consuming JSON-RPC over a pipe). Includes the version so
+    // users can confirm which binary is running when multiple are installed.
+    eprintln!(
+        "trusty-search v{} — HTTP admin panel: http://{}",
+        env!("CARGO_PKG_VERSION"),
+        addr,
+    );
+
     // Why: The embedded UI needs to know the actual port at runtime so it
     // can call back to the daemon (window.__DAEMON_PORT__). Stamp it onto
     // the state right before building the router.
@@ -284,9 +325,33 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     // Best-effort cleanup; ignore errors so the lockfile drop is what frees
     // the next daemon, not our cleanup.
     let _ = std::fs::remove_file(&port_path);
+    if let Some(path) = http_addr_written {
+        let _ = std::fs::remove_file(&path);
+    }
 
     serve_result.map_err(|e| DaemonError::Server(e.to_string()))?;
     drop(lock_file);
+    Ok(())
+}
+
+/// Write the canonical `host:port` discovery line to `~/.trusty-search/http_addr`.
+///
+/// Why: separate from `write_port_file` because the format and location differ
+/// — port file stores `12345`, http_addr stores `127.0.0.1:12345`. Both write
+/// atomically via tmp-file + rename so partial reads are impossible.
+/// What: creates parent directory if missing; writes via temp + rename.
+/// Test: with a fresh tempdir, write addr → read back → matches `host:port`.
+fn write_http_addr_file(path: &Path, addr: &SocketAddr) -> Result<(), DaemonError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("addr.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        writeln!(f, "{addr}")?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -305,6 +370,16 @@ fn write_port_file(path: &PathBuf, port: u16) -> Result<(), DaemonError> {
 mod tests {
     use super::*;
     use std::net::TcpListener as StdTcpListener;
+
+    #[test]
+    fn http_addr_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("http_addr");
+        let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        write_http_addr_file(&path, &addr).unwrap();
+        let read = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read.trim(), "127.0.0.1:54321");
+    }
 
     #[test]
     fn port_file_roundtrip() {

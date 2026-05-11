@@ -277,17 +277,72 @@ enum Commands {
     #[command(display_order = 21)]
     Stop,
 
-    /// Start MCP stdio server for Claude Code integration
+    /// Start MCP server (HTTP by default; add --no-http for stdio-only)
+    ///
+    /// HTTP/SSE binds to 127.0.0.1:<port> (port 0 = OS-chosen free port) and
+    /// the bound address is written to `~/.trusty-search/http_addr` so
+    /// `trusty-search dashboard` and other clients can discover it. Stdio
+    /// MCP is always served on the process's stdin/stdout for Claude Code.
+    ///
+    /// Use `--no-http` to skip the HTTP listener (Claude Code MCP hook path
+    /// — Claude Code pipes JSON-RPC directly and doesn't need a panel).
     ///
     /// Examples:
-    ///   trusty-search serve
-    ///   trusty-search serve --http 0.0.0.0:8080
+    ///   trusty-search serve                       # MCP stdio + HTTP on :0
+    ///   trusty-search serve --port 7878           # MCP stdio + HTTP on :7878
+    ///   trusty-search serve --no-http             # MCP stdio only (Claude hook)
+    ///   trusty-search serve --http 0.0.0.0:8080   # legacy: explicit bind addr
     #[command(display_order = 22)]
     Serve {
-        /// Start HTTP/SSE mode instead of stdio
+        /// Disable the HTTP listener (MCP stdio only).
+        ///
+        /// Use this when wired into a Claude Code MCP hook: Claude Code pipes
+        /// JSON-RPC over stdin/stdout, so the HTTP admin panel is unnecessary
+        /// and binding it just wastes a port.
+        #[arg(long, default_value_t = false)]
+        no_http: bool,
+
+        /// Port for the HTTP/SSE MCP transport (default: 0 = OS picks).
+        ///
+        /// Ignored when `--no-http` is set.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+
+        /// Legacy: explicit "host:port" bind address. When set, overrides
+        /// `--port`. Kept for backward compatibility with older docs.
         #[arg(long)]
         http: Option<String>,
     },
+
+    /// Manage the macOS launchd service (install/uninstall/status/logs)
+    ///
+    /// Installs a LaunchAgent plist at
+    /// `~/Library/LaunchAgents/com.trusty.trusty-search.plist` that runs the
+    /// daemon in the foreground under launchd supervision. Not supported on
+    /// Linux / Windows — the subcommand exits 1 with a clear message.
+    ///
+    /// Examples:
+    ///   trusty-search service install
+    ///   trusty-search service status
+    ///   trusty-search service logs
+    ///   trusty-search service uninstall
+    #[command(display_order = 24)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
+    /// Open the admin panel of the running daemon in the default browser
+    ///
+    /// Reads `~/.trusty-search/http_addr` to discover the daemon, then opens
+    /// `http://<addr>/ui` in the default browser. Falls back to printing the
+    /// URL if the browser fails to launch. Errors clearly if no daemon is
+    /// running (no discovery file).
+    ///
+    /// Examples:
+    ///   trusty-search dashboard
+    #[command(display_order = 23)]
+    Dashboard,
 
     /// Migrate mcp-vector-search project(s) to trusty-search
     ///
@@ -371,6 +426,27 @@ enum IntentArg {
     Unknown,
 }
 
+/// Subcommands for `trusty-search service` (macOS launchd integration).
+///
+/// Why: launchd is the canonical way to keep a long-lived foreground service
+/// alive on macOS — it survives logout, restarts on crash, and integrates with
+/// `launchctl` for diagnostics. Wrapping the plist mechanics in `service`
+/// subcommands keeps users from having to hand-edit XML.
+/// What: each variant maps to one `launchctl` operation.
+/// Test: `cargo run -- service --help` lists the four actions; on Linux,
+/// any action prints "not supported" and exits 1.
+#[derive(Debug, Clone, Subcommand)]
+enum ServiceAction {
+    /// Install the LaunchAgent plist and load it
+    Install,
+    /// Unload the LaunchAgent and remove the plist
+    Uninstall,
+    /// Show launchd status for the agent
+    Status,
+    /// Tail the launchd stdout / stderr logs
+    Logs,
+}
+
 /// Why: `convert` accepts a discrete operating mode, so model it as an enum
 /// rather than a free-form string. Validated at parse time by clap.
 /// What: `Project` operates on the CWD; `All` walks the user's home tree
@@ -418,20 +494,44 @@ fn print_index_header(index_id: &str, warned: bool) {
     }
 }
 
-/// Resolve the daemon's base URL from the port file written by
-/// `trusty-search start`. Falls back to `7878` when the file is missing,
-/// so `serve` works out-of-the-box if the user starts the daemon on its
-/// default port.
+/// Resolve the daemon's base URL.
 ///
-/// Why: stdio MCP servers are spawned by Claude Code and have no way to
-/// learn the daemon port other than this file.
-/// What: returns `http://127.0.0.1:{port}` (no trailing slash).
+/// Why: stdio MCP servers and CLI subcommands need to find the running
+/// daemon without configuration. We check the canonical
+/// `~/.trusty-search/http_addr` first (the new address-discovery contract,
+/// aligned with trusty-memory), then fall back to the legacy port file
+/// (`~/.local/share/trusty-search/daemon.port`) for backward compatibility,
+/// and finally to `127.0.0.1:7878` if neither exists.
+/// What: returns `http://{host}:{port}` (no trailing slash).
 fn daemon_base_url() -> String {
+    if let Some(addr) = read_http_addr_file() {
+        return format!("http://{addr}");
+    }
     let port = daemon_port_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(7878);
     format!("http://127.0.0.1:{port}")
+}
+
+/// Read the canonical address-discovery file. Returns `Some("host:port")`
+/// when the daemon has written it; `None` otherwise.
+fn read_http_addr_file() -> Option<String> {
+    let path = http_addr_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Path to `~/.trusty-search/http_addr` — the canonical address-discovery
+/// file. Mirrors `trusty_search_service::daemon::http_addr_path` so the CLI
+/// doesn't need to depend on the service crate for path resolution.
+fn http_addr_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".trusty-search").join("http_addr"))
 }
 
 /// Path to `~/.local/share/trusty-search/daemon.port` (or platform equivalent).
@@ -1886,6 +1986,267 @@ fn fix_stale_lock(data_dir: &std::path::Path) {
     }
 }
 
+// ── Dashboard ─────────────────────────────────────────────────────────────
+
+/// Open the admin panel of the running daemon in the default browser.
+///
+/// Why: provides a one-command path from "is the daemon up?" to "show me the
+/// UI" without the user having to memorize ports or paths.
+/// What: reads `~/.trusty-search/http_addr`; if missing, errors with a clear
+/// hint. Otherwise opens `http://<addr>/ui` (falling back to printing the
+/// URL when `open` fails — e.g. headless environments).
+/// Test: with no daemon running → returns Err with "no daemon running"
+/// message. With a fake `http_addr` file → prints URL.
+fn run_dashboard() -> Result<()> {
+    let Some(path) = http_addr_path() else {
+        anyhow::bail!("could not resolve $HOME — set HOME and try again");
+    };
+    let addr = match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => {
+            eprintln!(
+                "{} No daemon running ({} not found). Start one with {}.",
+                "✗".red(),
+                path.display(),
+                "trusty-search start".cyan()
+            );
+            std::process::exit(1);
+        }
+    };
+    if addr.is_empty() {
+        anyhow::bail!("{} is empty — daemon may be shutting down", path.display());
+    }
+    let url = format!("http://{addr}/ui");
+    println!("{} Opening {} …", "◉".green(), url.cyan());
+    if let Err(e) = open::that(&url) {
+        eprintln!(
+            "{} could not launch browser ({e}). Open this URL manually: {}",
+            "⚠".yellow(),
+            url
+        );
+    }
+    Ok(())
+}
+
+// ── Service (macOS launchd) ───────────────────────────────────────────────
+
+/// Reverse-DNS label for the LaunchAgent. Used as the plist filename and the
+/// `Label` key — both must match for `launchctl` lookups to work.
+#[cfg(target_os = "macos")]
+const LAUNCHD_LABEL: &str = "com.trusty.trusty-search";
+
+/// Dispatch a `trusty-search service <action>` invocation.
+///
+/// Why: launchd is macOS-specific; on other platforms we exit cleanly with a
+/// clear message rather than emitting confusing plist errors.
+/// What: macOS routes to `service_install` / `service_uninstall` /
+/// `service_status` / `service_logs`. Non-macOS prints "not supported" and
+/// exits 1.
+/// Test: on Linux, every action returns Err with the platform message;
+/// on macOS, `service status` runs `launchctl list` without crashing.
+fn run_service_action(action: &ServiceAction) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        match action {
+            ServiceAction::Install => service_install(),
+            ServiceAction::Uninstall => service_uninstall(),
+            ServiceAction::Status => service_status(),
+            ServiceAction::Logs => service_logs(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = action;
+        eprintln!(
+            "{} `trusty-search service` is not supported on this platform — \
+             use your distro's service manager (systemd, OpenRC, etc.) directly.",
+            "✗".red()
+        );
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist_path() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve $HOME"))?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist")))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_log_dir() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve $HOME"))?;
+    let dir = home.join("Library").join("Logs").join("trusty-search");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Render the LaunchAgent plist body. Foreground mode (launchd owns lifecycle).
+#[cfg(target_os = "macos")]
+fn launchd_plist_body(exe: &std::path::Path, log_dir: &std::path::Path) -> String {
+    let exe = exe.display();
+    let stdout = log_dir.join("stdout.log");
+    let stderr = log_dir.join("stderr.log");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{}</string>
+    <key>StandardErrorPath</key>
+    <string>{}</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#,
+        stdout.display(),
+        stderr.display(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn service_install() -> Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
+    let plist_path = launchd_plist_path()?;
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log_dir = launchd_log_dir()?;
+    let body = launchd_plist_body(&exe, &log_dir);
+    std::fs::write(&plist_path, body)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", plist_path.display()))?;
+    println!(
+        "{} Wrote LaunchAgent plist: {}",
+        "✓".green(),
+        plist_path.display()
+    );
+
+    // Bootstrap into the GUI domain of the current user. `bootout` first
+    // (ignoring errors) so a re-install replaces a previously-loaded agent
+    // cleanly.
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}");
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &domain])
+        .arg(&plist_path)
+        .status();
+    let status = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&plist_path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("launchctl bootstrap failed: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("launchctl bootstrap exited with {status}");
+    }
+    println!(
+        "{} Loaded {} into {} — daemon will start automatically.",
+        "✓".green(),
+        LAUNCHD_LABEL,
+        domain
+    );
+    println!(
+        "  Logs:    {}\n  Status:  {}",
+        log_dir.display().to_string().dimmed(),
+        "trusty-search service status".cyan(),
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn service_uninstall() -> Result<()> {
+    let plist_path = launchd_plist_path()?;
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}");
+    if plist_path.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &domain])
+            .arg(&plist_path)
+            .status();
+        std::fs::remove_file(&plist_path)
+            .map_err(|e| anyhow::anyhow!("remove {}: {e}", plist_path.display()))?;
+        println!(
+            "{} Unloaded and removed {}",
+            "✓".green(),
+            plist_path.display()
+        );
+    } else {
+        println!(
+            "{} {} not installed — nothing to do",
+            "·".dimmed(),
+            plist_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn service_status() -> Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .map_err(|e| anyhow::anyhow!("launchctl print failed: {e}"))?;
+    if output.status.success() {
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        // `launchctl print` exits non-zero when the service isn't loaded.
+        eprintln!(
+            "{} {} is not loaded ({})",
+            "✗".red(),
+            target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        eprintln!("  Install with: {}", "trusty-search service install".cyan());
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn service_logs() -> Result<()> {
+    let log_dir = launchd_log_dir()?;
+    let stdout = log_dir.join("stdout.log");
+    let stderr = log_dir.join("stderr.log");
+    if !stdout.exists() && !stderr.exists() {
+        eprintln!(
+            "{} No logs at {} yet — start the service first.",
+            "·".dimmed(),
+            log_dir.display()
+        );
+        return Ok(());
+    }
+    // Defer to `tail -F` so the user gets a familiar follow-mode experience
+    // and we don't have to re-implement log rotation handling.
+    let status = std::process::Command::new("tail")
+        .arg("-F")
+        .arg(&stdout)
+        .arg(&stderr)
+        .status()
+        .map_err(|e| anyhow::anyhow!("tail failed: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("tail exited with {status}");
+    }
+    Ok(())
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -2435,23 +2796,94 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Serve { http } => {
+        Commands::Serve {
+            no_http,
+            port,
+            http,
+        } => {
             let daemon_url = daemon_base_url();
-            let server = trusty_search_mcp::McpServer::new(daemon_url.clone());
-            if let Some(addr) = http {
-                eprintln!(
-                    "{} MCP HTTP/SSE on {} → daemon {}",
-                    "◉".green(),
-                    addr.cyan(),
-                    daemon_url.dimmed()
-                );
-                let listener = tokio::net::TcpListener::bind(&addr).await?;
-                let app = trusty_search_mcp::sse::router(server);
-                axum::serve(listener, app).await?;
+
+            // Resolve the HTTP bind address. Precedence:
+            //   1. `--no-http`              → disabled
+            //   2. legacy `--http <addr>`   → explicit bind
+            //   3. `--port <p>`             → 127.0.0.1:p (p=0 → OS picks)
+            let bind_addr: Option<String> = if no_http {
+                None
+            } else if let Some(addr) = http {
+                Some(addr)
             } else {
-                eprintln!("{} MCP stdio → daemon {}", "◉".green(), daemon_url.dimmed());
-                trusty_search_mcp::stdio::run(server).await?;
+                Some(format!("127.0.0.1:{port}"))
+            };
+
+            let server = trusty_search_mcp::McpServer::new(daemon_url.clone());
+
+            match bind_addr {
+                Some(addr) => {
+                    // Bind first so we can report the OS-chosen port when 0.
+                    let listener = tokio::net::TcpListener::bind(&addr).await?;
+                    let local = listener.local_addr()?;
+
+                    // Write `~/.trusty-search/http_addr` so `trusty-search
+                    // dashboard` (and other clients) can find this MCP
+                    // server's HTTP transport. Best-effort: a missing $HOME
+                    // is reported but doesn't abort.
+                    let addr_file = http_addr_path();
+                    if let Some(ref path) = addr_file {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match std::fs::write(path, format!("{local}\n")) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                eprintln!(
+                                    "{} could not write {}: {e}",
+                                    "⚠".yellow(),
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+
+                    eprintln!(
+                        "trusty-search v{} — HTTP admin panel: http://{}",
+                        env!("CARGO_PKG_VERSION"),
+                        local,
+                    );
+                    eprintln!(
+                        "{} MCP HTTP/SSE on {} → daemon {}",
+                        "◉".green(),
+                        local.to_string().cyan(),
+                        daemon_url.dimmed()
+                    );
+
+                    let app = trusty_search_mcp::sse::router(server);
+                    let serve_result = axum::serve(listener, app).await;
+
+                    // Clean up the discovery file regardless of the serve
+                    // outcome so a crashed `serve` doesn't leave a stale
+                    // pointer.
+                    if let Some(path) = addr_file {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    serve_result?;
+                }
+                None => {
+                    eprintln!(
+                        "{} MCP stdio (no HTTP) → daemon {}",
+                        "◉".green(),
+                        daemon_url.dimmed()
+                    );
+                    trusty_search_mcp::stdio::run(server).await?;
+                }
             }
+        }
+
+        Commands::Service { action } => {
+            run_service_action(&action)?;
+        }
+
+        Commands::Dashboard => {
+            run_dashboard()?;
         }
 
         Commands::Convert {
