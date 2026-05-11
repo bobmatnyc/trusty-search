@@ -27,6 +27,8 @@ redb = "2.6"
 
 # Embedding (extracted to shared crate)
 trusty-embedder = { workspace = true, features = ["test-support"] }
+# Shared entity types (no tree-sitter dep)
+trusty-contracts = { workspace = true }
 
 # Code parsing
 tree-sitter = "0.24"

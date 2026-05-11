@@ -4781,6 +4781,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusty-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "trusty-embedder"
 version = "0.1.1"
 dependencies = [
@@ -4880,6 +4888,7 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-swift",
  "tree-sitter-typescript",
+ "trusty-contracts",
  "trusty-embedder",
  "usearch",
  "uuid",

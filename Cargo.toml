@@ -33,6 +33,7 @@ libc = "0.2"
 trusty-mcp-core = { version = "0.1.0" }
 trusty-embedder = { version = "0.1.1" }
 trusty-common = { version = "0.1.2" }
+trusty-contracts = { version = "0.1.0" }
 
 # Local development override: use the in-tree `../trusty-common` workspace so
 # unreleased changes are picked up without a release cycle. Cargo requires
@@ -50,6 +51,7 @@ trusty-common = { version = "0.1.2" }
 trusty-common = { path = "../trusty-common/crates/trusty-common" }
 trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
 trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+trusty-contracts = { path = "../trusty-common/crates/trusty-contracts" }
 
 [package]
 name = "trusty-search"

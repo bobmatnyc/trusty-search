@@ -14,165 +14,20 @@
 //! which round-trips a Rust source string through `chunk_ast` and asserts the
 //! `NamedType` set.
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Tree};
 
-/// Taxonomy of program entities surfaced from the AST.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum EntityType {
-    /// Type identifiers (`Arc`, `Vec`, `CodeChunk`, …).
-    NamedType,
-    /// Trait bound expressions (`Send + Sync`, `Serialize`, …).
-    TraitBound,
-    /// Module paths (`crate::indexer::CodeIndexer`, `std::sync::Arc`).
-    ModulePath,
-    /// Error/panic call sites: `bail!`, `anyhow!`, `panic!`, `unwrap`.
-    ErrorVariant,
-    /// Identifiers referenced from `#[test]` function bodies.
-    TestRelation,
-    /// Doc-comment derived concept (NLP phrase / keyword).
-    DocConcept,
-    /// Attribute annotations (`#[derive(...)]`, `#[cfg(...)]`).
-    Annotation,
-    /// String literals longer than 10 characters.
-    LiteralString,
-    /// `type Foo = Bar` aliases.
-    TypeAlias,
-    /// Top-level `const`/`static` symbol.
-    ConstantSymbol,
-    /// Top-level `use` of a non-stdlib, non-self/super/crate path.
-    ExternalCrate,
-    /// Cluster of co-occurring concepts (Phase C).
-    ConceptCluster,
-    /// Free-form natural-language phrase pulled from docs/comments.
-    NaturalLanguagePhrase,
-}
-
-impl EntityType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::NamedType => "NamedType",
-            Self::TraitBound => "TraitBound",
-            Self::ModulePath => "ModulePath",
-            Self::ErrorVariant => "ErrorVariant",
-            Self::TestRelation => "TestRelation",
-            Self::DocConcept => "DocConcept",
-            Self::Annotation => "Annotation",
-            Self::LiteralString => "LiteralString",
-            Self::TypeAlias => "TypeAlias",
-            Self::ConstantSymbol => "ConstantSymbol",
-            Self::ExternalCrate => "ExternalCrate",
-            Self::ConceptCluster => "ConceptCluster",
-            Self::NaturalLanguagePhrase => "NaturalLanguagePhrase",
-        }
-    }
-}
-
-/// Edge kinds for the `SymbolGraph` knowledge graph.
-///
-/// Phase A = structural (tree-sitter derived)
-/// Phase B = test-relation
-/// Phase C = doc/concept
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum EdgeKind {
-    // Call graph
-    /// Caller → callee.
-    CallsFunction,
-    /// Callee → caller (reverse index of `CallsFunction`).
-    CalledByFunction,
-    // Phase A — structural
-    Implements,
-    UsesType,
-    Derives,
-    ModuleContains,
-    ReExports,
-    RaisesError,
-    Configures,
-    // Phase B — test relations
-    TestedBy,
-    TestUsesFixture,
-    CoOccursInTest,
-    // Phase C — docs / concepts
-    Documents,
-    ReferencesConcept,
-    Aliases,
-    ErrorDescribes,
-}
-
-impl EdgeKind {
-    /// Score multiplier for KG expansion. Higher = more relevant when ranking
-    /// neighbours discovered by walking this edge.
-    pub fn score_multiplier(&self) -> f32 {
-        match self {
-            EdgeKind::Implements => 0.85,
-            EdgeKind::UsesType => 0.75,
-            EdgeKind::TestedBy => 0.80,
-            EdgeKind::Documents => 0.65,
-            EdgeKind::ReferencesConcept => 0.60,
-            // Remaining edges use the legacy flat KG-expansion multiplier.
-            _ => 0.70,
-        }
-    }
-}
+// The data shapes (EntityType, EdgeKind, RawEntity, fact_hash_str, tables)
+// live in `trusty-contracts` so analyzer crates can consume them without
+// pulling in the 16 tree-sitter language grammars below. Tree-sitter–driven
+// extraction stays here.
+pub use trusty_contracts::{fact_hash_str, EdgeKind, EntityType, RawEntity};
 
 /// redb table name constants for entity storage.
+///
+/// Re-exported from `trusty-contracts::tables` for backward compatibility with
+/// existing `crate::entity::tables::*` call sites.
 pub mod tables {
-    /// `entity_id (str) -> RawEntity (bincode/json)`
-    pub const ENTITIES: &str = "entities";
-    /// `(from_entity_id, edge_kind, to_entity_id) -> ()`
-    pub const ENTITY_EDGES: &str = "entity_edges";
-    /// `chunk_id -> Vec<entity_id>`
-    pub const CHUNK_ENTITIES: &str = "chunk_entities";
-    /// `entity_id -> Vec<chunk_id>` (reverse index of `CHUNK_ENTITIES`)
-    pub const ENTITY_CHUNKS: &str = "entity_chunks";
-}
-
-/// One extracted entity, anchored to a byte span and source line.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawEntity {
-    /// Stable hash of (entity_type, text, file).
-    pub id: String,
-    pub entity_type: EntityType,
-    pub text: String,
-    pub span: (usize, usize),
-    pub file: String,
-    pub line: usize,
-}
-
-impl RawEntity {
-    fn new(
-        entity_type: EntityType,
-        text: String,
-        span: (usize, usize),
-        file: &str,
-        line: usize,
-    ) -> Self {
-        let mut h = Sha256::new();
-        h.update(entity_type.as_str().as_bytes());
-        h.update(b"\0");
-        h.update(text.as_bytes());
-        h.update(b"\0");
-        h.update(file.as_bytes());
-        let id = format!("{:x}", h.finalize());
-        Self {
-            id,
-            entity_type,
-            text,
-            span,
-            file: file.to_string(),
-            line,
-        }
-    }
-}
-
-/// Short, stable hex hash of a string. Used by ingest sources (e.g. SCIP) to
-/// derive readable, collision-resistant entity IDs from opaque symbol strings.
-pub fn fact_hash_str(s: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:08x}", h.finish())
+    pub use trusty_contracts::tables::*;
 }
 
 /// Slice the source text for a node and return it as an owned string.
