@@ -9,3 +9,11 @@ trusty-search.pid
 # fastembed model cache (large, auto-downloaded)
 .fastembed_cache/
 **/.fastembed_cache/
+
+# Local tooling
+.claude-mpm/
+.claude/settings.local.json
+.mcp-vector-search/
+.mcp.json
+.trusty-search
+.env
