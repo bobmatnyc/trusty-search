@@ -686,11 +686,7 @@ impl ReindexUi {
     }
 
     fn update_stats(&self, indexed: u64, total_chunks: u64, skipped: u64, elapsed_secs: u64) {
-        let files_per_sec = if elapsed_secs > 0 {
-            indexed / elapsed_secs
-        } else {
-            0
-        };
+        let files_per_sec = indexed.checked_div(elapsed_secs).unwrap_or(0);
         self.stats.set_message(format!(
             "Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}",
             chunks = format_with_commas(total_chunks),
@@ -879,7 +875,7 @@ async fn run_reindex_with(
                 let indexed = indexed_now.load(Ordering::Acquire);
                 let chunks = chunks_now.load(Ordering::Acquire);
                 let skipped = skipped_now.load(Ordering::Acquire);
-                let fps = if elapsed > 0 { indexed / elapsed } else { 0 };
+                let fps = indexed.checked_div(elapsed).unwrap_or(0);
                 let total = files_bar.length().unwrap_or(0);
                 let eta = if fps > 0 && total > indexed {
                     fmt_secs((total - indexed) / fps)
