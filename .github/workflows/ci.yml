@@ -1,6 +1,36 @@
 name: CI
 on: [push, pull_request]
 jobs:
+  ui-dist-check:
+    name: Verify ui-dist is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Build Svelte UI
+        working-directory: ui
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm install
+          fi
+          pnpm build
+      - name: Diff ui/dist against crates/trusty-search-service/ui-dist
+        run: |
+          if diff -rq --exclude="*.map" ui/dist crates/trusty-search-service/ui-dist; then
+            echo "ui-dist is up to date"
+          else
+            echo "ERROR: ui-dist is stale. Run 'make release-prep' and commit the result." >&2
+            exit 1
+          fi
   ci:
     strategy:
       matrix:

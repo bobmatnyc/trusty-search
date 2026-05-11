@@ -530,6 +530,33 @@ cargo run -- query "fn authenticate" --index myproject
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+### Release Process
+
+Before publishing to crates.io, the Svelte admin UI must be built and synced
+into `crates/trusty-search-service/ui-dist/` so `include_dir!` embeds the
+latest bundle. `cargo publish` cannot reach files outside the crate tarball,
+so the sync step is mandatory.
+
+```bash
+make release-prep                              # build ui/ and copy dist → crates/trusty-search-service/ui-dist/
+cargo publish -p trusty-search-core
+cargo publish -p trusty-search-service
+cargo publish -p trusty-search-mcp
+cargo publish                                  # root binary crate
+```
+
+`make release-prep` runs `pnpm install --frozen-lockfile && pnpm build` (or
+the npm equivalent) and then mirrors `ui/dist/` into the service crate's
+`ui-dist/`. CI fails if `ui-dist/` is stale relative to a fresh build (see
+`.github/workflows/ci.yml` → `ui-dist-check` job).
+
+When the Rust build runs after the JS step is already done (CI publish flow),
+set `SKIP_UI_BUILD=1` to skip `build.rs`'s embedded UI build:
+
+```bash
+SKIP_UI_BUILD=1 cargo publish -p trusty-search-service
+```
+
 ### GPU-accelerated embedding (CUDA, optional)
 
 Default builds and installs are CPU-only and require no GPU drivers. To enable

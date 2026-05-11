@@ -45,6 +45,16 @@ fn main() {
 
     if std::env::var("SKIP_UI_BUILD").as_deref() == Ok("1") {
         println!("cargo:warning=SKIP_UI_BUILD=1 — skipping Svelte UI build");
+        // When skipping the build, the embedded ui-dist/ must already be
+        // populated (typically by `make release-prep` before `cargo publish`).
+        // Warn loudly if it is missing or empty so stale releases are caught.
+        let crate_ui_dist = Path::new(&manifest_dir).join("ui-dist");
+        if !crate_ui_dist.join("index.html").exists() {
+            println!(
+                "cargo:warning=ui-dist/ is missing or empty. Run `make release-prep` \
+                 to build and sync the Svelte UI before publishing."
+            );
+        }
         ensure_dist_placeholder(&dist_dir);
         return;
     }
