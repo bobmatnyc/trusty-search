@@ -302,39 +302,16 @@ Paginated enumeration of all chunks in stable `(file, start_line)` order.
   }
   ```
 
-##### `GET /indexes/:id/complexity_hotspots?top_n=`
+##### Complexity / smells / quality endpoints
 
-Top-N chunks by cyclomatic complexity.
-
-- **Query params**: `top_n` (optional, default `20`).
-- **Response 200**:
-  ```json
-  { "index_id": "my-project", "top_n": 20, "hotspots": [/* CodeChunk[] */] }
-  ```
-
-##### `GET /indexes/:id/smells`
-
-Chunks with one or more code-smell findings.
-
-- **Response 200**:
-  ```json
-  { "index_id": "my-project", "count": 42, "chunks": [/* CodeChunk[] */] }
-  ```
-
-##### `GET /indexes/:id/quality`
-
-Aggregate quality grade for the index.
-
-- **Response 200**:
-  ```json
-  {
-    "index_id": "my-project",
-    "chunk_count": 14823,
-    "avg_cyclomatic": 4.2,
-    "grade_a_pct": 62.1,
-    "smell_count": 412
-  }
-  ```
+> **Moved to trusty-analyzer (issue #71).** As of v0.2.0, `CodeChunk` no longer
+> carries `complexity_score`, `complexity`, or `blame` fields. Complexity
+> hotspots, code-smell findings, and aggregate quality grades are now served by
+> the standalone **trusty-analyzer** service, which owns the canonical
+> cyclomatic / Halstead / cognitive metrics and git-blame integration. The
+> previous `GET /indexes/:id/complexity_hotspots`, `GET /indexes/:id/smells`,
+> and `GET /indexes/:id/quality` endpoints are not implemented in
+> trusty-search.
 
 ##### `GET /facts?subject=&predicate=&object=`
 

@@ -79,10 +79,7 @@ fn merge_chunks(a: CodeChunk, b: CodeChunk) -> CodeChunk {
         chunk_type: primary.chunk_type,
         calls: primary.calls,
         inherits_from: primary.inherits_from,
-        complexity_score: primary.complexity_score,
         chunk_depth: primary.chunk_depth,
-        blame: primary.blame,
-        complexity: primary.complexity,
         index_id: primary.index_id,
     }
 }
@@ -181,10 +178,7 @@ fn placeholder_chunk() -> CodeChunk {
         chunk_type: Default::default(),
         calls: Vec::new(),
         inherits_from: Vec::new(),
-        complexity_score: 0,
         chunk_depth: 0,
-        blame: None,
-        complexity: Default::default(),
         index_id: None,
     }
 }
@@ -266,10 +260,7 @@ mod tests {
             chunk_type: Default::default(),
             calls: vec![],
             inherits_from: vec![],
-            complexity_score: 0,
             chunk_depth: 0,
-            blame: None,
-            complexity: Default::default(),
             index_id: None,
         }
     }

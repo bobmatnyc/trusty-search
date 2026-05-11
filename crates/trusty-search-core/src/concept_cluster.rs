@@ -252,7 +252,6 @@ pub async fn cluster_concepts_from_contents<E: crate::embed::Embedder + ?Sized>(
 mod tests {
     use super::*;
     use crate::chunker::ChunkType;
-    use crate::complexity::ComplexityMetrics;
     use crate::embed::MockEmbedder;
     use crate::indexer::CodeChunk;
 
@@ -271,10 +270,7 @@ mod tests {
             chunk_type: ChunkType::Code,
             calls: vec![],
             inherits_from: vec![],
-            complexity_score: 0,
             chunk_depth: 0,
-            blame: None,
-            complexity: ComplexityMetrics::default(),
             index_id: None,
         }
     }

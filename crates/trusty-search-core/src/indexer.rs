@@ -87,22 +87,13 @@ pub struct CodeChunk {
     /// Parent type names this chunk's type inherits from / implements.
     #[serde(default)]
     pub inherits_from: Vec<String>,
-    /// Halstead-proxy complexity: unique operator + operand count over `content`.
-    /// Zero when not computable.
-    #[serde(default)]
-    pub complexity_score: u32,
     /// Nesting depth of this chunk in the file's AST (0 = top-level).
     #[serde(default)]
     pub chunk_depth: u8,
 
-    // Issue #30 — git blame metadata for temporal decay scoring. Optional so
-    // non-git workflows and older serialized payloads round-trip cleanly.
-    #[serde(default)]
-    pub blame: Option<crate::blame::ChunkBlame>,
-
-    // Issue #32 — per-chunk complexity & code-quality metrics.
-    #[serde(default)]
-    pub complexity: crate::complexity::ComplexityMetrics,
+    // Note: complexity metrics and git blame metadata are now owned by
+    // trusty-analyzer (issue #71). Removing them here keeps `CodeChunk` lean
+    // and avoids duplicating canonical computation.
 
     // Issue #10 — cross-project search fan-out: when a chunk is returned by
     // the global `POST /search` endpoint (or `search_all` MCP tool), this is
@@ -110,28 +101,6 @@ pub struct CodeChunk {
     // search responses so older clients round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_id: Option<String>,
-}
-
-/// Halstead-proxy complexity score: unique alphanumeric identifiers (operands)
-/// plus unique single-char operator symbols. Cheap, no AST required.
-fn compute_complexity(content: &str) -> u32 {
-    use std::collections::HashSet;
-    let mut operands: HashSet<&str> = HashSet::new();
-    for tok in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if !tok.is_empty() {
-            operands.insert(tok);
-        }
-    }
-    let mut operators: HashSet<char> = HashSet::new();
-    for c in content.chars() {
-        if matches!(
-            c,
-            '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '&' | '|' | '!' | '^' | '?' | ':'
-        ) {
-            operators.insert(c);
-        }
-    }
-    (operands.len() + operators.len()) as u32
 }
 
 /// Query parameters for hybrid search.
@@ -179,8 +148,7 @@ fn build_compact_snippet(content: &str) -> String {
 /// `enumerate_chunks`, the `search` materialization tail) used to inline the
 /// same 18-field struct literal. Consolidating them removes ~60 lines of
 /// duplication and the inevitable per-site drift when new fields are added.
-/// What: clones every metadata field, derives `chunk_depth` (clamped to u8)
-/// and `complexity_score`/`complexity` from the chunk content.
+/// What: clones every metadata field and derives `chunk_depth` (clamped to u8).
 /// Test: covered indirectly by every search/materialization test in this file.
 fn raw_to_code_chunk(
     raw: &RawChunk,
@@ -203,10 +171,7 @@ fn raw_to_code_chunk(
         chunk_type: raw.chunk_type.clone(),
         calls: raw.calls.clone(),
         inherits_from: raw.inherits_from.clone(),
-        complexity_score: compute_complexity(&raw.content),
         chunk_depth,
-        blame: None,
-        complexity: crate::complexity::compute_complexity(&raw.content),
         index_id: None,
     }
 }
