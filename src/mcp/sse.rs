@@ -13,7 +13,7 @@
 //! Test: smoke-tested in tests by binding to an ephemeral port; full SSE
 //! semantics are exercised by Claude Code's MCP harness in CI.
 
-use crate::tools::{McpServer, Request, Response};
+use crate::mcp::tools::{McpServer, Request, Response};
 use axum::{
     extract::State,
     response::{

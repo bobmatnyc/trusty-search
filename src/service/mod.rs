@@ -1,4 +1,5 @@
 pub mod client;
+pub mod config;
 pub mod daemon;
 pub mod indexed_files;
 pub mod reindex;
@@ -8,6 +9,7 @@ pub mod walker;
 pub mod watch_loop;
 pub mod watcher;
 
+pub use config::{load_user_config, LoadedUserConfig};
 pub use daemon::{
     daemon_lock_path, daemon_port_path, http_addr_path, is_already_running, run_daemon,
     running_daemon_pid, DaemonError, DaemonHandle,

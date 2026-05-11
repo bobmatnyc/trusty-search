@@ -27,7 +27,7 @@ pub async fn handle_serve(no_http: bool, port: u16, http: Option<String>) -> Res
         Some(format!("127.0.0.1:{port}"))
     };
 
-    let server = trusty_search_mcp::McpServer::new(daemon_url.clone());
+    let server = crate::mcp::McpServer::new(daemon_url.clone());
 
     match bind_addr {
         Some(addr) => serve_http(server, addr, &daemon_url).await,
@@ -37,7 +37,7 @@ pub async fn handle_serve(no_http: bool, port: u16, http: Option<String>) -> Res
                 "◉".green(),
                 daemon_url.dimmed()
             );
-            trusty_search_mcp::stdio::run(server).await?;
+            crate::mcp::stdio::run(server).await?;
             Ok(())
         }
     }
@@ -45,11 +45,7 @@ pub async fn handle_serve(no_http: bool, port: u16, http: Option<String>) -> Res
 
 /// Run the MCP HTTP/SSE listener on `addr`. Writes the discovery file before
 /// serving and removes it on exit (clean or crashed).
-async fn serve_http(
-    server: trusty_search_mcp::McpServer,
-    addr: String,
-    daemon_url: &str,
-) -> Result<()> {
+async fn serve_http(server: crate::mcp::McpServer, addr: String, daemon_url: &str) -> Result<()> {
     // Bind first so we can report the OS-chosen port when 0.
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local = listener.local_addr()?;
@@ -79,7 +75,7 @@ async fn serve_http(
         daemon_url.dimmed()
     );
 
-    let app = trusty_search_mcp::sse::router(server);
+    let app = crate::mcp::sse::router(server);
     let serve_result = axum::serve(listener, app).await;
 
     // Clean up the discovery file regardless of the serve outcome so a

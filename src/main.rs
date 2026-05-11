@@ -18,6 +18,11 @@ mod commands;
 mod detect;
 mod doctor;
 
+// Re-export the library's modules into the binary's `crate::` namespace so
+// existing `crate::core::*` / `crate::service::*` / `crate::mcp::*` imports
+// in `commands/*.rs` resolve without churn after the workspace consolidation.
+pub(crate) use trusty_search::{core, mcp, service};
+
 pub(crate) use doctor::run_doctor_checks;
 
 use anyhow::Result;
@@ -419,7 +424,7 @@ enum Commands {
 
 /// Why: Allow users to override `QueryClassifier`'s automatic intent detection
 /// when they know the intent up-front (e.g. searching for TODO comments).
-/// What: Mirrors `trusty_search_core::QueryIntent` for the CLI surface.
+/// What: Mirrors `crate::core::QueryIntent` for the CLI surface.
 /// Test: `cargo run -- search foo --intent conceptual --help` parses without error.
 #[derive(Debug, Clone, ValueEnum)]
 enum IntentArg {
@@ -532,7 +537,7 @@ fn read_http_addr_file() -> Option<String> {
 }
 
 /// Path to `~/.trusty-search/http_addr` — the canonical address-discovery
-/// file. Mirrors `trusty_search_service::daemon::http_addr_path` so the CLI
+/// file. Mirrors `crate::service::daemon::http_addr_path` so the CLI
 /// doesn't need to depend on the service crate for path resolution.
 fn http_addr_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".trusty-search").join("http_addr"))
@@ -572,7 +577,7 @@ async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
     let client = trusty_common::server::daemon_http_client()?;
 
     if path.is_dir() {
-        let walk = trusty_search_service::walker::walk_source_files(path);
+        let walk = crate::service::walker::walk_source_files(path);
         println!(
             "{} [{}] indexing {} files under {}",
             "→".cyan(),

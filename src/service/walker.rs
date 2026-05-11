@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 ///
 /// Source code is parsed with tree-sitter (AST-aware chunking). Structured
 /// documents (md, yaml, toml, json, xml, txt, log) are handled by the
-/// format-aware document chunkers in `trusty_search_core::chunker`.
+/// format-aware document chunkers in `crate::core::chunker`.
 /// Java-heavy build files (`.gradle`, `.groovy`) fall back to the
 /// sliding-window chunker since their tree-sitter grammars aren't compiled in.
 #[rustfmt::skip]

@@ -17,9 +17,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use trusty_search_core::indexer::{CodeChunk, CodeIndexer, SearchQuery};
-use trusty_search_core::store::{UsearchStore, VectorStore};
-use trusty_search_core::{Embedder, FastEmbedder};
+use trusty_search::core::indexer::{CodeChunk, CodeIndexer, SearchQuery};
+use trusty_search::core::store::{UsearchStore, VectorStore};
+use trusty_search::core::{Embedder, FastEmbedder};
 
 // ---------------------------------------------------------------------------
 // Query corpora — `(query_text, expected_substring)`. The substring is matched

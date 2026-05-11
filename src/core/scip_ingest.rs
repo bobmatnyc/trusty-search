@@ -18,7 +18,7 @@
 //! trait + `from_refs` constructor is the load-bearing surface; native
 //! `.scip` decode can be added later without changing this API.
 
-use crate::entity::{fact_hash_str, EdgeKind, EntityType, RawEntity};
+use crate::core::entity::{fact_hash_str, EdgeKind, EntityType, RawEntity};
 
 /// A cross-file entity reference materialised from a SCIP document.
 ///

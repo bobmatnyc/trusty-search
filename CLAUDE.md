@@ -460,21 +460,36 @@ When integrating into open-mpm, only one cut is needed:
 
 Everything else (the orchestrator, agent runners, REPL, ctrl) stays in open-mpm.
 
-## Workspace Layout
+## Crate Layout
+
+As of v0.3.0, `trusty-search` is a **single crate** with both `[lib]` and
+`[[bin]]` targets — the previous `trusty-search-core` / `-service` / `-mcp`
+sub-crates were consolidated into three sibling modules under `src/`. The
+library target (`trusty_search`) re-publishes `core`, `service`, and `mcp` so
+integration tests and downstream consumers can reach the internal APIs.
 
 ```
 trusty-search/
-├── Cargo.toml                       workspace + bin manifest
+├── Cargo.toml                       single-crate manifest (lib + bin)
+├── build.rs                         Svelte UI build wrapper
+├── ui/                              Svelte 5 admin UI sources
+├── ui-dist/                         compiled UI bundle (embedded via include_dir!)
 ├── CLAUDE.md                        this file
 ├── CHANGELOG.md
 ├── README.md
 ├── .open-mpm/agents/                pm.toml, engineer.toml
-├── crates/
-│   ├── trusty-search-core/          CodeIndexer, BM25, HNSW, chunking, classifier
-│   ├── trusty-search-service/       axum daemon, FileWatcher, client, Svelte UI
-│   └── trusty-search-mcp/           MCP server (stdio + HTTP/SSE)
-├── src/main.rs                      CLI binary
-└── tests/integration_tests.rs
+├── src/
+│   ├── lib.rs                       re-publishes `core`, `service`, `mcp`
+│   ├── main.rs                      CLI binary entry point
+│   ├── commands/                    per-subcommand handlers
+│   ├── detect.rs                    project auto-detection
+│   ├── doctor.rs                    diagnostic checks
+│   ├── core/                        CodeIndexer, BM25, HNSW, chunking, classifier
+│   ├── service/                     axum daemon, FileWatcher, client, Svelte UI
+│   └── mcp/                         MCP server (stdio + HTTP/SSE)
+└── tests/
+    ├── integration_tests.rs         imports `trusty_search::core::*`
+    └── benchmark_harness.rs         MRR@5 / Recall@10 quality bench
 ```
 
 ### Shared Crates (external, `../trusty-common`)
@@ -510,20 +525,17 @@ cargo clippy --all-targets --all-features -- -D warnings
 ### Release Process
 
 Before publishing to crates.io, the Svelte admin UI must be built and synced
-into `crates/trusty-search-service/ui-dist/` so `include_dir!` embeds the
-latest bundle. `cargo publish` cannot reach files outside the crate tarball,
-so the sync step is mandatory.
+into the crate-root `ui-dist/` so `include_dir!` embeds the latest bundle.
+`cargo publish` cannot reach files outside the crate tarball, so the sync
+step is mandatory.
 
 ```bash
-make release-prep                              # build ui/ and copy dist → crates/trusty-search-service/ui-dist/
-cargo publish -p trusty-search-core
-cargo publish -p trusty-search-service
-cargo publish -p trusty-search-mcp
-cargo publish                                  # root binary crate
+make release-prep                              # build ui/ and copy dist → ui-dist/
+cargo publish                                  # single crate (lib + bin)
 ```
 
 `make release-prep` runs `pnpm install --frozen-lockfile && pnpm build` (or
-the npm equivalent) and then mirrors `ui/dist/` into the service crate's
+the npm equivalent) and then mirrors `ui/dist/` into the crate-root
 `ui-dist/`. CI fails if `ui-dist/` is stale relative to a fresh build (see
 `.github/workflows/ci.yml` → `ui-dist-check` job).
 
@@ -531,7 +543,7 @@ When the Rust build runs after the JS step is already done (CI publish flow),
 set `SKIP_UI_BUILD=1` to skip `build.rs`'s embedded UI build:
 
 ```bash
-SKIP_UI_BUILD=1 cargo publish -p trusty-search-service
+SKIP_UI_BUILD=1 cargo publish
 ```
 
 ### GPU-accelerated embedding (CUDA, optional)

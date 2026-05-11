@@ -25,23 +25,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // CARGO_MANIFEST_DIR is `<workspace>/crates/trusty-search-service` —
-    // walk up two parents to reach the workspace root, where `ui/` lives.
+    // CARGO_MANIFEST_DIR is the crate root (= workspace root after
+    // consolidation), where `ui/` lives directly underneath.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let workspace_root = Path::new(&manifest_dir)
-        .parent()
-        .and_then(Path::parent)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&manifest_dir));
+    let workspace_root = PathBuf::from(&manifest_dir);
     let ui_dir = workspace_root.join("ui");
     let dist_dir = ui_dir.join("dist");
     let pkg_json = ui_dir.join("package.json");
 
     println!("cargo:rerun-if-env-changed=SKIP_UI_BUILD");
-    println!("cargo:rerun-if-changed=../../ui/package.json");
-    println!("cargo:rerun-if-changed=../../ui/vite.config.js");
-    println!("cargo:rerun-if-changed=../../ui/index.html");
-    println!("cargo:rerun-if-changed=../../ui/src");
+    println!("cargo:rerun-if-changed=ui/package.json");
+    println!("cargo:rerun-if-changed=ui/vite.config.js");
+    println!("cargo:rerun-if-changed=ui/index.html");
+    println!("cargo:rerun-if-changed=ui/src");
 
     if std::env::var("SKIP_UI_BUILD").as_deref() == Ok("1") {
         println!("cargo:warning=SKIP_UI_BUILD=1 — skipping Svelte UI build");

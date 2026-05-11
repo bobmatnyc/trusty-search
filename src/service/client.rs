@@ -1,5 +1,5 @@
+use crate::core::indexer::{CodeChunk, SearchQuery};
 use anyhow::Result;
-use trusty_search_core::indexer::{CodeChunk, SearchQuery};
 
 /// HTTP client for the trusty-search daemon.
 pub struct SearchClient {

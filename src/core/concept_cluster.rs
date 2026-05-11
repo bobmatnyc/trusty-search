@@ -19,7 +19,7 @@
 
 use ndarray::{Array1, Array2};
 
-use crate::entity::{EntityType, RawEntity};
+use crate::core::entity::{EntityType, RawEntity};
 
 /// Vocabulary seed for cluster labeling (nearest-centroid wins).
 ///
@@ -74,7 +74,7 @@ fn doc_comment(content: &str) -> Option<String> {
     }
 }
 
-use crate::mmr::cosine_similarity as cosine;
+use crate::core::mmr::cosine_similarity as cosine;
 
 /// Slugify a label for use in stable entity ids: lowercase ASCII, non-alnum → `-`.
 fn slugify(s: &str) -> String {
@@ -156,8 +156,8 @@ fn kmeans_cluster(embeddings: &[Vec<f32>], k: usize) -> Option<(Vec<Vec<f32>>, V
 /// Returns an empty vec if fewer than [`MIN_DOC_STRINGS`] doc strings are
 /// found (insufficient signal to cluster).
 pub async fn cluster_concepts(
-    chunks: &[crate::indexer::CodeChunk],
-    embedder: &crate::embed::FastEmbedder,
+    chunks: &[crate::core::indexer::CodeChunk],
+    embedder: &crate::core::embed::FastEmbedder,
     file: &str,
 ) -> Vec<RawEntity> {
     let contents: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
@@ -165,9 +165,9 @@ pub async fn cluster_concepts(
 }
 
 /// As [`cluster_concepts`] but accepts raw `&str` content slices, so callers
-/// holding [`crate::chunker::RawChunk`] (the indexing path) don't need to
-/// materialise full [`crate::indexer::CodeChunk`] values just to cluster.
-pub async fn cluster_concepts_from_contents<E: crate::embed::Embedder + ?Sized>(
+/// holding [`crate::core::chunker::RawChunk`] (the indexing path) don't need to
+/// materialise full [`crate::core::indexer::CodeChunk`] values just to cluster.
+pub async fn cluster_concepts_from_contents<E: crate::core::embed::Embedder + ?Sized>(
     contents: &[&str],
     embedder: &E,
     file: &str,
@@ -251,9 +251,9 @@ pub async fn cluster_concepts_from_contents<E: crate::embed::Embedder + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::ChunkType;
-    use crate::embed::MockEmbedder;
-    use crate::indexer::CodeChunk;
+    use crate::core::chunker::ChunkType;
+    use crate::core::embed::MockEmbedder;
+    use crate::core::indexer::CodeChunk;
 
     fn chunk_with(content: &str) -> CodeChunk {
         CodeChunk {

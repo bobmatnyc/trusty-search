@@ -25,14 +25,14 @@ use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::bm25::Bm25Index;
-use crate::chunker::{chunk_ast, ChunkType, RawChunk};
-use crate::classifier::{QueryClassifier, QueryIntent};
-use crate::embed::Embedder;
-use crate::entity::{EdgeKind, EntityType, RawEntity};
-use crate::search::rrf::{rrf_fuse, RRF_K};
-use crate::store::VectorStore;
-use crate::symbol_graph::{ChunkTuple, SymbolGraph};
+use crate::core::bm25::Bm25Index;
+use crate::core::chunker::{chunk_ast, ChunkType, RawChunk};
+use crate::core::classifier::{QueryClassifier, QueryIntent};
+use crate::core::embed::Embedder;
+use crate::core::entity::{EdgeKind, EntityType, RawEntity};
+use crate::core::search::rrf::{rrf_fuse, RRF_K};
+use crate::core::store::VectorStore;
+use crate::core::symbol_graph::{ChunkTuple, SymbolGraph};
 
 /// LRU capacity (entries) for the per-indexer query embedding cache.
 const QUERY_CACHE_CAPACITY: usize = 256;
@@ -268,7 +268,7 @@ pub struct CodeIndexer {
     /// Optional ONNX NER for `NaturalLanguagePhrase` extraction from doc
     /// comments (issue #23). Always present, but inert unless both the `ner`
     /// feature is compiled in and `~/.trusty-search/models/ner.onnx` exists.
-    ner: crate::ner::NerExtractor,
+    ner: crate::core::ner::NerExtractor,
 }
 
 impl CodeIndexer {
@@ -289,7 +289,7 @@ impl CodeIndexer {
             bm25: Arc::new(RwLock::new(Bm25Index::new())),
             query_cache: Arc::new(Mutex::new(LruCache::new(cap))),
             symbol_graph: Arc::new(RwLock::new(Arc::new(SymbolGraph::new()))),
-            ner: crate::ner::NerExtractor::try_load(),
+            ner: crate::core::ner::NerExtractor::try_load(),
         }
     }
 
@@ -553,7 +553,7 @@ impl CodeIndexer {
     ) -> Vec<RawEntity> {
         // Phase D: ONNX NER over doc comments (issue #23). Gated — no-op when
         // the model file is absent.
-        let doc_text = crate::ner::extract_doc_comments(content);
+        let doc_text = crate::core::ner::extract_doc_comments(content);
         let ner_entities = self.ner.extract(&doc_text, file_path);
         if !ner_entities.is_empty() {
             tracing::debug!(
@@ -570,7 +570,7 @@ impl CodeIndexer {
         // embedder is wired and the file has enough doc comments to cluster.
         if let Some(embedder) = &self.embedder {
             let refs: Vec<&str> = chunk_contents.iter().map(|s| s.as_str()).collect();
-            let cluster_entities = crate::concept_cluster::cluster_concepts_from_contents(
+            let cluster_entities = crate::core::concept_cluster::cluster_concepts_from_contents(
                 &refs,
                 embedder.as_ref(),
                 file_path,
@@ -1236,7 +1236,12 @@ impl CodeIndexer {
         if emb_map.is_empty() {
             fused_raw
         } else {
-            crate::mmr::mmr_rerank(fused_raw, &emb_map, crate::mmr::DEFAULT_LAMBDA, top_k)
+            crate::core::mmr::mmr_rerank(
+                fused_raw,
+                &emb_map,
+                crate::core::mmr::DEFAULT_LAMBDA,
+                top_k,
+            )
         }
     }
 
@@ -1316,8 +1321,8 @@ impl CodeIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::MockEmbedder;
-    use crate::store::UsearchStore;
+    use crate::core::embed::MockEmbedder;
+    use crate::core::store::UsearchStore;
 
     fn raw(id: &str, file: &str, content: &str) -> RawChunk {
         RawChunk {
@@ -1328,7 +1333,7 @@ mod tests {
             content: content.to_string(),
             function_name: None,
             language: Some("rust".to_string()),
-            chunk_type: crate::chunker::ChunkType::Code,
+            chunk_type: crate::core::chunker::ChunkType::Code,
             calls: Vec::new(),
             inherits_from: Vec::new(),
             chunk_depth: 0,
@@ -1484,7 +1489,7 @@ mod tests {
             content: "fn login_handler() { /* dispatch to verifier */ }".to_string(),
             function_name: Some("login_handler".to_string()),
             language: Some("rust".to_string()),
-            chunk_type: crate::chunker::ChunkType::Function,
+            chunk_type: crate::core::chunker::ChunkType::Function,
             calls: vec!["authenticate".to_string()],
             inherits_from: Vec::new(),
             chunk_depth: 0,
@@ -1504,7 +1509,7 @@ mod tests {
             content: "fn authenticate() {}".to_string(),
             function_name: Some("authenticate".to_string()),
             language: Some("rust".to_string()),
-            chunk_type: crate::chunker::ChunkType::Function,
+            chunk_type: crate::core::chunker::ChunkType::Function,
             calls: Vec::new(),
             inherits_from: Vec::new(),
             chunk_depth: 0,
@@ -1563,7 +1568,7 @@ mod tests {
             content: "fn caller() { target(); }".to_string(),
             function_name: Some("caller".to_string()),
             language: Some("rust".to_string()),
-            chunk_type: crate::chunker::ChunkType::Function,
+            chunk_type: crate::core::chunker::ChunkType::Function,
             calls: vec!["target".to_string()],
             inherits_from: Vec::new(),
             chunk_depth: 0,
@@ -1583,7 +1588,7 @@ mod tests {
             content: "fn target() {}".to_string(),
             function_name: Some("target".to_string()),
             language: Some("rust".to_string()),
-            chunk_type: crate::chunker::ChunkType::Function,
+            chunk_type: crate::core::chunker::ChunkType::Function,
             calls: Vec::new(),
             inherits_from: Vec::new(),
             chunk_depth: 0,
@@ -1829,7 +1834,7 @@ mod tests {
     #[test]
     fn test_intent_routing_definitions() {
         // Sanity: intent table from CLAUDE.md is wired through.
-        use crate::classifier::QueryIntent;
+        use crate::core::classifier::QueryIntent;
         let (a, b, kg) = QueryIntent::Definition.weights();
         assert!((a - 0.3).abs() < 1e-6 && (b - 0.7).abs() < 1e-6 && !kg);
         let (a, b, kg) = QueryIntent::Usage.weights();

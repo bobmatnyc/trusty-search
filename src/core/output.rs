@@ -20,7 +20,7 @@
 //!
 //! Issue: #13.
 
-use crate::indexer::CodeChunk;
+use crate::core::indexer::CodeChunk;
 
 /// Approx chars-per-token ratio used to estimate token budget without a
 /// real tokenizer. Conservative for code (~3.5–4 chars/token typical).

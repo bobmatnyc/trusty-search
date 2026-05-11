@@ -13,7 +13,8 @@
 //!
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
-use crate::walker::{should_skip_content, walk_source_files};
+use crate::core::registry::{IndexHandle, IndexId};
+use crate::service::walker::{should_skip_content, walk_source_files};
 use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use serde::Serialize;
@@ -22,7 +23,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, Semaphore};
-use trusty_search_core::registry::{IndexHandle, IndexId};
 
 /// Machine-wide reindex serializer.
 ///
@@ -386,9 +386,9 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::indexer::CodeIndexer;
     use std::fs;
     use std::sync::atomic::Ordering;
-    use trusty_search_core::indexer::CodeIndexer;
 
     #[tokio::test]
     async fn reindex_walks_directory_and_emits_events() {

@@ -1,4 +1,4 @@
-//! Glue between [`crate::watcher::FileWatcher`] and `CodeIndexer`.
+//! Glue between [`crate::service::watcher::FileWatcher`] and `CodeIndexer`.
 //!
 //! Why: The watcher emits raw filesystem events; the indexer wants
 //! `index_file` / `remove_chunk` calls. This module bridges them and
@@ -16,15 +16,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::core::chunker::chunk_ast;
+use crate::core::CodeIndexer;
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use trusty_search_core::chunker::chunk_ast;
-use trusty_search_core::CodeIndexer;
 
-use crate::indexed_files::IndexedFiles;
-use crate::watcher::{FileWatcher, WatchEvent};
+use crate::service::indexed_files::IndexedFiles;
+use crate::service::watcher::{FileWatcher, WatchEvent};
 
 /// Handle for a running watch loop. Drop it to stop watching and join the
 /// consumer task on the next `await` boundary.

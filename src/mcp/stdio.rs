@@ -11,7 +11,7 @@
 //! Test: covered indirectly by `tools::tests` plus a smoke test in
 //! `tests/stdio.rs` that pipes a `tools/list` request through the loop.
 
-use crate::tools::McpServer;
+use crate::mcp::tools::McpServer;
 use anyhow::Result;
 use std::sync::Arc;
 

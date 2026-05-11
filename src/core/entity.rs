@@ -25,7 +25,7 @@ pub use trusty_contracts::{fact_hash_str, EdgeKind, EntityType, RawEntity};
 /// redb table name constants for entity storage.
 ///
 /// Re-exported from `trusty-contracts::tables` for backward compatibility with
-/// existing `crate::entity::tables::*` call sites.
+/// existing `crate::core::entity::tables::*` call sites.
 pub mod tables {
     pub use trusty_contracts::tables::*;
 }

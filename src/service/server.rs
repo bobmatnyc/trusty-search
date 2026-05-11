@@ -18,6 +18,13 @@
 //! Test: `cargo test -p trusty-search-service` boots the router with an
 //! in-process registry and exercises each endpoint.
 
+use crate::core::{
+    classifier::QueryClassifier,
+    embed::Embedder,
+    indexer::{CodeIndexer, SearchQuery},
+    registry::{IndexHandle, IndexId, IndexRegistry},
+    store::{UsearchStore, VectorStore},
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -34,16 +41,11 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::OnceCell;
 use tokio_stream::wrappers::BroadcastStream;
-use trusty_search_core::{
-    classifier::QueryClassifier,
-    embed::Embedder,
-    indexer::{CodeIndexer, SearchQuery},
-    registry::{IndexHandle, IndexId, IndexRegistry},
-    store::{UsearchStore, VectorStore},
-};
+use trusty_common::{ChatProvider, LocalModelConfig};
 
-use crate::reindex::{spawn_reindex, ReindexProgress, ReindexStatus};
+use crate::service::reindex::{spawn_reindex, ReindexProgress, ReindexStatus};
 
 /// Shared state injected into every axum handler.
 #[derive(Clone)]
@@ -68,6 +70,19 @@ pub struct SearchAppState {
     /// Monotonic timestamp captured when the AppState was constructed.
     /// Used to compute `uptime_secs` in the `/health` response (issue #34).
     pub started_at: Instant,
+    /// Local-model (Ollama / LM Studio / llama.cpp server) configuration loaded
+    /// from `~/.trusty-search/config.toml`. Drives `auto_detect_local_provider`
+    /// and the `/api/chat/providers` payload.
+    pub local_model: LocalModelConfig,
+    /// OpenRouter model id (loaded from config; default
+    /// `anthropic/claude-haiku-4`). Used by the OpenRouter fallback provider.
+    pub openrouter_model: String,
+    /// OpenRouter API key resolved at startup. May be empty when the user
+    /// only configured a local model; the chat handler returns 503 in that case.
+    pub openrouter_api_key: String,
+    /// Lazily-initialised active chat provider. Auto-detection happens on the
+    /// first chat call and the result is cached for the daemon's lifetime.
+    pub chat_provider: Arc<OnceCell<Option<Arc<dyn ChatProvider>>>>,
 }
 
 impl SearchAppState {
@@ -76,14 +91,67 @@ impl SearchAppState {
     /// to BM25-only mode (no embedder); use [`Self::with_embedder`] to enable
     /// the vector lane.
     pub fn new(registry: IndexRegistry) -> Self {
+        let openrouter_api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
         Self {
             registry,
             reindex_progress: Arc::new(DashMap::new()),
             embedder: None,
             daemon_port: None,
-            openrouter_enabled: std::env::var("OPENROUTER_API_KEY").is_ok(),
+            openrouter_enabled: !openrouter_api_key.is_empty(),
             started_at: Instant::now(),
+            local_model: LocalModelConfig::default(),
+            openrouter_model: "anthropic/claude-haiku-4".to_string(),
+            openrouter_api_key,
+            chat_provider: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// Builder-style: install user-loaded `local_model` settings (e.g. from
+    /// `~/.trusty-search/config.toml`). Replaces the default Ollama address.
+    pub fn with_local_model(mut self, cfg: LocalModelConfig) -> Self {
+        self.local_model = cfg;
+        self
+    }
+
+    /// Builder-style: override the OpenRouter model id (defaults to
+    /// `anthropic/claude-haiku-4`).
+    pub fn with_openrouter_model(mut self, model: impl Into<String>) -> Self {
+        self.openrouter_model = model.into();
+        self
+    }
+
+    /// Resolve the active chat provider, auto-detecting on first call.
+    ///
+    /// Why: Provider selection depends on (a) filesystem-loaded config and (b)
+    /// a network probe to a local Ollama / LM Studio instance, so it must be
+    /// lazily initialised at runtime. Caching the choice in a `OnceCell` keeps
+    /// it stable across concurrent chat requests without re-probing.
+    /// What: On first use prefers an auto-detected local server when
+    /// `local_model.enabled`, otherwise falls back to OpenRouter when an API
+    /// key is configured. Returns `None` when neither is available so the
+    /// caller can emit a 503.
+    /// Test: Covered by `chat_provider_endpoint_returns_payload` in this crate.
+    pub async fn chat_provider(&self) -> Option<Arc<dyn ChatProvider>> {
+        self.chat_provider
+            .get_or_init(|| async {
+                if self.local_model.enabled {
+                    if let Some(mut p) =
+                        trusty_common::auto_detect_local_provider(&self.local_model.base_url).await
+                    {
+                        p.model = self.local_model.model.clone();
+                        return Some(Arc::new(p) as Arc<dyn ChatProvider>);
+                    }
+                }
+                if !self.openrouter_api_key.is_empty() {
+                    return Some(Arc::new(trusty_common::OpenRouterProvider::new(
+                        self.openrouter_api_key.clone(),
+                        self.openrouter_model.clone(),
+                    )) as Arc<dyn ChatProvider>);
+                }
+                None
+            })
+            .await
+            .clone()
     }
 
     /// Builder-style: record the actual port the daemon bound. Used by
@@ -136,7 +204,9 @@ pub struct RemoveFileRequest {
 ///
 /// Wraps `state` in an `Arc` so every handler clones the pointer cheaply.
 pub fn build_router(state: SearchAppState) -> Router {
-    use crate::ui::{chat_handler, ui_asset_handler, ui_index_handler};
+    use crate::service::ui::{
+        chat_handler, list_chat_providers, ui_asset_handler, ui_index_handler,
+    };
     let router = Router::new()
         .route("/health", get(health_handler))
         .route(
@@ -148,6 +218,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/ui/", get(ui_index_handler))
         .route("/ui/{*path}", get(ui_asset_handler))
         .route("/chat", post(chat_handler))
+        .route("/api/chat/providers", get(list_chat_providers))
         .route("/search", post(global_search_handler))
         .route("/indexes/{id}/search", post(search_handler))
         .route("/indexes/{id}/search_similar", post(search_similar_handler))
@@ -308,13 +379,13 @@ async fn global_search_handler(
     State(state): State<Arc<SearchAppState>>,
     Json(req): Json<GlobalSearchRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use trusty_search_core::search::rrf::{rrf_fuse, RRF_K};
+    use crate::core::search::rrf::{rrf_fuse, RRF_K};
 
     let index_ids = state.registry.list();
     let total_indexes = index_ids.len();
     if index_ids.is_empty() {
         return Ok(Json(serde_json::json!({
-            "results": Vec::<trusty_search_core::indexer::CodeChunk>::new(),
+            "results": Vec::<crate::core::indexer::CodeChunk>::new(),
             "indexes_searched": Vec::<String>::new(),
             "total_indexes": 0_usize,
             "latency_ms": 0_u64,
@@ -355,7 +426,7 @@ async fn global_search_handler(
             }
         }
     });
-    let per_index_results: Vec<(IndexId, Vec<trusty_search_core::indexer::CodeChunk>)> =
+    let per_index_results: Vec<(IndexId, Vec<crate::core::indexer::CodeChunk>)> =
         futures::future::join_all(futures)
             .await
             .into_iter()
@@ -367,10 +438,8 @@ async fn global_search_handler(
     // ranked id lists for RRF. Namespacing is required because different
     // indexes can produce colliding chunk_ids (same relative file path in
     // two projects).
-    let mut chunk_lookup: std::collections::HashMap<
-        String,
-        trusty_search_core::indexer::CodeChunk,
-    > = std::collections::HashMap::new();
+    let mut chunk_lookup: std::collections::HashMap<String, crate::core::indexer::CodeChunk> =
+        std::collections::HashMap::new();
     let mut lanes: Vec<Vec<(String, f32)>> = Vec::with_capacity(per_index_results.len());
     let mut indexes_searched: Vec<String> = Vec::with_capacity(per_index_results.len());
     for (id, results) in per_index_results {
@@ -398,7 +467,7 @@ async fn global_search_handler(
     }
     fused.truncate(req.top_k);
 
-    let results: Vec<trusty_search_core::indexer::CodeChunk> = fused
+    let results: Vec<crate::core::indexer::CodeChunk> = fused
         .into_iter()
         .filter_map(|(id, fused_score)| {
             let mut chunk = chunk_lookup.remove(&id)?;
@@ -676,12 +745,12 @@ mod tests {
     /// Test: covers issue #34's acceptance (indexes counter + uptime_secs).
     #[tokio::test]
     async fn health_handler_reports_indexes_and_uptime() {
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
-        use trusty_search_core::{
+        use crate::core::{
             indexer::CodeIndexer,
             registry::{IndexHandle, IndexId, IndexRegistry},
         };
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
 
         let registry = IndexRegistry::new();
         let id = IndexId::new("health-test");
@@ -708,12 +777,12 @@ mod tests {
     /// as searched. BM25-only path (no embedder) keeps the test hermetic.
     #[tokio::test]
     async fn global_search_fans_out_and_merges() {
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
-        use trusty_search_core::{
+        use crate::core::{
             indexer::CodeIndexer,
             registry::{IndexHandle, IndexId, IndexRegistry},
         };
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
 
         let registry = IndexRegistry::new();
         for name in ["proj-a", "proj-b"] {
@@ -787,7 +856,7 @@ mod tests {
     /// the fan-out path checks before spawning per-index futures.
     #[tokio::test]
     async fn global_search_empty_registry_returns_empty_results() {
-        use trusty_search_core::registry::IndexRegistry;
+        use crate::core::registry::IndexRegistry;
         let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
         let Json(value) = global_search_handler(
             State(state),

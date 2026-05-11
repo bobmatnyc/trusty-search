@@ -1,7 +1,7 @@
 //! Service-level mapping from `PathBuf` → chunk IDs currently in the index.
 //!
 //! Why: `CodeIndexer` exposes `add_chunk` / `remove_chunk` keyed by chunk ID,
-//! but the [`crate::watcher::FileWatcher`] only knows file paths. We must
+//! but the [`crate::service::watcher::FileWatcher`] only knows file paths. We must
 //! remember which chunk IDs a given file produced so a subsequent
 //! `WatchEvent::Removed` can drop them. Tracking this in core would couple
 //! the indexer to filesystem semantics; keeping it at the service layer keeps
@@ -11,7 +11,7 @@
 //! Insert is `O(chunks)`; lookup is `O(1)`; takes ownership of the chunk-id
 //! list on removal so the caller can iterate without holding the lock.
 //!
-//! Test: covered indirectly via [`crate::watch_loop`] integration tests.
+//! Test: covered indirectly via [`crate::service::watch_loop`] integration tests.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

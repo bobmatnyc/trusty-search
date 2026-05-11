@@ -28,7 +28,7 @@
 //! same path errors), (c) auto-port selection when the requested port is
 //! taken.
 
-use crate::server::{build_router, SearchAppState};
+use crate::service::server::{build_router, SearchAppState};
 use fs4::FileExt;
 use std::{
     fs::{File, OpenOptions},

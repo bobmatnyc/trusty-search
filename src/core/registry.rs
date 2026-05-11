@@ -1,4 +1,4 @@
-use crate::indexer::CodeIndexer;
+use crate::core::indexer::CodeIndexer;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;

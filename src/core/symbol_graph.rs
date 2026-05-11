@@ -21,8 +21,8 @@ use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
-use crate::chunker::ChunkType;
-use crate::entity::EdgeKind;
+use crate::core::chunker::ChunkType;
+use crate::core::entity::EdgeKind;
 
 /// A node in the symbol graph. One node per defining symbol (function or method).
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Language, Node, Parser};
 
-use crate::entity::{extract_entities, RawEntity};
+use crate::core::entity::{extract_entities, RawEntity};
 
 /// Coarse classification of an AST chunk.
 ///
@@ -1521,7 +1521,7 @@ fn f() {
         let (_chunks, entities) = chunk_ast("t.rs", src);
         let named: Vec<&str> = entities
             .iter()
-            .filter(|e| e.entity_type == crate::entity::EntityType::NamedType)
+            .filter(|e| e.entity_type == crate::core::entity::EntityType::NamedType)
             .map(|e| e.text.as_str())
             .collect();
         assert!(named.contains(&"Arc"), "named_types={named:?}");
@@ -1749,7 +1749,7 @@ fn f() {}
         let (_chunks, ents) = chunk_ast("u.rs", src);
         let exts: Vec<&str> = ents
             .iter()
-            .filter(|e| e.entity_type == crate::entity::EntityType::ExternalCrate)
+            .filter(|e| e.entity_type == crate::core::entity::EntityType::ExternalCrate)
             .map(|e| e.text.as_str())
             .collect();
         assert!(exts.contains(&"usearch"), "external_crates={exts:?}");
@@ -1765,7 +1765,7 @@ fn f() -> Result<(), anyhow::Error> {
         let (_chunks, ents) = chunk_ast("e.rs", src);
         let any_err = ents
             .iter()
-            .any(|e| e.entity_type == crate::entity::EntityType::ErrorVariant);
+            .any(|e| e.entity_type == crate::core::entity::EntityType::ErrorVariant);
         assert!(
             any_err,
             "expected at least one ErrorVariant entity, got {ents:#?}"
@@ -2055,7 +2055,7 @@ class Foo extends Bar with Mixin with Other {
         // What: build the graph from two scala chunks and assert
         // `callers_of("baz")` returns the qualified method.
         // Test: integrates chunker + symbol_graph for Phase 2.
-        use crate::symbol_graph::SymbolGraph;
+        use crate::core::symbol_graph::SymbolGraph;
         let src = r#"
 class Foo {
   def bar(): Unit = baz()
@@ -2197,7 +2197,7 @@ interface Child extends P1, P2 {}
         // Why: end-to-end Phase 2 integration: chunker → symbol_graph yields
         // a usable PHP caller→callee edge for KG expansion.
         // What: assert `callers_of("helper")` returns `Foo::doIt`.
-        use crate::symbol_graph::SymbolGraph;
+        use crate::core::symbol_graph::SymbolGraph;
         let src = r#"<?php
 class Foo {
     public function doIt(): void {

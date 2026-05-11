@@ -26,8 +26,8 @@ use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::server::SearchAppState;
-use trusty_common::{openrouter_chat, ChatMessage as CommonChatMessage};
+use crate::service::server::SearchAppState;
+use trusty_common::{ChatEvent, ChatMessage as CommonChatMessage};
 
 /// Why: `include_dir!` walks at compile time and embeds every byte. We point
 /// it at `ui-dist/` inside this crate's directory (committed alongside the
@@ -197,24 +197,6 @@ pub async fn chat_handler(
     State(state): State<Arc<SearchAppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    // Resolve API key: prefer env var (browser flow), fall back to body
-    // (MCP / CLI / scripted callers per issue #15).
-    let api_key = match std::env::var("OPENROUTER_API_KEY")
-        .ok()
-        .or_else(|| req.api_key.clone())
-    {
-        Some(k) if !k.is_empty() => k,
-        _ => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "OpenRouter not configured: set OPENROUTER_API_KEY or supply api_key in request body",
-                })),
-            )
-                .into_response();
-        }
-    };
-
     if req.message.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -224,10 +206,39 @@ pub async fn chat_handler(
     }
 
     let top_k = req.top_k.unwrap_or(5).max(1);
-    let model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model().to_string());
+
+    // Resolve the active provider (Ollama if detected, else OpenRouter). If the
+    // request body supplies an `api_key` AND the cached provider is unavailable
+    // or non-OpenRouter, we build a one-shot OpenRouter provider so scripted
+    // callers can override env-driven config (issue #15).
+    let provider: Arc<dyn trusty_common::ChatProvider> = match state.chat_provider().await {
+        Some(p) if req.api_key.as_ref().is_none_or(|k| k.is_empty()) => p,
+        _ => {
+            // Either no auto-detected provider, or caller supplied an api_key.
+            // Prefer the explicit api_key when provided.
+            let api_key = req.api_key.clone().filter(|k| !k.is_empty()).or_else(|| {
+                if state.openrouter_api_key.is_empty() {
+                    None
+                } else {
+                    Some(state.openrouter_api_key.clone())
+                }
+            });
+            let Some(api_key) = api_key else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "no chat provider available: start a local model server (Ollama / LM Studio) or set OPENROUTER_API_KEY",
+                    })),
+                )
+                    .into_response();
+            };
+            let model = req
+                .model
+                .clone()
+                .unwrap_or_else(|| state.openrouter_model.clone());
+            Arc::new(trusty_common::OpenRouterProvider::new(api_key, model))
+        }
+    };
 
     // 1. Search the index for context (best-effort — empty context is fine).
     let (context_snippet, sources) =
@@ -248,7 +259,6 @@ pub async fn chat_handler(
         req.index_id, context_snippet
     );
 
-    // Build messages in the shared `trusty_common::ChatMessage` shape.
     let mut messages: Vec<CommonChatMessage> = Vec::new();
     messages.push(CommonChatMessage {
         role: "system".into(),
@@ -271,24 +281,102 @@ pub async fn chat_handler(
         tool_calls: None,
     });
 
-    // 3. Forward to OpenRouter via the shared helper. Keeps every trusty-*
-    //    chat caller using identical headers / decoding / error semantics.
-    match openrouter_chat(&api_key, &model, messages).await {
-        // `reply` field preserved for backward compatibility with the Svelte UI;
-        // `answer`, `sources`, `model` added per issue #15 spec.
-        Ok(reply) => Json(serde_json::json!({
-            "reply": reply,
-            "answer": reply,
-            "sources": sources,
-            "model": model,
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("openrouter: {e}")})),
-        )
-            .into_response(),
+    // 3. Stream from the provider and collect deltas. The HTTP response stays
+    //    a single JSON envelope (matching the prior `openrouter_chat`
+    //    contract) — the streaming abstraction is internal. SSE streaming to
+    //    the browser can be added later without breaking existing callers.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ChatEvent>(64);
+    let provider_for_task = provider.clone();
+    let stream_task =
+        tokio::spawn(async move { provider_for_task.chat_stream(messages, vec![], tx).await });
+
+    let mut reply = String::new();
+    let mut stream_error: Option<String> = None;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            ChatEvent::Delta(d) => reply.push_str(&d),
+            // No tools wired up for trusty-search yet — model shouldn't call
+            // any since `tools` is empty, but if it does we ignore the call.
+            ChatEvent::ToolCall(_) => {}
+            ChatEvent::Done => {}
+            ChatEvent::Error(e) => stream_error = Some(e),
+        }
     }
+    match stream_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("{}: {e}", provider.name())})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("chat task join: {e}")})),
+            )
+                .into_response();
+        }
+    }
+    if let Some(e) = stream_error {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("{}: {e}", provider.name())})),
+        )
+            .into_response();
+    }
+
+    let model = provider.model().to_string();
+    Json(serde_json::json!({
+        "reply": reply,
+        "answer": reply,
+        "sources": sources,
+        "model": model,
+        "provider": provider.name(),
+    }))
+    .into_response()
+}
+
+/// GET /api/chat/providers — report provider availability + active choice.
+///
+/// Why: lets the Svelte UI (and CLI/MCP callers) show/hide the chat panel
+/// based on what's actually configured server-side. Mirrors the trusty-memory
+/// `/api/v1/chat/providers` shape so consumers can share UI code.
+/// What: probes Ollama (1s timeout) when `local_model.enabled`, checks for a
+/// non-empty OpenRouter key, and reports the active provider (lazily
+/// initialised — first call resolves it for the rest of the daemon's life).
+/// Test: integration tests build a fresh `SearchAppState` with neither
+/// provider configured and assert the endpoint returns a 200 + well-shaped
+/// JSON with `active: null`.
+pub async fn list_chat_providers(
+    State(state): State<Arc<SearchAppState>>,
+) -> Json<serde_json::Value> {
+    let ollama_available = if state.local_model.enabled {
+        trusty_common::auto_detect_local_provider(&state.local_model.base_url)
+            .await
+            .is_some()
+    } else {
+        false
+    };
+    let openrouter_available = !state.openrouter_api_key.is_empty();
+    let active = state.chat_provider().await.map(|p| p.name().to_string());
+    Json(serde_json::json!({
+        "providers": [
+            {
+                "name": "ollama",
+                "model": state.local_model.model,
+                "base_url": state.local_model.base_url,
+                "available": ollama_available,
+            },
+            {
+                "name": "openrouter",
+                "model": state.openrouter_model,
+                "available": openrouter_available,
+            }
+        ],
+        "active": active,
+    }))
 }
 
 /// Run a hybrid search and format the results as both an LLM-ready context
@@ -306,7 +394,7 @@ async fn search_for_context(
     query: &str,
     top_k: usize,
 ) -> Result<(String, Vec<serde_json::Value>), String> {
-    use trusty_search_core::{indexer::SearchQuery, registry::IndexId};
+    use crate::core::{indexer::SearchQuery, registry::IndexId};
     let id = IndexId::new(index_id.to_string());
     let handle = state
         .registry

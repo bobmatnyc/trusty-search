@@ -10,8 +10,8 @@ use colored::Colorize;
 /// `CodeIndexer` and the HNSW lane silently contributes nothing — the symptom
 /// seen in the 115k-chunk benchmark where every result returned
 /// `match_reason: "bm25"`.
-async fn build_embedder() -> Option<std::sync::Arc<dyn trusty_search_core::Embedder>> {
-    match trusty_search_core::FastEmbedder::new().await {
+async fn build_embedder() -> Option<std::sync::Arc<dyn crate::core::Embedder>> {
+    match crate::core::FastEmbedder::new().await {
         Ok(e) => Some(std::sync::Arc::new(e)),
         Err(e) => {
             tracing::warn!("FastEmbedder init failed ({e}); daemon falling back to BM25-only mode");
@@ -45,7 +45,7 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // the daemon is already running. If the PID is dead (stale lock), fall
     // through to `run_daemon`, whose `acquire_lock` removes the stale file
     // and retries on our behalf.
-    if let Some(pid) = trusty_search_service::running_daemon_pid() {
+    if let Some(pid) = crate::service::running_daemon_pid() {
         tracing::info!("daemon already running (pid {pid}), exiting cleanly");
         eprintln!(
             "{} trusty-search daemon already running (pid {pid}); nothing to do",
@@ -59,16 +59,18 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // (lock now free) or return AlreadyRunning, handled below.
 
     let embedder = build_embedder().await;
+    let cfg = crate::service::load_user_config();
 
-    let mut state = trusty_search_service::SearchAppState::new(
-        trusty_search_core::registry::IndexRegistry::new(),
-    );
+    let mut state =
+        crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
+            .with_local_model(cfg.local_model)
+            .with_openrouter_model(cfg.openrouter_model);
     if let Some(e) = embedder {
         state = state.with_embedder(e);
     }
-    match trusty_search_service::run_daemon(state, port).await {
+    match crate::service::run_daemon(state, port).await {
         Ok(()) => {}
-        Err(trusty_search_service::DaemonError::AlreadyRunning(p)) => {
+        Err(crate::service::DaemonError::AlreadyRunning(p)) => {
             // `acquire_lock` returns AlreadyRunning only after confirming the
             // recorded PID is alive (it removes stale lockfiles automatically).
             // Exit 0 so launchd does not treat this as a crash and re-spawn.

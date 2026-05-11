@@ -18,8 +18,8 @@
 //! requiring an ONNX model to be present.
 
 #[cfg(feature = "ner")]
-use crate::entity::EntityType;
-use crate::entity::RawEntity;
+use crate::core::entity::EntityType;
+use crate::core::entity::RawEntity;
 
 /// NER model handle. Always constructible; inference only runs when both the
 /// `ner` feature is compiled in *and* the ONNX model file is present at the

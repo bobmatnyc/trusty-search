@@ -1,6 +1,6 @@
 #[test]
 fn test_query_classifier_smoke() {
-    use trusty_search_core::classifier::{QueryClassifier, QueryIntent};
+    use trusty_search::core::classifier::{QueryClassifier, QueryIntent};
     assert_eq!(
         QueryClassifier::classify("fn authenticate"),
         QueryIntent::Definition
@@ -13,7 +13,7 @@ fn test_query_classifier_smoke() {
 
 #[test]
 fn test_bm25_smoke() {
-    use trusty_search_core::bm25::Bm25Index;
+    use trusty_search::core::bm25::Bm25Index;
     let mut idx = Bm25Index::new();
     idx.add_document(0, "rust async tokio search");
     idx.add_document(1, "python django web framework");
@@ -23,7 +23,7 @@ fn test_bm25_smoke() {
 
 #[test]
 fn test_chunker_smoke() {
-    use trusty_search_core::chunker::chunk_text;
+    use trusty_search::core::chunker::chunk_text;
     let content = "fn foo() {}\nfn bar() {}\n";
     let chunks = chunk_text("test.rs", content, 150, 50);
     assert!(!chunks.is_empty());
@@ -34,7 +34,7 @@ fn test_chunker_smoke() {
 fn test_index_registry() {
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use trusty_search_core::{
+    use trusty_search::core::{
         indexer::CodeIndexer,
         registry::{IndexHandle, IndexId, IndexRegistry},
     };

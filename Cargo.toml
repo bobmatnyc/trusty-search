@@ -1,61 +1,6 @@
-[workspace]
-members = [
-    "crates/trusty-search-core",
-    "crates/trusty-search-service",
-    "crates/trusty-search-mcp",
-    ".",
-]
-resolver = "2"
-
-[workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-thiserror = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-async-trait = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-dashmap = "5"
-axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-clap = { version = "4", features = ["derive", "env"] }
-clap_complete = "4"
-colored = "2"
-indicatif = "0.17"
-dotenvy = "0.15"
-include_dir = "0.7"
-open = "5"
-libc = "0.2"
-trusty-mcp-core = { version = "0.1.0" }
-trusty-embedder = { version = "0.1.2" }
-trusty-common = { version = "0.3.0" }
-trusty-contracts = { version = "0.1.0" }
-
-# Local development override: use the in-tree `../trusty-common` workspace so
-# unreleased changes are picked up without a release cycle. Cargo requires
-# every crate exported from the patched source to be listed even if not all
-# are consumed.
-#
-# Re-enabled (commit ac13d01 finished the axum 0.7 → 0.8 migration that
-# previously blocked this override). Required so the `cuda` feature on
-# `trusty-search-core` resolves against the in-tree `trusty-embedder 0.1.1`
-# (which adds `cuda`) until that version is published to crates.io.
-#
-# To build trusty-search standalone (without `../trusty-common` checked out),
-# comment this block out AND ensure trusty-embedder >=0.1.1 is published.
-[patch.crates-io]
-trusty-common = { path = "../trusty-common/crates/trusty-common" }
-trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
-trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
-trusty-contracts = { path = "../trusty-common/crates/trusty-contracts" }
-
 [package]
 name = "trusty-search"
-version = "0.2.3"
+version = "0.3.1"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -63,49 +8,138 @@ repository = "https://github.com/bobmatnyc/trusty-search"
 homepage = "https://github.com/bobmatnyc/trusty-search"
 keywords = ["search", "code-search", "mcp", "vector-search", "bm25"]
 categories = ["command-line-utilities", "development-tools"]
+build = "build.rs"
+include = [
+    "src/**/*",
+    "build.rs",
+    "ui-dist/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
+
+[lib]
+name = "trusty_search"
+path = "src/lib.rs"
 
 [[bin]]
 name = "trusty-search"
 path = "src/main.rs"
 
+# Local development override: use the in-tree `../trusty-common` workspace so
+# unreleased changes are picked up without a release cycle. Cargo requires
+# every crate exported from the patched source to be listed even if not all
+# are consumed.
+#
+# To build trusty-search standalone (without `../trusty-common` checked out),
+# comment this block out AND ensure trusty-embedder >=0.1.1 is published.
+[patch.crates-io]
+trusty-common = { path = "../trusty-common/crates/trusty-common" }
+trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+
 [dependencies]
-trusty-search-core = { version = "0.2.3", path = "crates/trusty-search-core" }
-trusty-search-service = { version = "0.2.3", path = "crates/trusty-search-service" }
-trusty-search-mcp = { version = "0.2.3", path = "crates/trusty-search-mcp" }
-trusty-common = { workspace = true }
-tokio = { workspace = true }
-clap = { workspace = true }
-clap_complete = { workspace = true }
-colored = { workspace = true }
-indicatif = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-dotenvy = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-axum = { workspace = true }
-reqwest = { workspace = true }
-dirs = "5"
-fs4 = { version = "0.8", features = ["sync"] }
-walkdir = "2"
-open = { workspace = true }
-libc = "0.2"
+# ── Shared trusty-common crates ────────────────────────────────────────────
+trusty-common = { version = "0.3.1", features = ["axum-server"] }
+trusty-mcp-core = { version = "0.1.0" }
+trusty-embedder = { version = "0.1.2", features = ["test-support"] }
+trusty-contracts = { version = "0.1.0" }
+
+# ── Async runtime / HTTP ───────────────────────────────────────────────────
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-trait = "0.1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 eventsource-stream = "0.2"
+futures = "0.3"
 futures-util = "0.3"
 
-[dev-dependencies]
+# ── Serde / errors / logs ──────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+
+# ── CLI / UX ───────────────────────────────────────────────────────────────
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+colored = "2"
+indicatif = "0.17"
+dotenvy = "0.15"
+open = "5"
+
+# ── Storage / vector / KG / chunking ───────────────────────────────────────
+usearch = "2.25"
+redb = "2.6"
+dashmap = "5"
+petgraph = "0.6"
+lru = "0.12"
+linfa = "0.7"
+linfa-clustering = "0.7"
+ndarray = "0.15"
+ndarray-rand = "0.14"
+rand = "0.8"
+rayon = "1"
+sha2 = "0.10"
+regex = "1"
+
+# ── Tree-sitter grammars (ABI 14 pinned) ───────────────────────────────────
+tree-sitter = "0.24"
+tree-sitter-language = "0.1"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-scala = "0.24"
+tree-sitter-c-sharp = "=0.23.0"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-swift = "=0.6.0"
+
+# ── File watching / FS ─────────────────────────────────────────────────────
+notify = "6"
+notify-debouncer-mini = "0.4"
+fs4 = { version = "0.8", features = ["sync"] }
 walkdir = "2"
-tokio = { workspace = true }
+crossbeam-utils = "0.8"
+dirs = "5"
+
+# ── Embedded UI ────────────────────────────────────────────────────────────
+include_dir = "0.7"
+
+# ── Optional ONNX NER (feature-gated) ──────────────────────────────────────
+ort = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
 
 [features]
 default = []
+# Exposes test doubles (e.g. `MockEmbedder`) outside `cfg(test)` so
+# downstream integration tests can reuse them. Kept for parity with the
+# previous trusty-search-core feature surface.
+test-support = []
+# Compile in the ONNX NER extractor. Even with this feature on, NER stays
+# inert at runtime unless `~/.trusty-search/models/ner.onnx` is present.
+ner = ["dep:ort", "dep:tokenizers"]
 # GPU-accelerated embedding via fastembed-rs CUDA backend.
-# Requires CUDA toolkit + compatible NVIDIA GPU. Install with:
-#   cargo install trusty-search --features cuda
-cuda = ["trusty-search-core/cuda"]
-# Apple Silicon GPU/Neural Engine acceleration via ONNX Runtime's CoreML
-# execution provider. macOS only (M1/M2/M3/M4). Install with:
-#   cargo install trusty-search --features coreml
-coreml = ["trusty-search-core/coreml"]
+cuda = ["trusty-embedder/cuda"]
+# Apple Silicon GPU/ANE acceleration via ONNX Runtime's CoreML provider.
+coreml = ["trusty-embedder/coreml"]
