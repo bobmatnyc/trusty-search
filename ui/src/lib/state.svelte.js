@@ -72,6 +72,19 @@ export function subscribeStatusStream() {
         };
         break;
       }
+      case 'index_registered':
+      case 'index_removed': {
+        // Why: A new/dropped index changes the catalogue the dashboard
+        // renders. Re-fetch /indexes (fan-out across per-index /status)
+        // so the "Recent indexes" table updates within one SSE round-trip
+        // — no page refresh needed. Mirrors trusty-memory's
+        // `palace_created` pattern.
+        // What: Fire-and-forget refresh; errors leave the list intact.
+        // Test: register an index via `POST /indexes`, observe the
+        // dashboard table gain a row within ~1s without reloading.
+        refreshIndexes().catch(() => {});
+        break;
+      }
       case 'connected':
       case 'lag':
       default:

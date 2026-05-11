@@ -66,6 +66,25 @@ pub enum DaemonEvent {
         uptime_secs: u64,
         version: String,
     },
+    /// Emitted by `POST /indexes` when a brand-new index is registered.
+    ///
+    /// Why: The dashboard's "Recent indexes" table is populated by a one-shot
+    /// `GET /indexes` fan-out at mount time; without a push event a user
+    /// running `trusty-search index <path>` would have to refresh the page to
+    /// see the new index. Emitting a tagged event lets the SPA call
+    /// `refreshIndexes()` immediately.
+    /// What: `{"type":"index_registered","id":"<index-id>"}`.
+    /// Test: subscribe to `/status/stream`, `POST /indexes`, assert an
+    /// `index_registered` frame with the matching id arrives.
+    IndexRegistered { id: String },
+    /// Emitted by `DELETE /indexes/:id` when an index is actually evicted.
+    ///
+    /// Why: Same rationale as `IndexRegistered` — keep dashboards reactive
+    /// without page refreshes.
+    /// What: `{"type":"index_removed","id":"<index-id>"}`.
+    /// Test: register → delete, subscribe before delete, assert an
+    /// `index_removed` frame arrives.
+    IndexRemoved { id: String },
 }
 
 /// Shared state injected into every axum handler.
@@ -462,6 +481,11 @@ async fn create_index_handler(
         root_path: req.root_path,
     };
     state.registry.register(handle);
+    // Push event so connected dashboards refresh their index list without a
+    // page reload (mirrors the trusty-memory `palace_created` pattern).
+    state.emit(DaemonEvent::IndexRegistered {
+        id: req.id.clone(),
+    });
     Ok(Json(serde_json::json!({ "id": req.id, "created": true })))
 }
 
@@ -479,6 +503,10 @@ async fn delete_index_handler(
     let index_id = IndexId::new(id.clone());
     let removed = state.registry.unregister(&index_id);
     state.reindex_progress.remove(&index_id);
+    if removed {
+        // Push event so connected dashboards drop the row without refresh.
+        state.emit(DaemonEvent::IndexRemoved { id: id.clone() });
+    }
     Json(serde_json::json!({ "id": id, "removed": removed }))
 }
 
