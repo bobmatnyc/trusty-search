@@ -10,8 +10,9 @@ trusty-search.pid
 .fastembed_cache/
 **/.fastembed_cache/
 
-# UI build artifacts (source; ui-dist/ is the embedded copy tracked in git)
+# UI build artifacts and dependencies (source; ui-dist/ is the embedded copy tracked in git)
 ui/dist/
+ui/node_modules/
 
 # Local tooling
 .claude-mpm/
