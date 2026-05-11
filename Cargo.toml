@@ -19,8 +19,8 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "5"
-axum = "0.7"
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -30,9 +30,9 @@ dotenvy = "0.15"
 include_dir = "0.7"
 open = "5"
 libc = "0.2"
-trusty-mcp-core = { version = "0.1.0", git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
-trusty-embedder = { version = "0.1.0", git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
-trusty-common = { version = "0.1.2", git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.2" }
+trusty-mcp-core = { version = "0.1.0" }
+trusty-embedder = { version = "0.1.0" }
+trusty-common = { version = "0.1.2" }
 
 # Local development override: use the in-tree trusty-common workspace so
 # changes here are picked up without a release cycle. Cargo requires every
