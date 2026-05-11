@@ -77,20 +77,324 @@ pub struct CodeChunk {
 
 ### HTTP API (axum, single daemon, multi-index)
 
+**Audience**: integrators (e.g. open-mpm) calling the daemon's REST API.
+
+**Transport conventions** (apply to every endpoint below):
+
+- **Base URL**: `http://127.0.0.1:<port>` — daemon binds loopback only; resolve
+  the live port from `~/Library/Application Support/trusty-search/port.lock` (macOS)
+  or `$XDG_DATA_HOME/trusty-search/port.lock` (Linux).
+- **Authentication**: none. The daemon is localhost-only and trusts every caller;
+  do **not** bind it to a non-loopback interface.
+- **Content-Type**: `application/json` for all request and response bodies (SSE
+  endpoint excepted — it returns `text/event-stream`).
+- **Error response**: any 4xx / 5xx returns a JSON body of the shape
+  `{ "error": "<message>" }`. Status codes follow standard HTTP semantics
+  (`404` = unknown `index_id`, `503` = subsystem disabled / not configured,
+  `500` = internal error).
+- **CORS**: permissive (`*`) for browser-based admin UIs.
+- **Gzip**: responses are gzipped when `Accept-Encoding: gzip` is set.
+
+#### Endpoint catalogue
+
+##### `GET /health`
+
+Liveness + readiness probe. Used by `trusty-search status`, `trusty-search doctor`,
+and external process detectors (open-mpm) to decide whether to spawn their own
+daemon.
+
+- **Request body**: none.
+- **Response 200**:
+  ```json
+  { "status": "ok", "version": "0.1.0", "indexes": 3 }
+  ```
+  - `status`: always `"ok"` when the daemon is up.
+  - `version`: `CARGO_PKG_VERSION` of the running binary.
+  - `indexes`: number of indexes currently registered in the in-memory registry.
+
+##### `GET /indexes`
+
+List every registered index.
+
+- **Request body**: none.
+- **Response 200**:
+  ```json
+  { "indexes": ["my-project", "trusty-search", "open-mpm"] }
+  ```
+
+##### `POST /indexes`
+
+Register a new (empty) index. Idempotent: re-registering an existing id returns
+`created: false` rather than an error.
+
+- **Request body**:
+  ```json
+  { "id": "my-project", "root_path": "/Users/me/code/my-project" }
+  ```
+- **Response 200** (created):
+  ```json
+  { "id": "my-project", "created": true }
+  ```
+- **Response 200** (already existed):
+  ```json
+  { "id": "my-project", "created": false, "reason": "already exists" }
+  ```
+
+##### `DELETE /indexes/:id`
+
+Drop an index from the in-memory registry. On-disk redb data is preserved —
+re-registering with the same id will reuse it.
+
+- **Request body**: none.
+- **Response 200**: `{ "id": "my-project", "removed": true }`
+
+##### `GET /indexes/:id/status`
+
+Per-index stats.
+
+- **Request body**: none.
+- **Response 200**:
+  ```json
+  {
+    "index_id": "my-project",
+    "root_path": "/Users/me/code/my-project",
+    "chunk_count": 14823
+  }
+  ```
+- **Response 404**: unknown `index_id`.
+
+##### `POST /indexes/:id/search`
+
+Hybrid search (BM25 + vector + KG expansion + RRF fusion).
+
+- **Request body**:
+  ```json
+  {
+    "text": "fn authenticate",
+    "top_k": 10,
+    "expand_graph": true,
+    "compact": true
+  }
+  ```
+  - `text` (required): the query string.
+  - `top_k` (optional, default `10`): max results to return.
+  - `expand_graph` (optional, default `true`): perform 1–2 hop KG expansion on top hits.
+  - `compact` (optional, default `true`): include `compact_snippet` (7-line) in each chunk.
+- **Response 200**:
+  ```json
+  {
+    "results": [
+      {
+        "id": "src/auth.rs:42:78",
+        "file": "src/auth.rs",
+        "start_line": 42,
+        "end_line": 78,
+        "content": "fn authenticate(...) { ... }",
+        "function_name": "authenticate",
+        "score": 0.0184,
+        "compact_snippet": "fn authenticate(...) {\n  ...\n}",
+        "match_reason": "hybrid+kg"
+      }
+    ],
+    "intent": "Definition",
+    "latency_ms": 7
+  }
+  ```
+  - `intent`: one of `"Definition" | "Usage" | "Conceptual" | "BugDebt" | "Unknown"`.
+  - `match_reason`: one of `"hybrid" | "hybrid+kg" | "bm25" | "vector" | "fallback:ripgrep"`.
+
+##### `POST /indexes/:id/search_similar`
+
+Code-to-code similarity: find chunks similar to a known file/function.
+
+- **Request body**:
+  ```json
+  { "file": "src/auth.rs", "function": "authenticate", "top_k": 10 }
+  ```
+  - `function` (optional): when omitted, uses the first chunk of the file as seed.
+  - `top_k` (optional, default `10`).
+- **Response 200**:
+  ```json
+  {
+    "results": [/* CodeChunk[] */],
+    "seed_chunk_id": "src/auth.rs:42:78",
+    "latency_ms": 4
+  }
+  ```
+- **Response 404**: unknown index, or seed chunk not found.
+
+##### `POST /indexes/:id/index-file`
+
+Add or replace one file in the index.
+
+- **Request body**:
+  ```json
+  { "path": "src/auth.rs", "content": "fn authenticate() { ... }" }
+  ```
+- **Response 200**:
+  ```json
+  { "index_id": "my-project", "path": "src/auth.rs", "indexed": true }
+  ```
+
+##### `POST /indexes/:id/remove-file`
+
+Remove a file (and all its chunks) from the index.
+
+- **Request body**: `{ "path": "src/auth.rs" }`
+- **Response 200**:
+  ```json
+  { "index_id": "my-project", "path": "src/auth.rs", "removed_chunks": 4 }
+  ```
+
+##### `POST /indexes/:id/reindex`
+
+Fire-and-forget full reindex. Returns immediately with an SSE stream URL; poll
+`GET /indexes/:id/reindex/stream` for progress.
+
+- **Request body** (all fields optional):
+  ```json
+  { "root_path": "/Users/me/code/my-project", "force": false }
+  ```
+  - `root_path`: override the path stored on the handle (lets CLI register + reindex in one call).
+  - `force`: when `true`, clear the per-index content-hash cache so every file is re-embedded.
+- **Response 200**:
+  ```json
+  {
+    "index_id": "my-project",
+    "queued": true,
+    "stream_url": "/indexes/my-project/reindex/stream"
+  }
+  ```
+
+##### `GET /indexes/:id/reindex/stream`
+
+SSE stream of reindex progress. **Content-Type**: `text/event-stream` (not JSON).
+
+Event payloads are JSON strings, one per SSE `data:` line, with shapes:
+
+```json
+{ "event": "start",    "total_files": 14823 }
+{ "event": "progress", "indexed": 1024, "total": 14823, "current_file": "src/auth.rs" }
+{ "event": "complete", "indexed": 14823, "elapsed_ms": 142000 }
+{ "event": "error",    "message": "<error>" }
 ```
-GET    /health                       liveness probe
-GET    /indexes                      list all registered indexes
-POST   /indexes/:id/search           hybrid search query
-POST   /indexes/:id/index-file       add/update a file
-POST   /indexes/:id/remove-file      remove from index
-POST   /indexes/:id/reindex          full reindex (fire-and-forget)
-GET    /indexes/:id/reindex/stream   SSE progress stream (start/progress/complete/error)
-GET    /indexes/:id/status           index stats (chunks, last-updated)
-GET    /indexes/:id/chunks           paginated chunk enumeration (?offset, ?limit)
-DELETE /indexes/:id                  delete an index
-GET    /ui                           web management UI (Svelte, embedded)
-POST   /chat                         OpenRouter proxy with search context injection
-```
+
+The handler replays any buffered events to late subscribers before streaming
+live updates, so a subscriber that connects after `start` still sees it.
+
+- **Response 404**: no reindex has been queued for this index.
+
+##### `GET /indexes/:id/chunks?offset=&limit=`
+
+Paginated enumeration of all chunks in stable `(file, start_line)` order.
+
+- **Query params**:
+  - `offset` (optional, default `0`).
+  - `limit` (optional, default `100`, clamped to `1000`).
+- **Response 200**:
+  ```json
+  {
+    "index_id": "my-project",
+    "total": 14823,
+    "offset": 0,
+    "limit": 100,
+    "chunks": [/* CodeChunk[] */]
+  }
+  ```
+
+##### `GET /indexes/:id/complexity_hotspots?top_n=`
+
+Top-N chunks by cyclomatic complexity.
+
+- **Query params**: `top_n` (optional, default `20`).
+- **Response 200**:
+  ```json
+  { "index_id": "my-project", "top_n": 20, "hotspots": [/* CodeChunk[] */] }
+  ```
+
+##### `GET /indexes/:id/smells`
+
+Chunks with one or more code-smell findings.
+
+- **Response 200**:
+  ```json
+  { "index_id": "my-project", "count": 42, "chunks": [/* CodeChunk[] */] }
+  ```
+
+##### `GET /indexes/:id/quality`
+
+Aggregate quality grade for the index.
+
+- **Response 200**:
+  ```json
+  {
+    "index_id": "my-project",
+    "chunk_count": 14823,
+    "avg_cyclomatic": 4.2,
+    "grade_a_pct": 62.1,
+    "smell_count": 412
+  }
+  ```
+
+##### `GET /facts?subject=&predicate=&object=`
+
+Query the optional facts store (used by the KG/IA pipeline). Any combination of
+the three filters is allowed; omitted filters match anything.
+
+- **Response 200**:
+  ```json
+  { "facts": [/* FactRecord[] */], "count": 17 }
+  ```
+- **Response 503**: facts store not configured.
+
+##### `POST /facts`
+
+Upsert a fact.
+
+- **Request body**:
+  ```json
+  {
+    "subject": "fn authenticate",
+    "predicate": "calls",
+    "object": "fn verify_token",
+    "index_id": "my-project",
+    "confidence": 1.0,
+    "provenance": ["src/auth.rs:42"]
+  }
+  ```
+  - `confidence` (optional, default `1.0`).
+  - `provenance` (optional, default `[]`).
+- **Response 200**: `{ "id": 1234567890, "upserted": true }`
+- **Response 503**: facts store not configured.
+
+##### `DELETE /facts/:id`
+
+Delete a fact by its u64 hash id.
+
+- **Response 200**: `{ "id": 1234567890, "removed": true }`
+
+##### `POST /chat`
+
+OpenRouter conversational Q&A with auto-injected search context. Requires
+`OPENROUTER_API_KEY` in the daemon's environment.
+
+- **Request body**:
+  ```json
+  {
+    "index_id": "my-project",
+    "message": "How does authentication work?",
+    "history": [
+      { "role": "user",      "content": "..." },
+      { "role": "assistant", "content": "..." }
+    ]
+  }
+  ```
+- **Response 200**: forwarded OpenRouter chat-completion payload.
+- **Response 503**: `{ "error": "OpenRouter not configured" }` (API key missing).
+
+##### `GET /ui`, `GET /ui/`, `GET /ui/*path`
+
+Serves the embedded Svelte admin UI. Not part of the integration contract.
 
 ### MCP Tools
 

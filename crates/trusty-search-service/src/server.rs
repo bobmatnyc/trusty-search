@@ -107,6 +107,7 @@ impl SearchAppState {
 struct HealthResponse {
     status: &'static str,
     version: &'static str,
+    indexes: usize,
 }
 
 #[derive(Serialize)]
@@ -244,10 +245,18 @@ async fn delete_fact_handler(
     Ok(Json(serde_json::json!({ "id": id, "removed": removed })))
 }
 
-async fn health_handler() -> Json<HealthResponse> {
+async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<HealthResponse> {
+    // Why: open-mpm (and other external integrators) probe `/health` to detect
+    // a running trusty-search daemon before spawning their own. Including
+    // `indexes` count lets the caller verify the daemon is not only alive but
+    // also has the expected registry populated (issue #34).
+    // What: returns `{ status, version, indexes }` where `indexes` is the
+    // number of registered IndexHandles in the registry.
+    // Test: register N indexes, GET /health, assert `indexes == N`.
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
+        indexes: state.registry.list().len(),
     })
 }
 

@@ -24,6 +24,7 @@ pub async fn handle_convert(
     concurrency: usize,
 ) -> Result<()> {
     let base = daemon_base_url();
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
 
     match target {
         ConvertTarget::Project => handle_convert_project(dry_run, &base).await,

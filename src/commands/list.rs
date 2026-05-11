@@ -10,6 +10,7 @@ use colored::Colorize;
 /// Test: `cargo run -- list` against a running daemon prints registered ids.
 pub async fn handle_list(json: bool) -> Result<()> {
     let base = daemon_base_url();
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
     let url = format!("{}/indexes", base);
     let list_client = trusty_common::server::daemon_http_client()?;
     match list_client.get(&url).send().await {

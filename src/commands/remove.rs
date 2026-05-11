@@ -15,6 +15,7 @@ pub async fn handle_remove(
     let (index_id, warned) = resolve_index(explicit_index);
     print_index_header(&index_id, warned);
     let base = daemon_base_url();
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
     let url = format!("{}/indexes/{}/remove-file", base, index_id);
     let client = trusty_common::server::daemon_http_client()?;
     let body = serde_json::json!({ "path": file.display().to_string() });

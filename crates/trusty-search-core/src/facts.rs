@@ -12,9 +12,7 @@
 //! Test: `tests` below covers upsert / query / dedupe / delete round-trips
 //! against an in-memory tempfile redb.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// redb table holding all facts. Key = `fact_id`, value = JSON `FactRecord`.
 const FACTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("facts");
@@ -96,14 +95,29 @@ impl FactRecord {
 
 /// Stable u64 hash of the canonical `(subject, predicate, object)` triple.
 ///
-/// This is the identity function for facts. Using `DefaultHasher` is fine —
-/// we only need stability *within a process* between `upsert` and `query`
-/// calls. Across releases the hash may shift; that's acceptable because the
-/// store is rebuildable from the indexed corpus.
+/// Why: `DefaultHasher` is explicitly *not* stable across Rust versions or
+/// process restarts (its seed and algorithm are unspecified), so stored
+/// `fact_id`s could shift between runs and break persistence. We use SHA-256
+/// over a length-prefixed encoding of the triple and take the first 8 bytes
+/// as a `u64` — deterministic across versions, processes, and platforms.
+///
+/// The encoding prefixes each field with its byte length so that
+/// `("ab", "c", "d")` and `("a", "bc", "d")` cannot collide.
+///
+/// Test: `tests::fact_hash_is_stable` asserts a fixed input produces a fixed
+/// output and that distinct triples yield distinct hashes.
 pub fn fact_hash(subject: &str, predicate: &str, object: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    (subject, predicate, object).hash(&mut h);
-    h.finish()
+    let mut h = Sha256::new();
+    for field in [subject, predicate, object] {
+        h.update((field.len() as u64).to_le_bytes());
+        h.update(field.as_bytes());
+    }
+    let digest = h.finalize();
+    // Take first 8 bytes of the digest as a little-endian u64. Deterministic
+    // across Rust versions, processes, and machine architectures.
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(buf)
 }
 
 fn now_secs() -> u64 {
@@ -323,6 +337,26 @@ mod tests {
         assert_eq!(h1, h2);
         assert_ne!(h1, fact_hash("a", "b", "d"));
         assert_ne!(h1, fact_hash("a", "x", "c"));
+    }
+
+    #[test]
+    fn fact_hash_is_stable() {
+        // This locks the SHA-256-based hash to a fixed expected value so any
+        // future change to the algorithm (which would invalidate persisted
+        // fact IDs) is caught by CI rather than silently shifting IDs across
+        // releases. Re-compute only if intentionally migrating the schema.
+        //
+        // For ("a", "b", "c") the SHA-256 of the length-prefixed encoding
+        // begins with bytes that decode as the u64 below (little-endian).
+        let h = fact_hash("a", "b", "c");
+        assert_eq!(h, 2_952_129_788_962_279_485_u64);
+    }
+
+    #[test]
+    fn fact_hash_is_length_prefix_safe() {
+        // Without length-prefixing, ("ab","c","d") and ("a","bc","d") would
+        // hash the same concatenated bytes. With prefixing they must differ.
+        assert_ne!(fact_hash("ab", "c", "d"), fact_hash("a", "bc", "d"));
     }
 
     #[test]

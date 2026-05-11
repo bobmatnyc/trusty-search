@@ -2452,7 +2452,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Dashboard => {
-            commands::dashboard::handle_dashboard()?;
+            commands::dashboard::handle_dashboard().await?;
         }
 
         Commands::Convert {

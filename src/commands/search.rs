@@ -1,6 +1,6 @@
 //! Handler for `trusty-search search`.
 
-use crate::{print_index_header, resolve_index};
+use crate::{daemon_base_url, print_index_header, resolve_index};
 use anyhow::Result;
 use colored::Colorize;
 
@@ -17,6 +17,7 @@ pub async fn handle_search(
 ) -> Result<()> {
     let (index_id, warned) = resolve_index(explicit_index);
     print_index_header(&index_id, warned);
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
     println!(
         "{} {} {} {}",
         "→".cyan(),

@@ -23,6 +23,11 @@ pub async fn handle_ui(port: Option<u16>) -> Result<()> {
         })
         .unwrap_or(7878);
     let url = format!("http://127.0.0.1:{port}/ui");
+    let base = format!("http://127.0.0.1:{port}");
+
+    // Auto-start the daemon if it isn't already up — opening the UI without
+    // a daemon would land the user on a confusing browser error page.
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
 
     // Probe the daemon — if it's not running, surface a friendly hint
     // instead of a confusing browser error page.

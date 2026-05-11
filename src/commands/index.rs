@@ -26,6 +26,11 @@ pub async fn handle_index(
             .into_owned()
     });
 
+    // 0. Auto-start the daemon if needed. `index` is useless without it,
+    //    so we proactively boot it rather than dump a confusing connection
+    //    error on the user.
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
+
     // 1. Register with daemon (idempotent). Surface a clear error if
     //    the daemon is unreachable — `index` is useless without it.
     let (created, daemon_reachable) =

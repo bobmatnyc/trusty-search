@@ -1,6 +1,6 @@
 //! Handler for `trusty-search doctor` — 6-check diagnostic + auto-repair.
 
-use crate::{fix_stale_lock, run_doctor_checks, run_reindex, CheckResult, EmptyIndex};
+use crate::{daemon_base_url, fix_stale_lock, run_doctor_checks, run_reindex, CheckResult, EmptyIndex};
 use anyhow::Result;
 use colored::Colorize;
 
@@ -17,6 +17,8 @@ use colored::Colorize;
 pub async fn handle_doctor(fix: bool) -> Result<()> {
     println!("\ntrusty-search doctor\n");
     println!("Checking configuration...\n");
+
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
 
     let (checks, empty_indexes) = run_doctor_checks().await;
 
