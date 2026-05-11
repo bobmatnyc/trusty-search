@@ -51,7 +51,10 @@ fn main() {
                  to build and sync the Svelte UI before publishing."
             );
         }
-        ensure_dist_placeholder(&dist_dir);
+        // Do NOT call ensure_dist_placeholder(dist_dir) here:
+        // include_dir! reads from ui-dist/ (not ui/dist/), and creating
+        // ui/dist/ during `cargo publish --verify` would trigger cargo's
+        // "source directory was modified by build.rs" check.
         return;
     }
 
