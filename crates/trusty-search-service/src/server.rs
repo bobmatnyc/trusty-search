@@ -143,20 +143,20 @@ pub fn build_router(state: SearchAppState) -> Router {
             "/indexes",
             get(list_indexes_handler).post(create_index_handler),
         )
-        .route("/indexes/:id", delete(delete_index_handler))
+        .route("/indexes/{id}", delete(delete_index_handler))
         .route("/ui", get(ui_index_handler))
         .route("/ui/", get(ui_index_handler))
-        .route("/ui/*path", get(ui_asset_handler))
+        .route("/ui/{*path}", get(ui_asset_handler))
         .route("/chat", post(chat_handler))
         .route("/search", post(global_search_handler))
-        .route("/indexes/:id/search", post(search_handler))
-        .route("/indexes/:id/search_similar", post(search_similar_handler))
-        .route("/indexes/:id/status", get(index_status_handler))
-        .route("/indexes/:id/index-file", post(index_file_handler))
-        .route("/indexes/:id/remove-file", post(remove_file_handler))
-        .route("/indexes/:id/reindex", post(reindex_handler))
-        .route("/indexes/:id/reindex/stream", get(reindex_stream_handler))
-        .route("/indexes/:id/chunks", get(get_index_chunks_handler))
+        .route("/indexes/{id}/search", post(search_handler))
+        .route("/indexes/{id}/search_similar", post(search_similar_handler))
+        .route("/indexes/{id}/status", get(index_status_handler))
+        .route("/indexes/{id}/index-file", post(index_file_handler))
+        .route("/indexes/{id}/remove-file", post(remove_file_handler))
+        .route("/indexes/{id}/reindex", post(reindex_handler))
+        .route("/indexes/{id}/reindex/stream", get(reindex_stream_handler))
+        .route("/indexes/{id}/chunks", get(get_index_chunks_handler))
         .with_state(Arc::new(state));
     // Standard middleware stack (CORS, tracing, gzip) lives in trusty-common
     // so every trusty-* daemon ships with the same defaults.
