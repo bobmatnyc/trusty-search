@@ -26,27 +26,47 @@ use crate::core::{
     store::{UsearchStore, VectorStore},
 };
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        Json, Redirect,
-    },
+    response::{IntoResponse, Json, Redirect, Response},
     routing::{delete, get, post},
     Router,
 };
 use std::time::Duration;
 use dashmap::DashMap;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::OnceCell;
+use tokio::sync::{broadcast, OnceCell};
 use tokio_stream::wrappers::BroadcastStream;
 use trusty_common::{ChatProvider, LocalModelConfig};
 
 use crate::service::reindex::{spawn_reindex_with_cleanup, ReindexProgress, ReindexStatus};
+
+/// Live daemon events pushed to dashboard subscribers via the `/status/stream`
+/// SSE feed.
+///
+/// Why: Mirrors the trusty-memory broadcast-channel pattern — a single tagged
+/// enum fanned out to every connected browser tab so the UI updates without
+/// per-tab polling.
+/// What: Tagged-enum (snake_case) serialised as `{"type": "status_changed",
+/// ...fields}`. Only `StatusChanged` exists today; new variants (e.g.
+/// `IndexCreated`, `ReindexCompleted`) plug in here without touching the
+/// handler.
+/// Test: subscribe to `/status/stream`, wait > 2s, parse a `status_changed`
+/// frame and assert the four fields are present.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    StatusChanged {
+        indexes: u64,
+        total_chunks: u64,
+        uptime_secs: u64,
+        version: String,
+    },
+}
 
 /// Shared state injected into every axum handler.
 #[derive(Clone)]
@@ -84,6 +104,17 @@ pub struct SearchAppState {
     /// Lazily-initialised active chat provider. Auto-detection happens on the
     /// first chat call and the result is cached for the daemon's lifetime.
     pub chat_provider: Arc<OnceCell<Option<Arc<dyn ChatProvider>>>>,
+    /// Broadcast sender for live `DaemonEvent` pushes to SSE subscribers.
+    ///
+    /// Why: Lets the periodic status-ticker (and any future mutating handler)
+    /// emit events that every connected dashboard receives instantly. Mirrors
+    /// the trusty-memory pattern: cap of 128 buffers transient slow readers;
+    /// if a receiver lags it gets `RecvError::Lagged` and we emit a `lag` frame.
+    /// What: A `tokio::sync::broadcast::Sender<DaemonEvent>` wrapped in `Arc`
+    /// so it's cheap to clone across the AppState.
+    /// Test: `emit_propagates_to_subscriber` verifies a subscriber observes
+    /// the emitted event.
+    pub events: Arc<broadcast::Sender<DaemonEvent>>,
 }
 
 impl SearchAppState {
@@ -93,6 +124,7 @@ impl SearchAppState {
     /// the vector lane.
     pub fn new(registry: IndexRegistry) -> Self {
         let openrouter_api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+        let (events_tx, _) = broadcast::channel::<DaemonEvent>(128);
         Self {
             registry,
             reindex_progress: Arc::new(DashMap::new()),
@@ -104,7 +136,19 @@ impl SearchAppState {
             openrouter_model: "anthropic/claude-haiku-4".to_string(),
             openrouter_api_key,
             chat_provider: Arc::new(OnceCell::new()),
+            events: Arc::new(events_tx),
         }
+    }
+
+    /// Send a `DaemonEvent` to all connected SSE subscribers.
+    ///
+    /// Why: Best-effort fan-out — `broadcast::Sender::send` only fails when
+    /// there are no live receivers, which is fine (no listeners == no work).
+    /// What: Drops the result, callers don't need to check anything.
+    /// Test: `emit_propagates_to_subscriber` subscribes then emits and asserts
+    /// the event arrives.
+    pub fn emit(&self, event: DaemonEvent) {
+        let _ = self.events.send(event);
     }
 
     /// Builder-style: install user-loaded `local_model` settings (e.g. from
@@ -118,6 +162,14 @@ impl SearchAppState {
     /// `anthropic/claude-haiku-4`).
     pub fn with_openrouter_model(mut self, model: impl Into<String>) -> Self {
         self.openrouter_model = model.into();
+        self
+    }
+
+    /// Builder-style: set the OpenRouter API key (loaded from config or env).
+    pub fn with_openrouter_api_key(mut self, api_key: impl Into<String>) -> Self {
+        let api_key_str = api_key.into();
+        self.openrouter_enabled = !api_key_str.is_empty();
+        self.openrouter_api_key = api_key_str;
         self
     }
 
@@ -217,6 +269,8 @@ pub fn build_router(state: SearchAppState) -> Router {
     // `/` redirect makes the daemon's landing page friendly (mirrors the
     // `.fallback(static_handler)` shape trusty-memory uses to serve its SPA
     // at `/`).
+    let state_arc = Arc::new(state);
+    spawn_status_ticker(Arc::clone(&state_arc));
     let router = Router::new()
         .route("/", get(|| async { Redirect::permanent("/ui/") }))
         .route("/health", get(health_handler))
@@ -240,10 +294,46 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/{id}/reindex", post(reindex_handler))
         .route("/indexes/{id}/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/{id}/chunks", get(get_index_chunks_handler))
-        .with_state(Arc::new(state));
+        .with_state(Arc::clone(&state_arc));
     // Standard middleware stack (CORS, tracing, gzip) lives in trusty-common
     // so every trusty-* daemon ships with the same defaults.
     trusty_common::server::with_standard_middleware(router)
+}
+
+/// Spawn a background ticker that emits `StatusChanged` every 2 seconds.
+///
+/// Why: trusty-memory's pattern is push-driven via mutating handlers, but
+/// trusty-search's headline stats (chunk count) change continuously during
+/// reindex without a discrete event. A 2s ticker keeps the dashboard's
+/// stat cards live (same cadence as the previous poll-based implementation)
+/// while still routing through the broadcast channel so the SSE handler
+/// stays purely subscription-driven.
+/// What: Spawns a detached tokio task holding a `Weak<SearchAppState>` so
+/// the ticker terminates automatically when the daemon shuts down (drops the
+/// last `Arc`). Each tick recomputes counts and emits one event.
+/// Test: subscribe to `/status/stream`, wait > 2s, observe a `status_changed`
+/// frame.
+fn spawn_status_ticker(state: Arc<SearchAppState>) {
+    let weak = Arc::downgrade(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        // Skip the immediate first tick — subscribers get an explicit
+        // `connected` frame, and a snapshot follows on the next tick.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(state) = weak.upgrade() else {
+                break;
+            };
+            let (indexes, total_chunks) = collect_status_counts(&state).await;
+            state.emit(DaemonEvent::StatusChanged {
+                indexes: indexes as u64,
+                total_chunks: total_chunks as u64,
+                uptime_secs: state.started_at.elapsed().as_secs(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            });
+        }
+    });
 }
 
 async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<HealthResponse> {
@@ -288,35 +378,42 @@ async fn collect_status_counts(state: &SearchAppState) -> (usize, usize) {
 /// `GET /status/stream` — Server-Sent Events stream of live daemon stats.
 ///
 /// Why: The admin dashboard's headline stat cards (Indexes, Documents,
-/// Uptime, Version) previously required a manual refresh or periodic
-/// `setInterval` polling. Pushing updates from the daemon via SSE keeps the
-/// UI live without each tab hammering the REST API.
-/// What: Pushes an initial JSON payload immediately on connect, then a fresh
-/// payload every 2 seconds for the lifetime of the connection. Payload shape:
-/// `{ "indexes": <u64>, "total_chunks": <u64>, "uptime_secs": <u64>,
-/// "version": "<semver>" }`. Mirrors the existing
-/// `/indexes/:id/reindex/stream` SSE pattern (axum `Sse` + `KeepAlive`).
-/// Test: `curl -N http://127.0.0.1:7878/status/stream` shows an event every
-/// 2s; closing the curl cleanly drops the stream on the server side.
-async fn status_stream_handler(
-    State(state): State<Arc<SearchAppState>>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let interval = tokio::time::interval(Duration::from_secs(2));
-    let ticks = tokio_stream::wrappers::IntervalStream::new(interval);
-    let stream = ticks.then(move |_| {
-        let state = Arc::clone(&state);
-        async move {
-            let (indexes, total_chunks) = collect_status_counts(&state).await;
-            let payload = serde_json::json!({
-                "indexes": indexes,
-                "total_chunks": total_chunks,
-                "uptime_secs": state.started_at.elapsed().as_secs(),
-                "version": env!("CARGO_PKG_VERSION"),
-            });
-            Ok::<Event, Infallible>(Event::default().data(payload.to_string()))
-        }
+/// Uptime, Version) should update without a manual refresh. Mirrors the
+/// trusty-memory `/sse` pattern — subscribers receive `DaemonEvent` frames
+/// pushed via the shared `broadcast::Sender` on `SearchAppState`.
+/// What: Subscribes to `state.events`, emits an initial `{"type":"connected"}`
+/// frame, then forwards every `DaemonEvent` as `data: <json>\n\n`. Lagged
+/// subscribers receive a `{"type":"lag","skipped":N}` frame. The 2s status
+/// cadence is supplied by the background ticker spawned in `build_router`.
+/// Test: `curl -N http://127.0.0.1:7878/status/stream` shows a `connected`
+/// frame immediately and a `status_changed` frame every ~2s.
+async fn status_stream_handler(State(state): State<Arc<SearchAppState>>) -> impl IntoResponse {
+    let rx = state.events.subscribe();
+    let initial = stream::once(async {
+        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(
+            "data: {\"type\":\"connected\"}\n\n",
+        ))
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    let events = BroadcastStream::new(rx).map(|res| {
+        let frame = match res {
+            Ok(event) => match serde_json::to_string(&event) {
+                Ok(json) => format!("data: {json}\n\n"),
+                Err(e) => format!("data: {{\"type\":\"error\",\"message\":\"{e}\"}}\n\n"),
+            },
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                format!("data: {{\"type\":\"lag\",\"skipped\":{n}}}\n\n")
+            }
+        };
+        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(frame))
+    });
+    let stream = initial.chain(events);
+
+    Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
+        .expect("valid SSE response")
 }
 
 async fn list_indexes_handler(State(state): State<Arc<SearchAppState>>) -> Json<IndexListResponse> {
@@ -763,13 +860,16 @@ async fn reindex_handler(
 
 /// SSE stream of reindex progress events.
 ///
+/// Mirrors the `/status/stream` SSE pattern (manual `Response::builder()`
+/// with `text/event-stream` + `no-cache` + `X-Accel-Buffering: no`).
 /// Replays any events already buffered (so a late subscriber still sees the
 /// `start` event) and then streams live events from the broadcast channel
-/// until the reindex completes.
+/// until the reindex completes. Lagged subscribers receive a
+/// `{"type":"lag","skipped":N}` frame.
 async fn reindex_stream_handler(
     State(state): State<Arc<SearchAppState>>,
     Path(id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let index_id = IndexId::new(id);
     let progress = state
         .reindex_progress
@@ -782,27 +882,38 @@ async fn reindex_stream_handler(
     // snapshot and subscription will appear in both — duplicates are harmless
     // for SSE consumers and rare in practice.
     let replay = progress.events.lock().await.clone();
-    let rx = progress.sender.subscribe();
-    let live = BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
-
     let initial_status = progress.status.load();
-    let stream = stream::iter(replay)
-        .chain(live)
-        .map(|line| Ok(Event::default().data(line)));
+    let rx = progress.sender.subscribe();
+
+    fn frame(line: String) -> Result<axum::body::Bytes, std::io::Error> {
+        Ok(axum::body::Bytes::from(format!("data: {line}\n\n")))
+    }
+
+    let replay_stream = stream::iter(replay).map(frame);
 
     // If the reindex already finished before the subscriber connected, the
     // replay buffer contains the terminal `complete` event and the live
-    // stream will idle forever. Trim to just the replay in that case.
-    let stream: futures::future::Either<_, _> = if initial_status != ReindexStatus::Running {
-        let replay_only = progress.events.lock().await.clone();
-        futures::future::Either::Left(
-            stream::iter(replay_only).map(|line| Ok(Event::default().data(line))),
-        )
+    // stream would idle forever. Return the replay only in that case.
+    let body = if initial_status != ReindexStatus::Running {
+        Body::from_stream(replay_stream)
     } else {
-        futures::future::Either::Right(stream)
+        let live = BroadcastStream::new(rx).map(|res| match res {
+            Ok(line) => frame(line),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                Ok(axum::body::Bytes::from(format!(
+                    "data: {{\"type\":\"lag\",\"skipped\":{n}}}\n\n"
+                )))
+            }
+        });
+        Body::from_stream(replay_stream.chain(live))
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(body)
+        .expect("valid SSE response"))
 }
 
 #[cfg(test)]

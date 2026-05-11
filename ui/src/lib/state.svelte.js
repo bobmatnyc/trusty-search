@@ -45,22 +45,45 @@ export function subscribeStatusStream() {
 
   const src = new EventSource('/status/stream');
   src.onmessage = (ev) => {
+    let event;
     try {
-      const payload = JSON.parse(ev.data);
-      _liveStats = payload;
-      // Mirror into _health so existing $derived(getHealth()) consumers
-      // keep updating live without code changes elsewhere.
-      _health = {
-        status: 'ok',
-        version: payload.version ?? _health?.version ?? '',
-        indexes: payload.indexes ?? 0,
-        uptime_secs: payload.uptime_secs ?? 0
-      };
-    } catch (_e) {
-      /* ignore malformed payload */
+      event = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    // Mirrors trusty-memory's pattern: switch on the tagged `type` field
+    // and route each event variant to the appropriate state mutation.
+    switch (event.type) {
+      case 'status_changed': {
+        const payload = {
+          indexes: event.indexes ?? 0,
+          total_chunks: event.total_chunks ?? 0,
+          uptime_secs: event.uptime_secs ?? 0,
+          version: event.version ?? ''
+        };
+        _liveStats = payload;
+        // Mirror into _health so existing $derived(getHealth()) consumers
+        // keep updating live without code changes elsewhere.
+        _health = {
+          status: 'ok',
+          version: payload.version || _health?.version || '',
+          indexes: payload.indexes,
+          uptime_secs: payload.uptime_secs
+        };
+        break;
+      }
+      case 'connected':
+      case 'lag':
+      default:
+        // Ignore connection-marker and lag-notice frames; EventSource
+        // auto-reconnects on transient errors so no action needed here.
+        break;
     }
   };
-  // EventSource auto-reconnects on transient errors; do not tear down here.
+  src.onerror = () => {
+    // EventSource auto-reconnects on transient errors; just note the blip.
+    console.warn('SSE connection lost, will reconnect...');
+  };
   _statusSource = src;
   return src;
 }

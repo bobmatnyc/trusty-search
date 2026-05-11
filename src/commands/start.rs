@@ -64,7 +64,8 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     let mut state =
         crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
             .with_local_model(cfg.local_model)
-            .with_openrouter_model(cfg.openrouter_model);
+            .with_openrouter_model(cfg.openrouter_model)
+            .with_openrouter_api_key(cfg.openrouter_api_key);
     if let Some(e) = embedder {
         state = state.with_embedder(e);
     }
