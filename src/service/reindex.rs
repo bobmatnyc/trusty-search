@@ -386,11 +386,10 @@ pub fn spawn_reindex_with_cleanup(
                     let indexed =
                         progress.indexed.fetch_add(batch_files, Ordering::Release) + batch_files;
                     let elapsed_ms = started.elapsed().as_millis() as u64;
-                    let chunks_per_sec = if elapsed_ms > 0 {
-                        (progress.total_chunks.load(Ordering::Acquire) as u64 * 1000) / elapsed_ms
-                    } else {
-                        0
-                    };
+                    let chunks_per_sec = (progress.total_chunks.load(Ordering::Acquire) as u64
+                        * 1000)
+                        .checked_div(elapsed_ms)
+                        .unwrap_or(0);
                     // Persist new content hashes for next reindex.
                     for (path, h) in new_hashes {
                         hashes.insert(path, h);
@@ -447,11 +446,9 @@ pub fn spawn_reindex_with_cleanup(
         progress.status.store(ReindexStatus::Complete);
         let total_chunks = progress.total_chunks.load(Ordering::Acquire);
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let chunks_per_sec = if elapsed_ms > 0 {
-            (total_chunks as u64 * 1000) / elapsed_ms
-        } else {
-            0
-        };
+        let chunks_per_sec = (total_chunks as u64 * 1000)
+            .checked_div(elapsed_ms)
+            .unwrap_or(0);
         progress
             .push(serde_json::json!({
                 "event": "complete",

@@ -910,7 +910,7 @@ impl CodeIndexer {
             return;
         }
         let mut emb_cache = self.chunk_embeddings.write().await;
-        for (chunk, vec_opt) in chunks.iter().zip(embeddings.into_iter()) {
+        for (chunk, vec_opt) in chunks.iter().zip(embeddings) {
             if let Some(vec) = vec_opt {
                 // LRU `put` evicts the oldest entry when over capacity. Cache
                 // eviction here is harmless: MMR rerank treats a missing entry
