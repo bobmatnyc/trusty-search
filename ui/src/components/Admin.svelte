@@ -94,7 +94,7 @@
 </div>
 
 <div class="card danger-zone">
-  <h2 style="color: var(--danger);">Danger Zone</h2>
+  <h2 style="color: var(--trusty-danger);">Danger Zone</h2>
   <p class="card-sub">Irreversible operations.</p>
   <button class="danger" onclick={deleteAll} disabled={busy || indexes.names.length === 0}>
     Delete all indexes ({indexes.names.length})

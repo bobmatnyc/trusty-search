@@ -86,7 +86,7 @@
       </div>
     </div>
     <div style="margin-top: 8px;">
-      <label style="font-size: 12px; color: var(--text-dim);">
+      <label style="font-size: 12px; color: var(--trusty-text-muted);">
         <input type="checkbox" bind:checked={showFull} /> Show full chunk
       </label>
     </div>
@@ -94,7 +94,7 @@
 </div>
 
 {#if error}
-  <div class="card" style="border-color: var(--danger); color: var(--danger);">
+  <div class="card" style="border-color: var(--trusty-danger); color: var(--trusty-danger);">
     {error}
   </div>
 {/if}

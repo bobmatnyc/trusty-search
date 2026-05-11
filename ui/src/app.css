@@ -1,55 +1,16 @@
-/* Why: Single source of styling for an admin-panel aesthetic without Tailwind.
-   What: CSS custom properties for theming, reset, layout primitives, and
-   component classes consumed by .svelte files via :global selectors.
-   Test: open ui/dist/index.html in a browser — sidebar dark, content light. */
+/* Why: trusty-search UI built on the shared Trusty Suite design tokens.
+   What: Imports shared tokens + base component library, then layers
+   trusty-search-specific layout (app-shell, sidebar nav, result list,
+   chat thread) on top.
+   Test: `npm run build && npm run preview` — sidebar dark, content light,
+   indigo accent matches trusty-memory. */
 
-:root {
-  --bg: #f6f7f9;
-  --panel: #ffffff;
-  --border: #e3e6ea;
-  --text: #1f2328;
-  --text-dim: #6e7781;
-  --sidebar-bg: #1f2937;
-  --sidebar-fg: #d1d5db;
-  --sidebar-active: #2563eb;
-  --accent: #2563eb;
-  --accent-hover: #1d4ed8;
-  --danger: #dc2626;
-  --danger-hover: #b91c1c;
-  --success: #16a34a;
-  --warn: #d97706;
-  --code-bg: #0f172a;
-  --code-fg: #e2e8f0;
-  --badge-hybrid: #16a34a;
-  --badge-bm25: #2563eb;
-  --badge-vector: #7c3aed;
-  --badge-fallback: #6b7280;
-  --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-}
+@import './lib/styles/tokens.css';
+@import './lib/styles/global.css';
 
-* {
-  box-sizing: border-box;
-}
-
-html, body, #app {
-  margin: 0;
-  padding: 0;
-  height: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-}
-
-a {
-  color: var(--accent);
-  text-decoration: none;
-}
-a:hover { text-decoration: underline; }
-
-/* Layout */
+/* ---------------------------------------------------------------------------
+ * Layout shell
+ * ------------------------------------------------------------------------- */
 .app-shell {
   display: grid;
   grid-template-rows: 48px 1fr;
@@ -61,14 +22,18 @@ a:hover { text-decoration: underline; }
 }
 .topbar { grid-area: topbar; }
 .sidebar { grid-area: sidebar; }
-.main { grid-area: main; overflow: auto; padding: 24px; }
+.main {
+  grid-area: main;
+  overflow: auto;
+  padding: var(--trusty-space-5);
+}
 
 /* Top bar */
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
+  padding: 0 var(--trusty-space-4);
   background: #111827;
   color: #f3f4f6;
   border-bottom: 1px solid #000;
@@ -76,33 +41,33 @@ a:hover { text-decoration: underline; }
 .topbar .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--trusty-space-2);
   font-weight: 600;
 }
 .topbar .brand .logo { font-size: 18px; }
 .topbar .version {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: #9ca3af;
+  font-family: var(--trusty-mono);
+  font-size: var(--trusty-fs-xs);
+  color: var(--trusty-sidebar-muted);
 }
 .topbar .health {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--trusty-fs-xs);
 }
 .topbar .dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: #6b7280;
 }
-.topbar .dot.ok { background: #22c55e; }
-.topbar .dot.bad { background: #ef4444; }
+.topbar .dot.ok { background: var(--trusty-success); }
+.topbar .dot.bad { background: var(--trusty-danger); }
 
 /* Sidebar */
 .sidebar {
-  background: var(--sidebar-bg);
-  color: var(--sidebar-fg);
-  padding: 16px 0;
+  background: var(--trusty-sidebar-bg);
+  color: var(--trusty-sidebar-text);
+  padding: var(--trusty-space-4) 0;
   display: flex;
   flex-direction: column;
 }
@@ -111,36 +76,47 @@ a:hover { text-decoration: underline; }
   align-items: center;
   gap: 10px;
   padding: 10px 20px;
-  color: var(--sidebar-fg);
+  color: var(--trusty-sidebar-text);
   cursor: pointer;
   border-left: 3px solid transparent;
-  font-size: 14px;
+  font-size: var(--trusty-fs-sm);
   user-select: none;
 }
-.sidebar .nav-item:hover { background: rgba(255, 255, 255, 0.05); }
+.sidebar .nav-item:hover {
+  background: var(--trusty-sidebar-active);
+}
 .sidebar .nav-item.active {
-  background: rgba(37, 99, 235, 0.15);
-  border-left-color: var(--sidebar-active);
+  background: var(--trusty-sidebar-active);
+  border-left-color: var(--trusty-sidebar-accent);
   color: #fff;
 }
 .sidebar .nav-icon { width: 18px; text-align: center; }
 
-/* Cards / panels */
+/* ---------------------------------------------------------------------------
+ * Card overrides
+ *
+ * Why: trusty-search uses .card as a flat padded container (no card-header /
+ * card-body subdivisions). The shared .card has no padding, so we add it back
+ * here without touching the shared file.
+ * ------------------------------------------------------------------------- */
 .card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: var(--shadow);
-  padding: 20px;
-  margin-bottom: 16px;
+  padding: var(--trusty-space-5);
+  margin-bottom: var(--trusty-space-4);
 }
 .card h2 { margin-top: 0; }
-.card .card-sub { color: var(--text-dim); font-size: 13px; margin-top: -4px; margin-bottom: 16px; }
+.card .card-sub {
+  color: var(--trusty-text-muted);
+  font-size: 13px;
+  margin-top: -4px;
+  margin-bottom: var(--trusty-space-4);
+}
 
-h1 { font-size: 22px; margin: 0 0 16px; }
-h2 { font-size: 16px; margin: 0 0 12px; }
+h1 { font-size: 22px; margin: 0 0 var(--trusty-space-4); }
+h2 { font-size: 16px; margin: 0 0 var(--trusty-space-3); }
 
-/* Tables */
+/* ---------------------------------------------------------------------------
+ * Tables (bare element styles — trusty-search uses raw <table>)
+ * ------------------------------------------------------------------------- */
 table {
   width: 100%;
   border-collapse: collapse;
@@ -149,163 +125,192 @@ table {
 th, td {
   text-align: left;
   padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--trusty-border);
 }
 th {
   background: #f9fafb;
   font-weight: 600;
-  color: var(--text-dim);
-  font-size: 12px;
+  color: var(--trusty-text-muted);
+  font-size: var(--trusty-fs-xs);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 tr:last-child td { border-bottom: none; }
 
-/* Buttons */
-button, .btn {
+/* ---------------------------------------------------------------------------
+ * Buttons (bare <button> + variant classes)
+ *
+ * Note: the shared library exposes .btn / .btn-primary / .btn-danger, but
+ * trusty-search components use bare <button> + button.primary / button.danger /
+ * button.ghost. Preserve that surface here.
+ * ------------------------------------------------------------------------- */
+button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 6px 12px;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: var(--text);
-  border-radius: 4px;
+  border: 1px solid var(--trusty-border);
+  background: var(--trusty-card-bg);
+  color: var(--trusty-text-primary);
+  border-radius: var(--trusty-radius-sm);
   cursor: pointer;
   font-size: 13px;
   font-family: inherit;
 }
-button:hover:not(:disabled), .btn:hover { background: #f3f4f6; }
+button:hover:not(:disabled) { background: #f3f4f6; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--trusty-accent);
+  border-color: var(--trusty-accent);
+  color: var(--trusty-text-inverse);
 }
-button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+button.primary:hover:not(:disabled) {
+  background: var(--trusty-accent-hover);
+  border-color: var(--trusty-accent-hover);
+}
 button.danger {
-  background: var(--danger);
-  border-color: var(--danger);
-  color: #fff;
+  background: var(--trusty-danger);
+  border-color: var(--trusty-danger);
+  color: var(--trusty-text-inverse);
 }
-button.danger:hover:not(:disabled) { background: var(--danger-hover); }
+button.danger:hover:not(:disabled) {
+  background: #b91c1c;
+  border-color: #b91c1c;
+}
 button.ghost {
   border: 1px solid transparent;
   background: transparent;
 }
 
-/* Form controls */
+/* ---------------------------------------------------------------------------
+ * Form controls (bare element styles)
+ * ------------------------------------------------------------------------- */
 input[type=text], input[type=number], textarea, select {
   width: 100%;
   padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  border: 1px solid var(--trusty-border);
+  border-radius: var(--trusty-radius-sm);
   font-size: 13px;
   font-family: inherit;
-  background: #fff;
-  color: var(--text);
+  background: var(--trusty-card-bg);
+  color: var(--trusty-text-primary);
 }
 input:focus, textarea:focus, select:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+  border-color: var(--trusty-accent);
+  box-shadow: 0 0 0 3px var(--trusty-accent-soft);
 }
 .field { margin-bottom: 12px; }
 .field label {
   display: block;
-  font-size: 12px;
+  font-size: var(--trusty-fs-xs);
   margin-bottom: 4px;
-  color: var(--text-dim);
+  color: var(--trusty-text-muted);
   font-weight: 500;
 }
 .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
 .row > * { flex: 1; min-width: 160px; }
 .row .shrink { flex: 0 0 auto; min-width: auto; }
 
-/* Badges */
-.badge {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 12px;
-  font-size: 11px;
-  font-weight: 600;
+/* ---------------------------------------------------------------------------
+ * Badges — trusty-search uses solid-color variants for match reasons.
+ *
+ * Note: the shared .badge is a pill with a soft background; these variants
+ * override to solid color + white text to communicate categorical match types.
+ * ------------------------------------------------------------------------- */
+.badge.hybrid,
+.badge.bm25,
+.badge.vector,
+.badge.fallback,
+.badge.unknown {
   color: #fff;
+  font-weight: 600;
   text-transform: lowercase;
+  font-size: 11px;
+  padding: 2px 8px;
 }
-.badge.hybrid { background: var(--badge-hybrid); }
-.badge.bm25 { background: var(--badge-bm25); }
-.badge.vector { background: var(--badge-vector); }
-.badge.fallback, .badge.unknown { background: var(--badge-fallback); }
+.badge.hybrid { background: var(--trusty-success); }
+.badge.bm25 { background: var(--trusty-accent); }
+.badge.vector { background: #7c3aed; }
+.badge.fallback,
+.badge.unknown { background: #6b7280; }
 
-/* Code & snippets */
+/* ---------------------------------------------------------------------------
+ * Code & snippets
+ * ------------------------------------------------------------------------- */
 pre.snippet {
-  background: var(--code-bg);
-  color: var(--code-fg);
+  background: #0f172a;
+  color: #e2e8f0;
   padding: 12px;
-  border-radius: 4px;
-  font-family: var(--mono);
+  border-radius: var(--trusty-radius-sm);
+  font-family: var(--trusty-mono);
   font-size: 12px;
   overflow-x: auto;
-  margin: 8px 0 0 0;
+  margin: var(--trusty-space-2) 0 0 0;
   line-height: 1.45;
   white-space: pre;
 }
-.mono { font-family: var(--mono); }
+.mono { font-family: var(--trusty-mono); }
 
-/* Search results */
+/* ---------------------------------------------------------------------------
+ * Search results
+ * ------------------------------------------------------------------------- */
 .result-item {
   padding: 12px 0;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--trusty-border);
 }
 .result-item:last-child { border-bottom: none; }
 .result-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--trusty-space-2);
   flex-wrap: wrap;
 }
 .result-file {
-  font-family: var(--mono);
+  font-family: var(--trusty-mono);
   font-size: 13px;
-  color: var(--accent);
+  color: var(--trusty-accent);
   font-weight: 500;
 }
 .result-score {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--trusty-text-muted);
 }
 
-/* Utility */
-.muted { color: var(--text-dim); }
+/* ---------------------------------------------------------------------------
+ * Utility additions specific to trusty-search
+ *
+ * Note: shared global.css provides .empty (centered, muted). trusty-search's
+ * older .empty was italic — keeping with the shared definition for cross-app
+ * consistency. .muted is provided here as a thin alias to .text-muted because
+ * existing markup uses class="muted".
+ * ------------------------------------------------------------------------- */
+.muted { color: var(--trusty-text-muted); }
 .danger-zone {
-  border: 1px dashed var(--danger);
-  padding: 16px;
-  border-radius: 6px;
-  background: #fef2f2;
-}
-.empty {
-  color: var(--text-dim);
-  font-style: italic;
-  text-align: center;
-  padding: 24px;
+  border: 1px dashed var(--trusty-danger);
+  padding: var(--trusty-space-4);
+  border-radius: var(--trusty-radius);
+  background: var(--trusty-danger-soft);
 }
 .spinner {
   display: inline-block;
   width: 12px; height: 12px;
-  border: 2px solid var(--border);
-  border-top-color: var(--accent);
+  border: 2px solid var(--trusty-border);
+  border-top-color: var(--trusty-accent);
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* Chat */
+/* ---------------------------------------------------------------------------
+ * Chat
+ * ------------------------------------------------------------------------- */
 .chat-thread {
   max-height: 60vh;
   overflow-y: auto;
-  padding: 8px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  padding: var(--trusty-space-2);
+  border: 1px solid var(--trusty-border);
+  border-radius: var(--trusty-radius-sm);
   background: #fbfbfc;
   margin-bottom: 12px;
 }
@@ -313,15 +318,15 @@ pre.snippet {
 .chat-msg .role {
   font-size: 11px;
   font-weight: 600;
-  color: var(--text-dim);
+  color: var(--trusty-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   margin-bottom: 2px;
 }
-.chat-msg.user .body { background: #e0f2fe; }
+.chat-msg.user .body { background: var(--trusty-info-soft); }
 .chat-msg.assistant .body { background: #f1f5f9; }
 .chat-msg .body {
-  padding: 8px 12px;
-  border-radius: 6px;
+  padding: var(--trusty-space-2) 12px;
+  border-radius: var(--trusty-radius);
   white-space: pre-wrap;
 }

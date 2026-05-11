@@ -1,0 +1,71 @@
+/*
+ * Trusty Suite design tokens.
+ *
+ * Why: A shared palette + typography across trusty-memory, trusty-search,
+ * and other Trusty tools. Reuse this file (or import these custom properties)
+ * in sibling projects to keep the visual identity coherent.
+ * What: CSS custom properties scoped to :root.
+ * Test: Inspect any .trusty-* class in DevTools and confirm values resolve.
+ */
+:root {
+  /* Sidebar (dark) */
+  --trusty-sidebar-bg: #1e1e2e;
+  --trusty-sidebar-text: #cdd6f4;
+  --trusty-sidebar-muted: #7f849c;
+  --trusty-sidebar-accent: #89b4fa;
+  --trusty-sidebar-active: #313244;
+  --trusty-sidebar-border: #313244;
+
+  /* Content (light) */
+  --trusty-content-bg: #f8f9fc;
+  --trusty-card-bg: #ffffff;
+  --trusty-border: #e2e8f0;
+  --trusty-border-strong: #cbd5e1;
+
+  /* Text */
+  --trusty-text-primary: #1e293b;
+  --trusty-text-secondary: #475569;
+  --trusty-text-muted: #64748b;
+  --trusty-text-inverse: #ffffff;
+
+  /* Accents */
+  --trusty-accent: #6366f1;
+  --trusty-accent-hover: #4f46e5;
+  --trusty-accent-soft: #eef2ff;
+  --trusty-success: #22c55e;
+  --trusty-success-soft: #dcfce7;
+  --trusty-warning: #f59e0b;
+  --trusty-warning-soft: #fef3c7;
+  --trusty-danger: #ef4444;
+  --trusty-danger-soft: #fee2e2;
+  --trusty-info: #0ea5e9;
+  --trusty-info-soft: #e0f2fe;
+
+  /* Typography */
+  --trusty-font: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --trusty-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, Menlo, monospace;
+  --trusty-fs-xs: 0.75rem;
+  --trusty-fs-sm: 0.875rem;
+  --trusty-fs-md: 1rem;
+  --trusty-fs-lg: 1.125rem;
+  --trusty-fs-xl: 1.5rem;
+  --trusty-fs-2xl: 2rem;
+
+  /* Surface */
+  --trusty-radius-sm: 4px;
+  --trusty-radius: 8px;
+  --trusty-radius-lg: 12px;
+  --trusty-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --trusty-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --trusty-shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.1);
+
+  /* Layout */
+  --trusty-sidebar-width: 240px;
+  --trusty-topbar-height: 60px;
+  --trusty-space-1: 4px;
+  --trusty-space-2: 8px;
+  --trusty-space-3: 12px;
+  --trusty-space-4: 16px;
+  --trusty-space-5: 24px;
+  --trusty-space-6: 32px;
+}
