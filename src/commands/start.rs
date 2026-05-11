@@ -10,14 +10,28 @@ use colored::Colorize;
 /// `CodeIndexer` and the HNSW lane silently contributes nothing — the symptom
 /// seen in the 115k-chunk benchmark where every result returned
 /// `match_reason: "bm25"`.
-async fn build_embedder() -> Option<std::sync::Arc<dyn crate::core::Embedder>> {
-    match crate::core::FastEmbedder::new().await {
-        Ok(e) => Some(std::sync::Arc::new(e)),
-        Err(e) => {
-            tracing::warn!("FastEmbedder init failed ({e}); daemon falling back to BM25-only mode");
-            None
-        }
-    }
+///
+/// Why (blocking init): previously a failure here returned `None` and the
+/// daemon continued in BM25-only mode without any visible signal — operators
+/// only noticed when every search returned `match_reason: "bm25"` and an
+/// entire 17k-file repo "indexed" in 12 seconds (no ONNX work happened).
+/// Now: success is logged at INFO with the embedding dimension so operators
+/// can confirm the model loaded; failure is logged at ERROR and propagated
+/// so the daemon exits non-zero rather than silently degrading.
+/// Test: run `trusty-search start` with `RUST_LOG=info` — the log MUST
+/// contain `embedder initialized: dim=384` before any HTTP request is
+/// accepted. Force a failure (e.g. delete the model cache while offline)
+/// and the daemon must exit non-zero, not start in BM25 mode.
+async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
+    let embedder = crate::core::FastEmbedder::new()
+        .await
+        .map_err(|e| {
+            tracing::error!("FastEmbedder init failed: {e:#}");
+            anyhow::anyhow!("FastEmbedder init failed: {e}")
+        })?;
+    let dim = <crate::core::FastEmbedder as crate::core::Embedder>::dimension(&embedder);
+    tracing::info!("embedder initialized: model=AllMiniLML6V2(Q) dim={dim}");
+    Ok(std::sync::Arc::new(embedder))
 }
 
 /// Why: extracted from `main()`. The boot sequence is intricate (lockfile probe,
@@ -58,17 +72,29 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // Fall through to `run_daemon` — its `acquire_lock` will either succeed
     // (lock now free) or return AlreadyRunning, handled below.
 
-    let embedder = build_embedder().await;
+    // Block daemon startup on embedder readiness. If the embedder fails to
+    // load, exit non-zero rather than silently degrading to BM25-only mode —
+    // a degraded daemon is worse than no daemon because callers can't tell
+    // their search results are missing the vector lane.
+    let embedder = match build_embedder().await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "{} embedder failed to initialize: {e}\n\
+                 Daemon refuses to start in BM25-only mode (vector search would be silently disabled).\n\
+                 Check the model cache at ~/Library/Caches/trusty-search/models/ and network access.",
+                "✗".red()
+            );
+            std::process::exit(1);
+        }
+    };
     let cfg = crate::service::load_user_config();
 
-    let mut state =
-        crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
-            .with_local_model(cfg.local_model)
-            .with_openrouter_model(cfg.openrouter_model)
-            .with_openrouter_api_key(cfg.openrouter_api_key);
-    if let Some(e) = embedder {
-        state = state.with_embedder(e);
-    }
+    let state = crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
+        .with_local_model(cfg.local_model)
+        .with_openrouter_model(cfg.openrouter_model)
+        .with_openrouter_api_key(cfg.openrouter_api_key)
+        .with_embedder(embedder);
     match crate::service::run_daemon(state, port).await {
         Ok(()) => {}
         Err(crate::service::DaemonError::AlreadyRunning(p)) => {

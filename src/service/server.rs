@@ -248,6 +248,14 @@ struct HealthResponse {
     version: &'static str,
     indexes: usize,
     uptime_secs: u64,
+    /// Why: operators previously had no way to tell whether the daemon
+    /// loaded the embedding model. Silent BM25-only fallback wasted hours
+    /// of debugging on "17k files indexed in 12 seconds" symptoms. Now
+    /// `/health` reports `"ready"` when an embedder is attached and
+    /// `"unavailable"` when the daemon is running BM25-only.
+    /// What: `"ready"` if `state.embedder.is_some()` else `"unavailable"`.
+    /// Test: start daemon, GET /health, assert `embedder == "ready"`.
+    embedder: &'static str,
 }
 
 #[derive(Serialize)]
@@ -370,6 +378,11 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
         version: env!("CARGO_PKG_VERSION"),
         indexes: state.registry.list().len(),
         uptime_secs: state.started_at.elapsed().as_secs(),
+        embedder: if state.embedder.is_some() {
+            "ready"
+        } else {
+            "unavailable"
+        },
     })
 }
 
@@ -980,6 +993,8 @@ mod tests {
         assert_eq!(resp.indexes, 1);
         // uptime_secs is u64 — always >= 0 by type; just exercise the path.
         let _ = resp.uptime_secs;
+        // No embedder attached in this test → "unavailable".
+        assert_eq!(resp.embedder, "unavailable");
     }
 
     /// Issue #10 — `POST /search` fan-out: with two registered indexes each
