@@ -96,7 +96,7 @@ pub struct SearchAppState {
     /// and the `/api/chat/providers` payload.
     pub local_model: LocalModelConfig,
     /// OpenRouter model id (loaded from config; default
-    /// `anthropic/claude-haiku-4`). Used by the OpenRouter fallback provider.
+    /// `anthropic/claude-haiku-4.5`). Used by the OpenRouter fallback provider.
     pub openrouter_model: String,
     /// OpenRouter API key resolved at startup. May be empty when the user
     /// only configured a local model; the chat handler returns 503 in that case.
@@ -133,7 +133,7 @@ impl SearchAppState {
             openrouter_enabled: !openrouter_api_key.is_empty(),
             started_at: Instant::now(),
             local_model: LocalModelConfig::default(),
-            openrouter_model: "anthropic/claude-haiku-4".to_string(),
+            openrouter_model: "anthropic/claude-haiku-4.5".to_string(),
             openrouter_api_key,
             chat_provider: Arc::new(OnceCell::new()),
             events: Arc::new(events_tx),
@@ -159,7 +159,7 @@ impl SearchAppState {
     }
 
     /// Builder-style: override the OpenRouter model id (defaults to
-    /// `anthropic/claude-haiku-4`).
+    /// `anthropic/claude-haiku-4.5`).
     pub fn with_openrouter_model(mut self, model: impl Into<String>) -> Self {
         self.openrouter_model = model.into();
         self

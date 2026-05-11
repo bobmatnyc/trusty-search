@@ -153,7 +153,7 @@ fn cache_control_for(path: &str) -> &'static str {
 /// Programmatic callers (MCP, CLI) may instead supply `api_key` in the body.
 /// What: Caller supplies `index_id` (the collection to ground the question
 /// in), the new `message` (or `question`), optional prior `history`,
-/// optional `model` (default `anthropic/claude-haiku-4`), optional `top_k`
+/// optional `model` (default `anthropic/claude-haiku-4.5`), optional `top_k`
 /// (default 5), and optional `api_key`. The handler runs a search to gather
 /// context, then forwards a chat completion request to OpenRouter.
 /// Test: With `OPENROUTER_API_KEY` unset and no `api_key` in body →
@@ -167,7 +167,7 @@ pub struct ChatRequest {
     pub message: String,
     #[serde(default)]
     pub history: Vec<ChatMessage>,
-    /// OpenRouter model id. Defaults to `anthropic/claude-haiku-4`.
+    /// OpenRouter model id. Defaults to `anthropic/claude-haiku-4.5`.
     #[serde(default)]
     pub model: Option<String>,
     /// Number of context chunks to retrieve. Defaults to 5.
@@ -182,9 +182,9 @@ pub struct ChatRequest {
 ///
 /// Why: Centralize the default so MCP, HTTP, and CLI all agree.
 /// What: Returns the model id literal.
-/// Test: `assert_eq!(default_model(), "anthropic/claude-haiku-4")`.
+/// Test: `assert_eq!(default_model(), "anthropic/claude-haiku-4.5")`.
 pub fn default_model() -> &'static str {
-    "anthropic/claude-haiku-4"
+    "anthropic/claude-haiku-4.5"
 }
 
 #[derive(Deserialize, serde::Serialize, Clone)]

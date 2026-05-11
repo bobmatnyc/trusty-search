@@ -8,7 +8,7 @@
 //!
 //! What: `~/.trusty-search/config.toml` is optional. When absent, defaults
 //! apply (Ollama at localhost:11434, model `llama3.2`, OpenRouter model
-//! `anthropic/claude-haiku-4`). Unknown keys are ignored to keep forward
+//! `anthropic/claude-haiku-4.5`). Unknown keys are ignored to keep forward
 //! compatibility.
 //!
 //! Test: `load_user_config_returns_defaults_when_missing` and
@@ -19,7 +19,7 @@ use trusty_common::LocalModelConfig;
 
 /// Default OpenRouter model when the user hasn't specified one.
 fn default_openrouter_model() -> String {
-    "anthropic/claude-haiku-4".to_string()
+    "anthropic/claude-haiku-4.5".to_string()
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -77,7 +77,7 @@ impl Default for LocalModelSection {
 /// the codebase from juggling `Option<...>` everywhere.
 /// What: `openrouter_api_key` resolves to the env var when set, otherwise the
 /// TOML value. `openrouter_model` falls back to
-/// `anthropic/claude-haiku-4`. `local_model` is the [`LocalModelConfig`]
+/// `anthropic/claude-haiku-4.5`. `local_model` is the [`LocalModelConfig`]
 /// from trusty-common.
 /// Test: `parses_local_model_section`.
 #[derive(Clone, Debug)]

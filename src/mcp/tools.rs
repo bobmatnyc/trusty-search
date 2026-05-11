@@ -566,7 +566,7 @@ pub fn tool_descriptors() -> Value {
             "description": "Ask a natural-language question about the indexed codebase. \
                             Automatically searches for the top_k most relevant chunks and \
                             sends them as context to an OpenRouter LLM (default model: \
-                            anthropic/claude-haiku-4). Returns {answer, sources, model}. \
+                            anthropic/claude-haiku-4.5). Returns {answer, sources, model}. \
                             Requires OPENROUTER_API_KEY env var on the daemon, or an \
                             `api_key` field in the request.",
             "inputSchema": {
@@ -577,7 +577,7 @@ pub fn tool_descriptors() -> Value {
                     "message":  { "type": "string", "description": "User question (alias: question)" },
                     "question": { "type": "string", "description": "User question (alias: message)" },
                     "history":  { "type": "array", "items": { "type": "object" } },
-                    "model":    { "type": "string", "description": "OpenRouter model id (default: anthropic/claude-haiku-4)" },
+                    "model":    { "type": "string", "description": "OpenRouter model id (default: anthropic/claude-haiku-4.5)" },
                     "top_k":    { "type": "integer", "description": "Number of context chunks (default: 5)", "default": 5 },
                     "api_key":  { "type": "string", "description": "Fallback OpenRouter API key when OPENROUTER_API_KEY env is unset" }
                 }
