@@ -33,6 +33,7 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_stream::wrappers::BroadcastStream;
 use trusty_search_core::{
     classifier::QueryClassifier,
@@ -69,6 +70,9 @@ pub struct SearchAppState {
     /// Whether `OPENROUTER_API_KEY` is set when the daemon starts. Toggles
     /// the Chat panel in the SPA via `window.__OPENROUTER_ENABLED__`.
     pub openrouter_enabled: bool,
+    /// Monotonic timestamp captured when the AppState was constructed.
+    /// Used to compute `uptime_secs` in the `/health` response (issue #34).
+    pub started_at: Instant,
 }
 
 impl SearchAppState {
@@ -84,6 +88,7 @@ impl SearchAppState {
             embedder: None,
             daemon_port: None,
             openrouter_enabled: std::env::var("OPENROUTER_API_KEY").is_ok(),
+            started_at: Instant::now(),
         }
     }
 
@@ -108,6 +113,7 @@ struct HealthResponse {
     status: &'static str,
     version: &'static str,
     indexes: usize,
+    uptime_secs: u64,
 }
 
 #[derive(Serialize)]
@@ -250,13 +256,16 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
     // a running trusty-search daemon before spawning their own. Including
     // `indexes` count lets the caller verify the daemon is not only alive but
     // also has the expected registry populated (issue #34).
-    // What: returns `{ status, version, indexes }` where `indexes` is the
-    // number of registered IndexHandles in the registry.
-    // Test: register N indexes, GET /health, assert `indexes == N`.
+    // What: returns `{ status, version, indexes, uptime_secs }` where
+    // `indexes` is the number of registered IndexHandles in the registry
+    // and `uptime_secs` is wall-clock seconds since AppState construction.
+    // Test: register N indexes, GET /health, assert `indexes == N` and
+    // `uptime_secs >= 0`.
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         indexes: state.registry.list().len(),
+        uptime_secs: state.started_at.elapsed().as_secs(),
     })
 }
 

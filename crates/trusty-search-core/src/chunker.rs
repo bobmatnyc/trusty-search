@@ -576,10 +576,497 @@ fn rust_impl_type_name(node: Node<'_>, src: &[u8]) -> Option<String> {
     )
 }
 
+/// Maximum lines for a JSON file to be indexed as a single chunk. Files
+/// larger than this are skipped (JSON is hard to chunk meaningfully).
+const JSON_MAX_LINES: usize = 500;
+
+/// Maximum lines per plaintext / log chunk. Long paragraphs are split.
+const PLAINTEXT_MAX_LINES: usize = 50;
+
+/// Structured document chunker.
+///
+/// Why: code-aware chunking is the wrong tool for prose, config, and log
+/// formats; sliding-window chunking shreds heading structure. Format-aware
+/// chunking yields semantically coherent BM25/vector candidates.
+/// What: dispatches on extension to per-format chunkers:
+///   - md/mdx  → section-per-heading
+///   - yaml/yml → top-level key sections
+///   - toml    → `[section]` blocks
+///   - json    → whole file if < 500 lines, otherwise skip
+///   - txt/log → blank-line paragraphs, capped at 50 lines/chunk
+///   - xml     → top-level child elements
+///
+/// Returns `None` for unknown extensions so the caller can fall back to the
+/// sliding-window chunker.
+///
+/// Test: see `test_chunk_markdown_*`, `test_chunk_yaml_*`, etc. below.
+pub fn chunk_document(file: &str, content: &str) -> Option<Vec<RawChunk>> {
+    let ext = std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let chunks = match ext.as_str() {
+        "md" | "mdx" => chunk_markdown(file, content),
+        "yaml" | "yml" => chunk_yaml(file, content),
+        "toml" => chunk_toml(file, content),
+        "json" => chunk_json(file, content)?,
+        "txt" | "log" => chunk_plaintext(file, content),
+        "xml" => chunk_xml(file, content),
+        _ => return None,
+    };
+    Some(chunks)
+}
+
+/// Build a generic document chunk with a specific language tag and chunk type.
+fn document_chunk(
+    file: &str,
+    start_line: usize,
+    end_line: usize,
+    content: String,
+    function_name: Option<String>,
+    language: &str,
+    chunk_type: ChunkType,
+) -> RawChunk {
+    let id = match &function_name {
+        Some(name) if !name.is_empty() => {
+            format!("{file}::{}::{name}::{start_line}", chunk_type.as_str())
+        }
+        _ => format!("{file}:{start_line}:{end_line}"),
+    };
+    RawChunk {
+        id,
+        file: file.to_string(),
+        start_line,
+        end_line,
+        content,
+        function_name,
+        language: Some(language.to_string()),
+        chunk_type,
+        calls: Vec::new(),
+        inherits_from: Vec::new(),
+        chunk_depth: 0,
+        parent_chunk_id: None,
+        child_chunk_ids: Vec::new(),
+        nlp_keywords: Vec::new(),
+        nlp_code_refs: Vec::new(),
+        virtual_terms: Vec::new(),
+    }
+}
+
+/// Markdown: split on `^#+ ` headings. Each heading + its body becomes one
+/// chunk. Content before the first heading becomes a leading chunk.
+fn chunk_markdown(file: &str, content: &str) -> Vec<RawChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<RawChunk> = Vec::new();
+    let mut section_start = 0usize;
+    let mut section_heading: Option<String> = None;
+    let mut in_code_fence = false;
+
+    let flush = |out: &mut Vec<RawChunk>,
+                 start: usize,
+                 end: usize,
+                 heading: &Option<String>,
+                 lines: &[&str]| {
+        if start >= end {
+            return;
+        }
+        let text = lines[start..end].join("\n");
+        if text.trim().is_empty() {
+            return;
+        }
+        out.push(document_chunk(
+            file,
+            start + 1,
+            end,
+            text,
+            heading.clone(),
+            "markdown",
+            ChunkType::Docstring,
+        ));
+    };
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        // Track fenced code blocks so we don't treat `#` inside code as headings.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            // Heading line — flush previous section.
+            flush(&mut out, section_start, i, &section_heading, &lines);
+            // Extract heading text (strip leading #'s and whitespace).
+            let heading = trimmed.trim_start_matches('#').trim().to_string();
+            section_heading = if heading.is_empty() {
+                None
+            } else {
+                Some(heading)
+            };
+            section_start = i;
+        }
+    }
+    // Final section.
+    flush(
+        &mut out,
+        section_start,
+        lines.len(),
+        &section_heading,
+        &lines,
+    );
+
+    if out.is_empty() {
+        // No content matched: fall back to a single whole-file chunk.
+        out.push(document_chunk(
+            file,
+            1,
+            lines.len(),
+            content.to_string(),
+            None,
+            "markdown",
+            ChunkType::Docstring,
+        ));
+    }
+    out
+}
+
+/// YAML: split on top-level keys (lines starting at column 0 with `key:`).
+/// Comments and blank lines are bundled with the following key's section.
+fn chunk_yaml(file: &str, content: &str) -> Vec<RawChunk> {
+    chunk_by_top_level_key(file, content, "yaml", |line| {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        // Top-level YAML key: starts at col 0, not indented, contains ':'.
+        if !line.starts_with(|c: char| c.is_whitespace() || c == '-') {
+            if let Some(idx) = trimmed.find(':') {
+                let key = trimmed[..idx].trim();
+                if !key.is_empty() && !key.contains(' ') {
+                    return Some(key.to_string());
+                }
+            }
+        }
+        None
+    })
+}
+
+/// TOML: split on `[section]` and `[[array.section]]` headers at column 0.
+fn chunk_toml(file: &str, content: &str) -> Vec<RawChunk> {
+    chunk_by_top_level_key(file, content, "toml", |line| {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let inner = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .to_string();
+            if !inner.is_empty() {
+                return Some(inner);
+            }
+        }
+        None
+    })
+}
+
+/// Generic top-level-key chunker. `header_of(line)` returns `Some(name)` when
+/// the line starts a new section. Content before the first header is emitted
+/// as a leading "preamble" chunk.
+fn chunk_by_top_level_key(
+    file: &str,
+    content: &str,
+    language: &str,
+    header_of: impl Fn(&str) -> Option<String>,
+) -> Vec<RawChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<RawChunk> = Vec::new();
+    let mut section_start = 0usize;
+    let mut section_name: Option<String> = None;
+
+    let flush = |out: &mut Vec<RawChunk>,
+                 start: usize,
+                 end: usize,
+                 name: &Option<String>,
+                 lines: &[&str]| {
+        if start >= end {
+            return;
+        }
+        let text = lines[start..end].join("\n");
+        if text.trim().is_empty() {
+            return;
+        }
+        out.push(document_chunk(
+            file,
+            start + 1,
+            end,
+            text,
+            name.clone(),
+            language,
+            ChunkType::Constant,
+        ));
+    };
+
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(name) = header_of(line) {
+            flush(&mut out, section_start, i, &section_name, &lines);
+            section_name = Some(name);
+            section_start = i;
+        }
+    }
+    flush(&mut out, section_start, lines.len(), &section_name, &lines);
+
+    if out.is_empty() {
+        out.push(document_chunk(
+            file,
+            1,
+            lines.len(),
+            content.to_string(),
+            None,
+            language,
+            ChunkType::Constant,
+        ));
+    }
+    out
+}
+
+/// JSON: if the file has fewer than `JSON_MAX_LINES` lines, emit a single
+/// whole-file chunk. Otherwise return `Some(empty)` to signal "skip indexing".
+fn chunk_json(file: &str, content: &str) -> Option<Vec<RawChunk>> {
+    let line_count = content.lines().count();
+    if line_count == 0 {
+        return Some(Vec::new());
+    }
+    if line_count >= JSON_MAX_LINES {
+        // Skip large JSON: it's effectively un-chunkable and dominates BM25
+        // with structural punctuation noise.
+        return Some(Vec::new());
+    }
+    Some(vec![document_chunk(
+        file,
+        1,
+        line_count,
+        content.to_string(),
+        None,
+        "json",
+        ChunkType::Constant,
+    )])
+}
+
+/// Plaintext / logs: split on blank-line paragraphs, cap at
+/// `PLAINTEXT_MAX_LINES` per chunk. Paragraphs longer than the cap are split
+/// into successive fixed-size sub-chunks.
+fn chunk_plaintext(file: &str, content: &str) -> Vec<RawChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let lang = match std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "log" => "log",
+        _ => "text",
+    };
+    let mut out: Vec<RawChunk> = Vec::new();
+    let mut buf_start: Option<usize> = None;
+
+    let push_buf =
+        |out: &mut Vec<RawChunk>, start: usize, end: usize, lines: &[&str], lang: &str| {
+            // Split into fixed PLAINTEXT_MAX_LINES windows (no overlap).
+            let mut s = start;
+            while s < end {
+                let e = (s + PLAINTEXT_MAX_LINES).min(end);
+                let text = lines[s..e].join("\n");
+                if !text.trim().is_empty() {
+                    out.push(document_chunk(
+                        file,
+                        s + 1,
+                        e,
+                        text,
+                        None,
+                        lang,
+                        ChunkType::Code,
+                    ));
+                }
+                s = e;
+            }
+        };
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            if let Some(start) = buf_start.take() {
+                push_buf(&mut out, start, i, &lines, lang);
+            }
+        } else if buf_start.is_none() {
+            buf_start = Some(i);
+        }
+    }
+    if let Some(start) = buf_start {
+        push_buf(&mut out, start, lines.len(), &lines, lang);
+    }
+
+    if out.is_empty() {
+        out.push(document_chunk(
+            file,
+            1,
+            lines.len(),
+            content.to_string(),
+            None,
+            lang,
+            ChunkType::Code,
+        ));
+    }
+    out
+}
+
+/// XML: split on top-level child elements via a minimal depth-tracking parser.
+/// Each direct child of the root becomes one chunk; the XML prolog and root
+/// open/close tags are emitted as separate trivial chunks if present.
+fn chunk_xml(file: &str, content: &str) -> Vec<RawChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    // Walk lines tracking element-open depth (excluding self-closing and
+    // closing tags). Depth==1 is "inside root, at top of children".
+    let mut out: Vec<RawChunk> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut child_start: Option<usize> = None;
+    let mut child_name: Option<String> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let opens = count_xml_opens(line);
+        let closes = count_xml_closes(line);
+
+        // If we're at depth 1 with no active child and this line opens a new
+        // element, start tracking.
+        if depth == 1 && child_start.is_none() && opens > closes {
+            child_start = Some(i);
+            child_name = first_xml_tag_name(line);
+        }
+
+        let prev_depth = depth;
+        depth += opens as i32;
+        depth -= closes as i32;
+
+        // Closed a top-level child: emit chunk.
+        if let Some(start) = child_start {
+            if depth <= 1 && prev_depth >= 1 && i >= start {
+                let text = lines[start..=i].join("\n");
+                if !text.trim().is_empty() {
+                    out.push(document_chunk(
+                        file,
+                        start + 1,
+                        i + 1,
+                        text,
+                        child_name.clone(),
+                        "xml",
+                        ChunkType::Class,
+                    ));
+                }
+                child_start = None;
+                child_name = None;
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.push(document_chunk(
+            file,
+            1,
+            lines.len(),
+            content.to_string(),
+            None,
+            "xml",
+            ChunkType::Class,
+        ));
+    }
+    out
+}
+
+/// Count element-opening tags on a line, excluding self-closing (`<foo/>`),
+/// closing tags (`</foo>`), prolog (`<?xml ... ?>`), comments, and DOCTYPE.
+fn count_xml_opens(line: &str) -> usize {
+    let mut count = 0usize;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            // Skip prolog/comment/doctype/closing.
+            let rest = &line[i..];
+            if rest.starts_with("<?")
+                || rest.starts_with("<!--")
+                || rest.starts_with("<!")
+                || rest.starts_with("</")
+            {
+                i += 1;
+                continue;
+            }
+            // Find the matching `>` and check if it's self-closing.
+            if let Some(close) = rest.find('>') {
+                let tag = &rest[..=close];
+                if !tag.ends_with("/>") {
+                    count += 1;
+                }
+                i += close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Count element-closing tags (`</foo>`) on a line.
+fn count_xml_closes(line: &str) -> usize {
+    line.matches("</").count()
+}
+
+/// Extract the first opening tag name from a line, e.g. `<book id="1">` → `book`.
+fn first_xml_tag_name(line: &str) -> Option<String> {
+    let start = line.find('<')?;
+    let rest = &line[start + 1..];
+    if rest.starts_with('?') || rest.starts_with('!') || rest.starts_with('/') {
+        return None;
+    }
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 /// AST-aware entry point. Returns chunks and entities produced from a single
-/// parse pass. Falls back to `chunk_text` for unknown extensions.
+/// parse pass. For structured documents (md, yaml, toml, json, xml, txt, log)
+/// dispatches to `chunk_document`. Falls back to `chunk_text` for unknown
+/// extensions.
 pub fn chunk_ast(file: &str, content: &str) -> (Vec<RawChunk>, Vec<RawEntity>) {
     let Some((lang, language)) = language_for(file) else {
+        // Try structured-document chunkers (markdown, yaml, toml, json, xml,
+        // plaintext, logs). These return None for unknown extensions and we
+        // fall back to the sliding-window chunker.
+        if let Some(chunks) = chunk_document(file, content) {
+            return (chunks, Vec::new());
+        }
         return (chunk_text(file, content, 150, 50), Vec::new());
     };
 
@@ -906,11 +1393,170 @@ fn f() {
 
     #[test]
     fn test_unknown_language_fallback() {
+        // Use an unknown extension (no document chunker matches) to verify the
+        // sliding-window fallback path.
         let content = "hello world\nfoo bar\nbaz";
-        let (chunks, entities) = chunk_ast("notes.txt", content);
+        let (chunks, entities) = chunk_ast("notes.unknownext", content);
         assert!(entities.is_empty());
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk_type, ChunkType::Code);
+    }
+
+    #[test]
+    fn test_chunk_markdown_sections() {
+        let content = "# Title\n\nintro\n\n## Section A\n\nbody a\n\n## Section B\n\nbody b\n";
+        let chunks = chunk_markdown("doc.md", content);
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple sections, got {chunks:#?}"
+        );
+        let names: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.function_name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "Section A"), "names={names:?}");
+        assert!(names.iter().any(|n| n == "Section B"), "names={names:?}");
+        for c in &chunks {
+            assert_eq!(c.language.as_deref(), Some("markdown"));
+            assert_eq!(c.chunk_type, ChunkType::Docstring);
+        }
+    }
+
+    #[test]
+    fn test_chunk_markdown_ignores_hash_in_code_fence() {
+        let content = "# Real Heading\n\nintro\n\n```\n## not a heading\n```\n\n## Next\n\nx\n";
+        let chunks = chunk_markdown("doc.md", content);
+        let names: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.function_name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "Real Heading"));
+        assert!(names.iter().any(|n| n == "Next"));
+        assert!(
+            !names.iter().any(|n| n == "not a heading"),
+            "should not split on # inside fenced code block: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_chunk_yaml_top_level_keys() {
+        let content = "name: foo\nversion: 1.0\n\ndeps:\n  - a\n  - b\n\nscripts:\n  build: x\n";
+        let chunks = chunk_yaml("conf.yaml", content);
+        let names: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.function_name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "name"), "names={names:?}");
+        assert!(names.iter().any(|n| n == "deps"), "names={names:?}");
+        assert!(names.iter().any(|n| n == "scripts"), "names={names:?}");
+        for c in &chunks {
+            assert_eq!(c.language.as_deref(), Some("yaml"));
+        }
+    }
+
+    #[test]
+    fn test_chunk_toml_sections() {
+        let content = "[package]\nname = \"foo\"\nversion = \"1.0\"\n\n[dependencies]\nserde = \"1\"\n\n[[bin]]\nname = \"x\"\n";
+        let chunks = chunk_toml("Cargo.toml", content);
+        let names: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.function_name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "package"), "names={names:?}");
+        assert!(names.iter().any(|n| n == "dependencies"), "names={names:?}");
+        assert!(names.iter().any(|n| n == "bin"), "names={names:?}");
+    }
+
+    #[test]
+    fn test_chunk_json_small_file_single_chunk() {
+        let content = "{\n  \"name\": \"foo\",\n  \"version\": \"1.0\"\n}\n";
+        let chunks = chunk_json("a.json", content).expect("Some result");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].language.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn test_chunk_json_large_file_skipped() {
+        let big = (0..600)
+            .map(|i| format!("  \"k{i}\": {i},"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!("{{\n{big}\n}}\n");
+        let chunks = chunk_json("big.json", &content).expect("Some result");
+        assert!(chunks.is_empty(), "expected large JSON to be skipped");
+    }
+
+    #[test]
+    fn test_chunk_plaintext_paragraphs() {
+        let content = "First paragraph line 1.\nFirst paragraph line 2.\n\nSecond paragraph line 1.\nSecond paragraph line 2.\n\nThird paragraph.\n";
+        let chunks = chunk_plaintext("note.txt", content);
+        assert_eq!(
+            chunks.len(),
+            3,
+            "expected one chunk per paragraph, got {chunks:#?}"
+        );
+        for c in &chunks {
+            assert_eq!(c.language.as_deref(), Some("text"));
+        }
+    }
+
+    #[test]
+    fn test_chunk_plaintext_caps_at_50_lines() {
+        let content = (1..=130)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = chunk_plaintext("big.log", &content);
+        assert!(
+            chunks.len() >= 3,
+            "expected at least 3 chunks for 130-line paragraph, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            let line_count = c.end_line.saturating_sub(c.start_line) + 1;
+            assert!(line_count <= 50, "chunk too large: {line_count} lines");
+            assert_eq!(c.language.as_deref(), Some("log"));
+        }
+    }
+
+    #[test]
+    fn test_chunk_xml_top_level_children() {
+        let content = "<?xml version=\"1.0\"?>\n<library>\n  <book id=\"1\">\n    <title>A</title>\n  </book>\n  <book id=\"2\">\n    <title>B</title>\n  </book>\n  <magazine>\n    <title>C</title>\n  </magazine>\n</library>\n";
+        let chunks = chunk_xml("data.xml", content);
+        let names: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.function_name.clone())
+            .collect();
+        assert!(
+            names.iter().filter(|n| *n == "book").count() >= 2,
+            "names={names:?}"
+        );
+        assert!(names.iter().any(|n| n == "magazine"), "names={names:?}");
+        for c in &chunks {
+            assert_eq!(c.language.as_deref(), Some("xml"));
+        }
+    }
+
+    #[test]
+    fn test_chunk_document_dispatch() {
+        // Verify chunk_ast routes structured documents through chunk_document.
+        let md_content = "# Hello\n\nworld\n";
+        let (md_chunks, _) = chunk_ast("readme.md", md_content);
+        assert!(md_chunks
+            .iter()
+            .any(|c| c.language.as_deref() == Some("markdown")));
+
+        let yaml_content = "key: value\n";
+        let (yaml_chunks, _) = chunk_ast("conf.yml", yaml_content);
+        assert!(yaml_chunks
+            .iter()
+            .any(|c| c.language.as_deref() == Some("yaml")));
+
+        let toml_content = "[section]\nx = 1\n";
+        let (toml_chunks, _) = chunk_ast("a.toml", toml_content);
+        assert!(toml_chunks
+            .iter()
+            .any(|c| c.language.as_deref() == Some("toml")));
     }
 
     #[test]

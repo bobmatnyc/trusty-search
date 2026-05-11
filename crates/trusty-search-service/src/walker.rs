@@ -13,17 +13,23 @@ use walkdir::WalkDir;
 
 /// Source file extensions that the indexer can handle.
 ///
-/// Java-heavy build files (`.gradle`, `.groovy`) and Kotlin (`.kt`, `.kts`)
-/// fall back to the unknown-language sliding-window chunker since their
-/// tree-sitter grammars aren't compiled in.
-/// Note: config/data formats (`toml`, `yaml`, `yml`, `json`) are intentionally
-/// excluded. They contain dependency declarations and string blobs that
-/// produced BM25 false-positives in benchmarks (e.g. `Cargo.toml` ranking #3
-/// for "error handling" because it lists `anyhow`, `thiserror`). Markdown is
-/// kept since prose docs are genuinely useful for conceptual queries.
+/// Source code is parsed with tree-sitter (AST-aware chunking). Structured
+/// documents (md, yaml, toml, json, xml, txt, log) are handled by the
+/// format-aware document chunkers in `trusty_search_core::chunker`.
+/// Java-heavy build files (`.gradle`, `.groovy`) fall back to the
+/// sliding-window chunker since their tree-sitter grammars aren't compiled in.
+#[rustfmt::skip]
 pub const SOURCE_EXTS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c", "cpp", "h", "hpp", "cs",
-    "rb", "php", "swift", "kt", "kts", "scala", "groovy", "gradle", "sh", "md",
+    // Source code
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java",
+    "c", "cpp", "h", "hpp", "cs", "rb", "php", "swift", "kt", "kts",
+    "scala", "groovy", "gradle", "sh",
+    // Documentation
+    "md", "mdx",
+    // Structured config / data
+    "yaml", "yml", "toml", "json", "xml",
+    // Plaintext / logs
+    "txt", "log",
 ];
 
 /// Directory names to skip when walking. Matched on basename only.
@@ -39,15 +45,24 @@ pub const SKIP_DIRS: &[&str] = &[
     "__pycache__",
     "dist",
     "build",
+    ".build",
     ".next",
     ".nuxt",
     ".svelte-kit",
     "vendor",
     ".cargo",
+    ".npm",
+    ".cache",
+    ".pnpm-store",
+    ".yarn",
+    ".rustup",
+    ".tox",
+    ".bundle",
     "coverage",
     ".nyc_output",
     ".pytest_cache",
     ".mypy_cache",
+    ".ruff_cache",
     // Java / Gradle / Maven build artefacts
     ".gradle",
     ".m2",
@@ -68,6 +83,27 @@ pub const SKIP_DIRS: &[&str] = &[
     ".aider",
     ".continue",
     ".obsidian",
+];
+
+/// File names (full basename) to skip unconditionally.
+///
+/// Why: lock files and dependency manifests carry no semantic value for
+/// code search — they list versions/hashes which bloat BM25 vocabulary
+/// and produce false positives (e.g. `Cargo.lock` ranking for dependency
+/// names rather than source code).
+/// What: matched on full file basename only (case-sensitive on the well-
+/// known names; the same as how the ecosystems themselves spell them).
+/// Test: see `test_skips_lock_files` below.
+pub const SKIP_FILES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "go.sum",
 ];
 
 /// File extensions that are always binary or non-parseable. These are skipped
@@ -105,6 +141,13 @@ pub fn should_skip_path(path: &Path) -> bool {
         Some(n) => n,
         None => return true, // no name → skip
     };
+
+    // Exact-name skip list (lock files, etc.). Case-sensitive: these names
+    // are spelled exactly the same way by every tool that produces them.
+    if SKIP_FILES.contains(&file_name) {
+        return true;
+    }
+
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -404,6 +447,107 @@ mod tests {
         let minified = "a".repeat(501);
         assert!(should_skip_content(Path::new("mod.mjs"), &minified));
         assert!(should_skip_content(Path::new("mod.cjs"), &minified));
+    }
+
+    // --- SKIP_FILES / lock file tests ---
+
+    #[test]
+    fn test_skips_lock_files() {
+        assert!(should_skip_path(Path::new("Cargo.lock")));
+        assert!(should_skip_path(Path::new("project/Cargo.lock")));
+        assert!(should_skip_path(Path::new("package-lock.json")));
+        assert!(should_skip_path(Path::new("yarn.lock")));
+        assert!(should_skip_path(Path::new("pnpm-lock.yaml")));
+        assert!(should_skip_path(Path::new("poetry.lock")));
+        assert!(should_skip_path(Path::new("Pipfile.lock")));
+        assert!(should_skip_path(Path::new("Gemfile.lock")));
+        assert!(should_skip_path(Path::new("composer.lock")));
+        assert!(should_skip_path(Path::new("go.sum")));
+    }
+
+    #[test]
+    fn test_does_not_skip_non_lock_named_files() {
+        // Case-sensitive: "cargo.lock" (lowercase) is not Cargo.lock, but the
+        // `.lock` extension is still in BINARY_EXTS so it would be skipped
+        // anyway. Verify a clearly unrelated filename passes through.
+        assert!(!should_skip_path(Path::new("main.rs")));
+        assert!(!should_skip_path(Path::new("locked_file.rs")));
+        assert!(!should_skip_path(Path::new("my-cargo-locker.py")));
+    }
+
+    #[test]
+    fn test_walker_skips_lock_files_in_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("Cargo.lock"), "# lock").unwrap();
+        fs::write(root.join("package-lock.json"), "{}").unwrap();
+        fs::write(root.join("yarn.lock"), "# lock").unwrap();
+        fs::write(root.join("real.rs"), "fn main() {}").unwrap();
+
+        let result = walk_source_files(root);
+        let names: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"real.rs".to_string()));
+        assert!(!names.contains(&"Cargo.lock".to_string()));
+        assert!(!names.contains(&"package-lock.json".to_string()));
+        assert!(!names.contains(&"yarn.lock".to_string()));
+    }
+
+    // --- SKIP_DIRS new entries ---
+
+    #[test]
+    fn test_walker_skips_new_skip_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in [".cache", ".npm", ".build", ".pnpm-store", ".yarn", ".tox"] {
+            let d = root.join(dir);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("trapped.rs"), "fn x() {}").unwrap();
+        }
+        fs::write(root.join("kept.rs"), "fn k() {}").unwrap();
+
+        let result = walk_source_files(root);
+        let names: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"kept.rs".to_string()));
+        assert!(
+            !names.contains(&"trapped.rs".to_string()),
+            "files inside new SKIP_DIRS must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_skip_dirs_contains_required_entries() {
+        // Issue #12 acceptance: these directory names must be in the skip list.
+        for required in [
+            "node_modules",
+            "target",
+            "vendor",
+            ".git",
+            ".cargo",
+            ".npm",
+            "dist",
+            "build",
+            ".build",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".next",
+            ".nuxt",
+            "coverage",
+            ".nyc_output",
+        ] {
+            assert!(
+                SKIP_DIRS.contains(&required),
+                "SKIP_DIRS missing required entry: {required}"
+            );
+        }
     }
 
     #[test]
