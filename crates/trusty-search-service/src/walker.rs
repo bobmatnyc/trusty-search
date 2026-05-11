@@ -16,6 +16,11 @@ use walkdir::WalkDir;
 /// Java-heavy build files (`.gradle`, `.groovy`) and Kotlin (`.kt`, `.kts`)
 /// fall back to the unknown-language sliding-window chunker since their
 /// tree-sitter grammars aren't compiled in.
+/// Note: config/data formats (`toml`, `yaml`, `yml`, `json`) are intentionally
+/// excluded. They contain dependency declarations and string blobs that
+/// produced BM25 false-positives in benchmarks (e.g. `Cargo.toml` ranking #3
+/// for "error handling" because it lists `anyhow`, `thiserror`). Markdown is
+/// kept since prose docs are genuinely useful for conceptual queries.
 pub const SOURCE_EXTS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c", "cpp", "h", "hpp", "cs",
     "rb", "php", "swift", "kt", "kts", "scala", "groovy", "gradle", "sh", "md",
