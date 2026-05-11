@@ -157,6 +157,35 @@ pub fn is_already_running() -> Option<PathBuf> {
     }
 }
 
+/// Inspect the lockfile and return the PID of a *running* daemon, if any.
+///
+/// Why: launchd treats any non-zero exit from `trusty-search start` as a
+/// crash and re-spawns it after `ThrottleInterval` — producing an infinite
+/// crash-loop when the daemon is already up and the second invocation
+/// exits 1 with "already running". Callers (notably the `start` command)
+/// need to distinguish "another live daemon is running, exit cleanly"
+/// from "stale lockfile, recover and start".
+///
+/// What: returns `Some(pid)` if a lockfile exists, contains a parseable
+/// PID, and that PID is currently alive. Returns `None` if the lockfile
+/// is absent, unparseable, or records a dead PID (stale).
+///
+/// Test: with no lockfile, returns None. With a lockfile containing
+/// `std::process::id()`, returns Some(current_pid). With a lockfile
+/// containing a known-dead PID (e.g. u32::MAX), returns None.
+pub fn running_daemon_pid() -> Option<u32> {
+    let lock_path = daemon_lock_path().ok()?;
+    if !lock_path.exists() {
+        return None;
+    }
+    let pid = read_lockfile_pid(&lock_path)?;
+    if pid_alive(pid) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
 /// Read the PID stored in the lockfile (if any). Returns `None` on parse failure.
 ///
 /// Why: the lockfile records the daemon PID so callers can detect stale
@@ -388,6 +417,34 @@ mod tests {
         write_port_file(&path, 12345).unwrap();
         let read = std::fs::read_to_string(&path).unwrap();
         assert_eq!(read.trim(), "12345");
+    }
+
+    #[test]
+    fn pid_alive_current_process_is_alive() {
+        // Why: smoke-test the PID-aliveness predicate so the launchd
+        // crash-loop fix has explicit coverage. Our own PID must register
+        // as alive; a clearly-invalid PID must not.
+        assert!(pid_alive(std::process::id()));
+        // Find a clearly-dead PID. macOS `pid_max` defaults to 99999 and
+        // Linux to 4194304; on both, a value just under i32::MAX is well
+        // beyond the legal range and `kill(pid, 0)` returns ESRCH.
+        // (u32::MAX would narrow to -1 on i32 cast, which `kill` interprets
+        // as "every process the caller can signal" — never ESRCH.)
+        assert!(!pid_alive(2_000_000_000));
+    }
+
+    #[test]
+    fn read_lockfile_pid_parses_pid() {
+        // Why: `running_daemon_pid` depends on this parser. A malformed
+        // file must return None rather than panic.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.lock");
+        std::fs::write(&good, "12345\n").unwrap();
+        assert_eq!(read_lockfile_pid(&good), Some(12345));
+
+        let bad = dir.path().join("bad.lock");
+        std::fs::write(&bad, "not-a-pid").unwrap();
+        assert_eq!(read_lockfile_pid(&bad), None);
     }
 
     #[test]

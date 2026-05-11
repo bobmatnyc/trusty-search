@@ -2127,8 +2127,17 @@ fn launchd_plist_body(exe: &std::path::Path, log_dir: &std::path::Path) -> Strin
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- KeepAlive=SuccessfulExit:false means launchd only restarts the daemon
+         on a non-zero exit. The `start` command exits 0 when a live daemon is
+         already running (idempotent fast-path); without this, launchd would
+         immediately re-spawn and crash-loop on the existing lockfile. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>{}</string>
     <key>StandardErrorPath</key>
