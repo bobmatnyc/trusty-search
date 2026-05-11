@@ -150,14 +150,12 @@ impl FactStore {
                 .open_table(FACTS_TABLE)
                 .context("open facts table for upsert")?;
 
-            let merged = if let Some(existing_bytes) = table
-                .get(fact.id)
-                .context("read existing fact for merge")?
+            let merged = if let Some(existing_bytes) =
+                table.get(fact.id).context("read existing fact for merge")?
             {
                 let existing: FactRecord = serde_json::from_slice(existing_bytes.value())
                     .context("decode existing fact for merge")?;
-                let mut prov_set: HashSet<String> =
-                    existing.provenance.into_iter().collect();
+                let mut prov_set: HashSet<String> = existing.provenance.into_iter().collect();
                 for p in &fact.provenance {
                     prov_set.insert(p.clone());
                 }
@@ -202,8 +200,8 @@ impl FactStore {
         let mut out = Vec::new();
         for row in table.iter().context("iter facts")? {
             let (_, v) = row.context("read fact row")?;
-            let fact: FactRecord = serde_json::from_slice(v.value())
-                .context("decode fact during query")?;
+            let fact: FactRecord =
+                serde_json::from_slice(v.value()).context("decode fact during query")?;
             if let Some(s) = subject {
                 if fact.subject != s {
                     continue;

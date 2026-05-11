@@ -128,10 +128,7 @@ mod tests {
     fn temporal_decay_half_life_around_69_days() {
         // ln(2)/0.01 ≈ 69.3
         let s = temporal_decay(69, 0.01);
-        assert!(
-            (s - 0.5).abs() < 0.1,
-            "expected ~0.5 at 69 days, got {s}"
-        );
+        assert!((s - 0.5).abs() < 0.1, "expected ~0.5 at 69 days, got {s}");
     }
 
     #[test]

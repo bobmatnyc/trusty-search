@@ -7,7 +7,9 @@ use tokio::sync::RwLock;
 pub struct IndexId(pub String);
 
 impl IndexId {
-    pub fn new(s: impl Into<String>) -> Self { Self(s.into()) }
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
 }
 
 impl std::fmt::Display for IndexId {
@@ -30,7 +32,9 @@ pub struct IndexRegistry {
 }
 
 impl IndexRegistry {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn register(&self, handle: IndexHandle) -> Arc<IndexHandle> {
         let handle = Arc::new(handle);
@@ -58,6 +62,10 @@ impl IndexRegistry {
         self.indexes.remove(id).is_some()
     }
 
-    pub fn len(&self) -> usize { self.indexes.len() }
-    pub fn is_empty(&self) -> bool { self.indexes.is_empty() }
+    pub fn len(&self) -> usize {
+        self.indexes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
+    }
 }

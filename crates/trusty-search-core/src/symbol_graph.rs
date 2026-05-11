@@ -159,10 +159,7 @@ impl SymbolGraph {
             name.is_some()
                 && matches!(
                     ct,
-                    ChunkType::Impl
-                        | ChunkType::Class
-                        | ChunkType::Struct
-                        | ChunkType::Module
+                    ChunkType::Impl | ChunkType::Class | ChunkType::Struct | ChunkType::Module
                 )
         });
         if has_container {
@@ -181,10 +178,7 @@ impl SymbolGraph {
             for (_chunk_id, file, name, _calls, _inh, ct) in chunks {
                 if !matches!(
                     ct,
-                    ChunkType::Impl
-                        | ChunkType::Class
-                        | ChunkType::Struct
-                        | ChunkType::Module
+                    ChunkType::Impl | ChunkType::Class | ChunkType::Struct | ChunkType::Module
                 ) {
                     continue;
                 }
@@ -199,8 +193,7 @@ impl SymbolGraph {
                     if *sib_idx == from || *sib_name == name.as_str() {
                         continue;
                     }
-                    g.graph
-                        .add_edge(from, *sib_idx, EdgeKind::ModuleContains);
+                    g.graph.add_edge(from, *sib_idx, EdgeKind::ModuleContains);
                 }
             }
         }
@@ -406,7 +399,12 @@ mod tests {
     #[test]
     fn test_callees_of_one_hop() {
         let chunks = vec![
-            chunk("a:1", "a.rs", Some("authenticate"), &["hash_password", "lookup_user"]),
+            chunk(
+                "a:1",
+                "a.rs",
+                Some("authenticate"),
+                &["hash_password", "lookup_user"],
+            ),
             chunk("p:1", "p.rs", Some("hash_password"), &[]),
             chunk("u:1", "u.rs", Some("lookup_user"), &[]),
         ];
@@ -537,11 +535,7 @@ mod tests {
         assert_eq!(impls.len(), 1);
         assert_eq!(impls[0].0, "c");
 
-        let both = g.neighbors_by_edge(
-            "a",
-            &[EdgeKind::CallsFunction, EdgeKind::Implements],
-            1,
-        );
+        let both = g.neighbors_by_edge("a", &[EdgeKind::CallsFunction, EdgeKind::Implements], 1);
         assert_eq!(both.len(), 2);
 
         // Empty edge set returns nothing.
@@ -597,30 +591,9 @@ mod tests {
         // Issue #33: a container chunk (Impl/Class/Struct/Module) should emit
         // `ModuleContains` edges to other defining symbols in the same file.
         let chunks = vec![
-            chunk_full(
-                "i:1",
-                "f.rs",
-                Some("FooImpl"),
-                &[],
-                &[],
-                ChunkType::Impl,
-            ),
-            chunk_full(
-                "m:1",
-                "f.rs",
-                Some("method_a"),
-                &[],
-                &[],
-                ChunkType::Method,
-            ),
-            chunk_full(
-                "m:2",
-                "f.rs",
-                Some("method_b"),
-                &[],
-                &[],
-                ChunkType::Method,
-            ),
+            chunk_full("i:1", "f.rs", Some("FooImpl"), &[], &[], ChunkType::Impl),
+            chunk_full("m:1", "f.rs", Some("method_a"), &[], &[], ChunkType::Method),
+            chunk_full("m:2", "f.rs", Some("method_b"), &[], &[], ChunkType::Method),
             // A symbol in a different file should NOT be contained.
             chunk_full(
                 "o:1",

@@ -16,12 +16,17 @@ impl SearchClient {
     }
 
     pub async fn health(&self) -> Result<bool> {
-        let resp = self.client.get(format!("{}/health", self.base_url)).send().await?;
+        let resp = self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await?;
         Ok(resp.status().is_success())
     }
 
     pub async fn search(&self, index_id: &str, query: SearchQuery) -> Result<Vec<CodeChunk>> {
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}/indexes/{}/search", self.base_url, index_id))
             .json(&query)
             .send()

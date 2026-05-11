@@ -38,7 +38,7 @@ use std::time::Duration;
     author,
     propagate_version = true,
     subcommand_required = true,
-    arg_required_else_help = true,
+    arg_required_else_help = true
 )]
 struct Cli {
     /// Override the auto-detected project index
@@ -487,12 +487,7 @@ async fn add_path(index_id: &str, path: &std::path::Path) -> Result<()> {
                 }
             }
         }
-        println!(
-            "{} indexed {} files ({} errors)",
-            "✓".green(),
-            ok,
-            err
-        );
+        println!("{} indexed {} files ({} errors)", "✓".green(), ok, err);
         Ok(())
     } else {
         index_single_file(&client, &base, index_id, path).await?;
@@ -666,7 +661,9 @@ async fn run_reindex_force(index_id: &str, root_path: &std::path::Path) -> Resul
         prior_chunk_count: prior,
         force: true,
     };
-    run_reindex_with(index_id, root_path, opts).await.map(|_| ())
+    run_reindex_with(index_id, root_path, opts)
+        .await
+        .map(|_| ())
 }
 
 /// Drive a reindex: POST /reindex, then connect to the SSE stream and render
@@ -705,8 +702,10 @@ async fn run_reindex_with(
         anyhow::bail!("daemon returned {} for reindex kickoff", kickoff.status());
     }
 
-    let kickoff_body: serde_json::Value =
-        kickoff.json().await.unwrap_or_else(|_| serde_json::json!({}));
+    let kickoff_body: serde_json::Value = kickoff
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
     let stream_path = kickoff_body
         .get("stream_url")
         .and_then(|v| v.as_str())
@@ -820,25 +819,16 @@ async fn run_reindex_with(
         };
         match evt.get("event").and_then(|v| v.as_str()) {
             Some("start") => {
-                let total = evt
-                    .get("total_files")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let total = evt.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0);
                 ui.set_total(total);
             }
             Some("batch") => {
-                let indexed = evt
-                    .get("indexed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let indexed = evt.get("indexed").and_then(|v| v.as_u64()).unwrap_or(0);
                 let batch_chunks = evt
                     .get("batch_chunks")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let total = evt
-                    .get("total_files")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let total = evt.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0);
                 if total > 0 && ui.files.length() != Some(total.max(1)) {
                     ui.set_total(total);
                 }
@@ -854,10 +844,7 @@ async fn run_reindex_with(
                 );
             }
             Some("skip") => {
-                let indexed = evt
-                    .get("indexed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let indexed = evt.get("indexed").and_then(|v| v.as_u64()).unwrap_or(0);
                 indexed_now.store(indexed, Ordering::Release);
                 let skipped = skipped_now.fetch_add(1, Ordering::AcqRel) + 1;
                 ui.set_position(indexed);
@@ -869,10 +856,7 @@ async fn run_reindex_with(
                 );
             }
             Some("complete") => {
-                outcome.indexed = evt
-                    .get("indexed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                outcome.indexed = evt.get("indexed").and_then(|v| v.as_u64()).unwrap_or(0);
                 outcome.total_chunks = evt
                     .get("total_chunks")
                     .and_then(|v| v.as_u64())
@@ -881,14 +865,8 @@ async fn run_reindex_with(
                     .get("skipped")
                     .and_then(|v| v.as_u64())
                     .unwrap_or_else(|| skipped_now.load(Ordering::Acquire));
-                outcome.errors = evt
-                    .get("errors")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                outcome.elapsed_ms = evt
-                    .get("elapsed_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                outcome.errors = evt.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
+                outcome.elapsed_ms = evt.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 outcome.completed = true;
                 ui.set_position(outcome.indexed);
                 done = true;
@@ -959,8 +937,7 @@ async fn run_reindex_with(
 
     // ── Post-reindex health check (blue-green safety net) ─────────────────
     if opts.verify_after {
-        verify_reindex_health(&client, &base, index_id, &outcome, opts.prior_chunk_count)
-            .await?;
+        verify_reindex_health(&client, &base, index_id, &outcome, opts.prior_chunk_count).await?;
     }
 
     Ok(outcome)
@@ -1263,8 +1240,12 @@ async fn convert_one(
 
     let already_existed = match create_resp {
         Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
-            !body.get("created").and_then(|v| v.as_bool()).unwrap_or(true)
+            let body: serde_json::Value =
+                resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+            !body
+                .get("created")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
         }
         Ok(resp) => {
             return ConvertResult {
@@ -1385,7 +1366,9 @@ async fn run_status(json: bool) -> Result<()> {
 
     let health = client.get(format!("{}/health", base)).send().await;
     let health_body: serde_json::Value = match health {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+        Ok(r) if r.status().is_success() => {
+            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+        }
         _ => {
             if json {
                 println!(r#"{{"daemon":"not_running"}}"#);
@@ -1401,7 +1384,9 @@ async fn run_status(json: bool) -> Result<()> {
 
     let list = client.get(format!("{}/indexes", base)).send().await;
     let list_body: serde_json::Value = match list {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+        Ok(r) if r.status().is_success() => {
+            r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+        }
         _ => serde_json::json!({"indexes": []}),
     };
     let empty: Vec<serde_json::Value> = Vec::new();
@@ -1472,17 +1457,10 @@ async fn run_status(json: bool) -> Result<()> {
                     .get("chunk_count")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let root = body
-                    .get("root_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let root = body.get("root_path").and_then(|v| v.as_str()).unwrap_or("");
                 let chunks_fmt = format_with_commas(chunks);
                 if root.is_empty() {
-                    println!(
-                        "  {:<16} {:>12} chunks",
-                        name.bold(),
-                        chunks_fmt,
-                    );
+                    println!("  {:<16} {:>12} chunks", name.bold(), chunks_fmt,);
                 } else {
                     println!(
                         "  {:<16} {:>12} chunks  {}",
@@ -1627,15 +1605,14 @@ async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
     let client = match trusty_common::server::daemon_http_client() {
         Ok(c) => c,
         Err(e) => {
-            checks.push(CheckResult::Error(format!("failed to build HTTP client: {e}")));
+            checks.push(CheckResult::Error(format!(
+                "failed to build HTTP client: {e}"
+            )));
             return (checks, empty_indexes);
         }
     };
 
-    let health_result = client
-        .get(format!("{}/health", base))
-        .send()
-        .await;
+    let health_result = client.get(format!("{}/health", base)).send().await;
 
     let (daemon_running, daemon_version) = match health_result {
         Ok(r) if r.status().is_success() => {
@@ -1759,7 +1736,9 @@ async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
     if daemon_running {
         let list = client.get(format!("{}/indexes", base)).send().await;
         let list_body: serde_json::Value = match list {
-            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+            Ok(r) if r.status().is_success() => {
+                r.json().await.unwrap_or_else(|_| serde_json::json!({}))
+            }
             _ => serde_json::json!({"indexes": []}),
         };
         let empty_arr: Vec<serde_json::Value> = Vec::new();
@@ -1887,11 +1866,22 @@ fn fix_stale_lock(data_dir: &std::path::Path) {
             .unwrap_or(true);
         if stale {
             match std::fs::remove_file(&lock_path) {
-                Ok(()) => println!("  {} Removed stale lock file {}", "✓".green(), lock_path.display()),
-                Err(e) => println!("  {} Could not remove lock file {}: {e}", "✗".red(), lock_path.display()),
+                Ok(()) => println!(
+                    "  {} Removed stale lock file {}",
+                    "✓".green(),
+                    lock_path.display()
+                ),
+                Err(e) => println!(
+                    "  {} Could not remove lock file {}: {e}",
+                    "✗".red(),
+                    lock_path.display()
+                ),
             }
         } else {
-            println!("  {} Lock file is held by a live process — not removing", "⚠".yellow());
+            println!(
+                "  {} Lock file is held by a live process — not removing",
+                "⚠".yellow()
+            );
         }
     }
 }
@@ -2106,7 +2096,12 @@ async fn main() -> Result<()> {
                     println!("{} [{}] removed {}", "−".red(), index_id, file.display());
                 }
                 Ok(resp) => {
-                    eprintln!("{} daemon returned {} for {}", "✗".red(), resp.status(), url);
+                    eprintln!(
+                        "{} daemon returned {} for {}",
+                        "✗".red(),
+                        resp.status(),
+                        url
+                    );
                     std::process::exit(1);
                 }
                 Err(e) => {
@@ -2209,11 +2204,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     _ => {
-                        eprintln!(
-                            "{} could not reach daemon at {}",
-                            "✗".red(),
-                            base
-                        );
+                        eprintln!("{} could not reach daemon at {}", "✗".red(), base);
                         std::process::exit(1);
                     }
                 }
@@ -2227,11 +2218,7 @@ async fn main() -> Result<()> {
                     r.json().await.unwrap_or_else(|_| serde_json::json!({}))
                 }
                 Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-                    eprintln!(
-                        "{} index '{}' not found on daemon",
-                        "✗".red(),
-                        target_id
-                    );
+                    eprintln!("{} index '{}' not found on daemon", "✗".red(), target_id);
                     std::process::exit(1);
                 }
                 Ok(r) => {
@@ -2265,7 +2252,13 @@ async fn main() -> Result<()> {
                     "→".cyan(),
                     target_id.dimmed(),
                     query.bold(),
-                    format!("(intent={}, {}ms, {} results)", intent, latency, results.len()).dimmed()
+                    format!(
+                        "(intent={}, {}ms, {} results)",
+                        intent,
+                        latency,
+                        results.len()
+                    )
+                    .dimmed()
                 );
                 if results.is_empty() {
                     println!("  {}", "(no matches)".dimmed());
@@ -2398,8 +2391,8 @@ async fn main() -> Result<()> {
             // (see trusty-search-service/src/daemon.rs). Read the PID, send
             // SIGTERM, then poll for the port file to disappear as a signal
             // that shutdown completed cleanly.
-            let lock_path = dirs::data_local_dir()
-                .map(|d| d.join("trusty-search").join("daemon.lock"));
+            let lock_path =
+                dirs::data_local_dir().map(|d| d.join("trusty-search").join("daemon.lock"));
             let port_path = daemon_port_path();
 
             let pid = lock_path
@@ -2428,10 +2421,7 @@ async fn main() -> Result<()> {
                                     return Ok(());
                                 }
                             }
-                            println!(
-                                "{} Daemon may still be shutting down",
-                                "⚠".yellow()
-                            );
+                            println!("{} Daemon may still be shutting down", "⚠".yellow());
                         }
                         _ => {
                             eprintln!(
@@ -2459,11 +2449,7 @@ async fn main() -> Result<()> {
                 let app = trusty_search_mcp::sse::router(server);
                 axum::serve(listener, app).await?;
             } else {
-                eprintln!(
-                    "{} MCP stdio → daemon {}",
-                    "◉".green(),
-                    daemon_url.dimmed()
-                );
+                eprintln!("{} MCP stdio → daemon {}", "◉".green(), daemon_url.dimmed());
                 trusty_search_mcp::stdio::run(server).await?;
             }
         }
@@ -2509,10 +2495,7 @@ async fn main() -> Result<()> {
                                 );
                             }
                             ConvertStatus::AlreadyRegistered => {
-                                println!(
-                                    "{} Already registered — reindex queued",
-                                    "↻".cyan()
-                                );
+                                println!("{} Already registered — reindex queued", "↻".cyan());
                             }
                             ConvertStatus::Failed(msg) => {
                                 eprintln!("{} Conversion failed: {}", "✗".red(), msg);
@@ -2567,9 +2550,7 @@ async fn main() -> Result<()> {
                             let _permit = sem.acquire_owned().await.ok();
                             let parsed = parse_mvs_config(&config_path);
                             let result = match parsed {
-                                Ok((root, name)) => {
-                                    convert_one(root, name, &base, dry_run).await
-                                }
+                                Ok((root, name)) => convert_one(root, name, &base, dry_run).await,
                                 Err(e) => ConvertResult {
                                     name: config_path.display().to_string(),
                                     path: config_path.clone(),
@@ -2608,11 +2589,7 @@ async fn main() -> Result<()> {
 
                     println!();
                     if dry_run {
-                        println!(
-                            "{} Dry run complete: {} projects",
-                            "·".dimmed(),
-                            dry
-                        );
+                        println!("{} Dry run complete: {} projects", "·".dimmed(), dry);
                     } else {
                         println!(
                             "{} Summary: {} queued, {} already registered (reindexing), {} failed",

@@ -107,8 +107,7 @@ impl UsearchStore {
             expansion_search,
             multi: false,
         };
-        let index = Index::new(&options)
-            .map_err(|e| anyhow!("usearch Index::new failed: {e}"))?;
+        let index = Index::new(&options).map_err(|e| anyhow!("usearch Index::new failed: {e}"))?;
         let initial = expected_chunks.max(INITIAL_CAPACITY);
         index
             .reserve(initial)
@@ -336,10 +335,7 @@ mod tests {
     async fn test_len() {
         let store = UsearchStore::new(4).expect("store init");
         assert_eq!(store.len().await.unwrap(), 0);
-        store
-            .upsert("x", vec![1.0, 0.0, 0.0, 0.0])
-            .await
-            .unwrap();
+        store.upsert("x", vec![1.0, 0.0, 0.0, 0.0]).await.unwrap();
         assert_eq!(store.len().await.unwrap(), 1);
     }
 
@@ -360,14 +356,8 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_reads() {
         let store = Arc::new(UsearchStore::new(4).expect("store init"));
-        store
-            .upsert("r1", vec![1.0, 0.0, 0.0, 0.0])
-            .await
-            .unwrap();
-        store
-            .upsert("r2", vec![0.0, 1.0, 0.0, 0.0])
-            .await
-            .unwrap();
+        store.upsert("r1", vec![1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        store.upsert("r2", vec![0.0, 1.0, 0.0, 0.0]).await.unwrap();
 
         let s1 = store.clone();
         let s2 = store.clone();

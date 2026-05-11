@@ -194,8 +194,14 @@ mod tests {
         let idx = ScipIndex::from_refs(refs, edges);
 
         assert_eq!(idx.entities().len(), 2);
-        assert!(matches!(idx.entities()[0].entity_type, EntityType::NamedType));
-        assert!(matches!(idx.entities()[1].entity_type, EntityType::ModulePath));
+        assert!(matches!(
+            idx.entities()[0].entity_type,
+            EntityType::NamedType
+        ));
+        assert!(matches!(
+            idx.entities()[1].entity_type,
+            EntityType::ModulePath
+        ));
         assert_eq!(idx.edges().len(), 1);
         assert!(matches!(idx.edges()[0].1, EdgeKind::UsesType));
     }

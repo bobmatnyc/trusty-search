@@ -63,7 +63,10 @@ impl NerExtractor {
                     );
                 }
             }
-            return Self { enabled: false, inner: None };
+            return Self {
+                enabled: false,
+                inner: None,
+            };
         }
         #[cfg(not(feature = "ner"))]
         {
@@ -133,11 +136,7 @@ fn model_path() -> Option<std::path::PathBuf> {
 /// with a tokenize → forward → BIO-decode pipeline is independent of the gating
 /// logic the rest of the codebase relies on.
 #[cfg(feature = "ner")]
-fn run_inference(
-    inner: &NerInner,
-    doc_text: &str,
-    file: &str,
-) -> anyhow::Result<Vec<RawEntity>> {
+fn run_inference(inner: &NerInner, doc_text: &str, file: &str) -> anyhow::Result<Vec<RawEntity>> {
     // Touch the fields so that compiling with `--features ner` doesn't warn
     // about unused inner state until the inference body lands.
     let _ = (&inner.session, &inner.tokenizer, doc_text, file);
@@ -178,7 +177,10 @@ mod tests {
             "extractor must be disabled in tests (no ner.onnx present)"
         );
         let result = extractor.extract("async runtime", "foo.rs");
-        assert!(result.is_empty(), "disabled extractor must return no entities");
+        assert!(
+            result.is_empty(),
+            "disabled extractor must return no entities"
+        );
     }
 
     #[test]

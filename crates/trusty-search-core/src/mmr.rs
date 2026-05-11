@@ -159,7 +159,11 @@ mod tests {
         ];
         let out = mmr_rerank(cands, &embeddings, 0.5, 3);
         let ids: Vec<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["A", "B", "C"], "missing embeddings → keep input order");
+        assert_eq!(
+            ids,
+            vec!["A", "B", "C"],
+            "missing embeddings → keep input order"
+        );
     }
 
     #[test]

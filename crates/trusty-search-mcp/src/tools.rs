@@ -73,11 +73,7 @@ impl McpServer {
             if is_notification {
                 return Response::suppressed();
             }
-            return Response::err(
-                id,
-                error_codes::INVALID_REQUEST,
-                "jsonrpc must be \"2.0\"",
-            );
+            return Response::err(id, error_codes::INVALID_REQUEST, "jsonrpc must be \"2.0\"");
         }
 
         // MCP lifecycle methods. `initialize` exchanges capabilities;
@@ -141,9 +137,7 @@ impl McpServer {
                     error_codes::METHOD_NOT_FOUND,
                     format!("unknown tool: {tool}"),
                 ),
-                Err(DispatchError::InvalidParams(msg)) => {
-                    Response::ok(id, wrap_tool_error(&msg))
-                }
+                Err(DispatchError::InvalidParams(msg)) => Response::ok(id, wrap_tool_error(&msg)),
                 Err(DispatchError::Transport(msg)) => Response::ok(id, wrap_tool_error(&msg)),
             }
         } else {
@@ -186,7 +180,8 @@ impl McpServer {
                         ))
                     }
                 };
-                self.post(&format!("/indexes/{index_id}/search"), &body).await
+                self.post(&format!("/indexes/{index_id}/search"), &body)
+                    .await
             }
             "index_file" => {
                 let index_id = require_str(args, "index_id")?;
@@ -604,7 +599,9 @@ mod tests {
     #[tokio::test]
     async fn missing_params_returns_invalid_params() {
         let server = McpServer::new("http://127.0.0.1:1");
-        let resp = server.dispatch(req("index_file", serde_json::json!({}))).await;
+        let resp = server
+            .dispatch(req("index_file", serde_json::json!({})))
+            .await;
         let err = resp.error.expect("expected error");
         assert_eq!(err.code, error_codes::INVALID_PARAMS);
     }
@@ -614,10 +611,17 @@ mod tests {
         let server = McpServer::new("http://127.0.0.1:1");
         let resp = server.dispatch(req("tools/list", Value::Null)).await;
         let result = resp.result.expect("expected result");
-        let tools = result.get("tools").and_then(Value::as_array).expect("array");
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("array");
         // Issue #36 requires the 6 core MCP tools to be present; we ship
         // additional tools beyond that minimum.
-        assert!(tools.len() >= 6, "expected at least 6 tools, got {}", tools.len());
+        assert!(
+            tools.len() >= 6,
+            "expected at least 6 tools, got {}",
+            tools.len()
+        );
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -630,7 +634,10 @@ mod tests {
             "create_index",
             "search_health",
         ] {
-            assert!(names.contains(&required), "missing required tool: {required}");
+            assert!(
+                names.contains(&required),
+                "missing required tool: {required}"
+            );
         }
     }
 
@@ -665,7 +672,10 @@ mod tests {
         let server = McpServer::new("http://127.0.0.1:1");
         let resp = server.dispatch(req("tools/list", Value::Null)).await;
         let result = resp.result.expect("expected result");
-        let tools = result.get("tools").and_then(Value::as_array).expect("array");
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("array");
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -724,7 +734,10 @@ mod tests {
         let server = McpServer::new("http://127.0.0.1:1");
         let resp = server.dispatch(req("tools/list", Value::Null)).await;
         let result = resp.result.expect("expected result");
-        let tools = result.get("tools").and_then(Value::as_array).expect("array");
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("array");
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -751,7 +764,9 @@ mod tests {
     #[tokio::test]
     async fn tools_call_without_name_returns_invalid_params() {
         let server = McpServer::new("http://127.0.0.1:1");
-        let resp = server.dispatch(req("tools/call", serde_json::json!({}))).await;
+        let resp = server
+            .dispatch(req("tools/call", serde_json::json!({})))
+            .await;
         let err = resp.error.expect("expected error");
         assert_eq!(err.code, error_codes::INVALID_PARAMS);
     }

@@ -141,7 +141,13 @@ pub struct RawEntity {
 }
 
 impl RawEntity {
-    fn new(entity_type: EntityType, text: String, span: (usize, usize), file: &str, line: usize) -> Self {
+    fn new(
+        entity_type: EntityType,
+        text: String,
+        span: (usize, usize),
+        file: &str,
+        line: usize,
+    ) -> Self {
         let mut h = Sha256::new();
         h.update(entity_type.as_str().as_bytes());
         h.update(b"\0");
@@ -321,7 +327,13 @@ fn walk_rust(node: Node<'_>, src: &[u8], file: &str, in_test_fn: bool, out: &mut
                 let last = name.rsplit("::").next().unwrap_or(&name).trim();
                 if matches!(last, "bail" | "anyhow" | "panic" | "unwrap" | "expect") {
                     let t = node_text(node, src);
-                    out.push(RawEntity::new(EntityType::ErrorVariant, t, span, file, line));
+                    out.push(RawEntity::new(
+                        EntityType::ErrorVariant,
+                        t,
+                        span,
+                        file,
+                        line,
+                    ));
                 }
             }
         }
@@ -332,7 +344,13 @@ fn walk_rust(node: Node<'_>, src: &[u8], file: &str, in_test_fn: bool, out: &mut
                 let last = txt.rsplit('.').next().unwrap_or(&txt);
                 if matches!(last, "unwrap" | "expect") {
                     let t = node_text(node, src);
-                    out.push(RawEntity::new(EntityType::ErrorVariant, t, span, file, line));
+                    out.push(RawEntity::new(
+                        EntityType::ErrorVariant,
+                        t,
+                        span,
+                        file,
+                        line,
+                    ));
                 }
             }
         }
@@ -345,7 +363,13 @@ fn walk_rust(node: Node<'_>, src: &[u8], file: &str, in_test_fn: bool, out: &mut
             // Strip surrounding quotes for length check.
             let inner = t.trim_matches('"');
             if inner.len() > 10 {
-                out.push(RawEntity::new(EntityType::LiteralString, t, span, file, line));
+                out.push(RawEntity::new(
+                    EntityType::LiteralString,
+                    t,
+                    span,
+                    file,
+                    line,
+                ));
             }
         }
         "type_item" => {
@@ -355,7 +379,13 @@ fn walk_rust(node: Node<'_>, src: &[u8], file: &str, in_test_fn: bool, out: &mut
         "identifier" if in_test_fn => {
             let t = node_text(node, src);
             if !t.is_empty() {
-                out.push(RawEntity::new(EntityType::TestRelation, t, span, file, line));
+                out.push(RawEntity::new(
+                    EntityType::TestRelation,
+                    t,
+                    span,
+                    file,
+                    line,
+                ));
             }
         }
         _ => {}
@@ -421,7 +451,8 @@ mod tests {
             "expected NamedType=MyType in {ents:?}"
         );
         assert!(
-            ents.iter().any(|e| matches!(e.entity_type, EntityType::ModulePath)),
+            ents.iter()
+                .any(|e| matches!(e.entity_type, EntityType::ModulePath)),
             "expected at least one ModulePath in {ents:?}"
         );
         assert!(

@@ -79,7 +79,9 @@ impl FileWatcher {
             .watch(&root_path, RecursiveMode::Recursive)
             .with_context(|| format!("watch path {}", root_path.display()))?;
 
-        Ok(Self { _debouncer: debouncer })
+        Ok(Self {
+            _debouncer: debouncer,
+        })
     }
 
     /// Stop the watcher and release OS resources by dropping the debouncer.
@@ -103,8 +105,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let _watcher = FileWatcher::start(dir.path().to_path_buf(), tx)
-            .expect("watcher starts");
+        let _watcher = FileWatcher::start(dir.path().to_path_buf(), tx).expect("watcher starts");
 
         // Give the OS watcher a moment to install its kqueue/inotify hooks
         // before generating events; otherwise the very first write can be lost.
@@ -137,8 +138,7 @@ mod tests {
         fs::write(&file_path, b"transient").expect("write file");
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _watcher = FileWatcher::start(dir.path().to_path_buf(), tx)
-            .expect("watcher starts");
+        let _watcher = FileWatcher::start(dir.path().to_path_buf(), tx).expect("watcher starts");
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 

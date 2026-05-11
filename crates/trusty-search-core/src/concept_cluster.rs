@@ -173,10 +173,7 @@ pub async fn cluster_concepts_from_contents<E: crate::embed::Embedder + ?Sized>(
     file: &str,
 ) -> Vec<RawEntity> {
     // 1) Extract doc strings.
-    let docs: Vec<String> = contents
-        .iter()
-        .filter_map(|c| doc_comment(c))
-        .collect();
+    let docs: Vec<String> = contents.iter().filter_map(|c| doc_comment(c)).collect();
     if docs.len() < MIN_DOC_STRINGS {
         return Vec::new();
     }
@@ -198,7 +195,10 @@ pub async fn cluster_concepts_from_contents<E: crate::embed::Embedder + ?Sized>(
     // 3) K-means.
     let k = (docs.len() / 2).clamp(1, MAX_CLUSTERS);
     let Some((centroids, _assignments)) = kmeans_cluster(&doc_embeddings, k) else {
-        tracing::debug!("cluster_concepts: kmeans rejected k={k} n={} for {file}", docs.len());
+        tracing::debug!(
+            "cluster_concepts: kmeans rejected k={k} n={} for {file}",
+            docs.len()
+        );
         return Vec::new();
     };
 
@@ -314,8 +314,7 @@ mod tests {
             chunk_with("fn c() {}"),
         ];
         let embedder = MockEmbedder::new(8);
-        let out =
-            cluster_concepts_from_contents(&contents_of(&chunks), &embedder, "f.rs").await;
+        let out = cluster_concepts_from_contents(&contents_of(&chunks), &embedder, "f.rs").await;
         assert!(out.is_empty());
     }
 
@@ -328,8 +327,7 @@ mod tests {
             chunk_with("/// gamma\nfn c() {}"),
         ];
         let embedder = MockEmbedder::new(8);
-        let out =
-            cluster_concepts_from_contents(&contents_of(&chunks), &embedder, "f.rs").await;
+        let out = cluster_concepts_from_contents(&contents_of(&chunks), &embedder, "f.rs").await;
         assert!(out.is_empty(), "got {out:?}");
     }
 
@@ -347,8 +345,7 @@ mod tests {
             chunk_with("/// serializes the response\nfn e() {}"),
         ];
         let embedder = MockEmbedder::new(16);
-        let out =
-            cluster_concepts_from_contents(&contents_of(&chunks), &embedder, "svc.rs").await;
+        let out = cluster_concepts_from_contents(&contents_of(&chunks), &embedder, "svc.rs").await;
         // K-means with the deterministic MockEmbedder may collapse all rows
         // into one cluster — that's fine; we just need at least one entity
         // and the right type / file.

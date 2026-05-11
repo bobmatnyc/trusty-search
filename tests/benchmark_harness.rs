@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use trusty_search_core::indexer::{CodeChunk, CodeIndexer, SearchQuery};
-use trusty_search_core::{Embedder, FastEmbedder};
 use trusty_search_core::store::{UsearchStore, VectorStore};
+use trusty_search_core::{Embedder, FastEmbedder};
 
 // ---------------------------------------------------------------------------
 // Query corpora — `(query_text, expected_substring)`. The substring is matched
@@ -133,10 +133,8 @@ async fn build_indexer() -> CodeIndexer {
             .await
             .expect("init FastEmbedder (downloads model on first run)"),
     );
-    let store: Arc<dyn VectorStore> =
-        Arc::new(UsearchStore::new(384).expect("init UsearchStore"));
-    let indexer = CodeIndexer::new("bench", core_src_dir())
-        .with_components(embedder, store);
+    let store: Arc<dyn VectorStore> = Arc::new(UsearchStore::new(384).expect("init UsearchStore"));
+    let indexer = CodeIndexer::new("bench", core_src_dir()).with_components(embedder, store);
 
     // Walk core src and feed every .rs file through index_file.
     let src = core_src_dir();
@@ -173,10 +171,7 @@ async fn run_bench(label: &str, indexer: &CodeIndexer, queries: &[(&str, &str)])
         "| {:<40} | {:>6} | {:>9} | {:>10} |",
         "query", "MRR@5", "Recall@10", "latency_ms"
     );
-    println!(
-        "|{:-<42}|{:-<8}|{:-<11}|{:-<12}|",
-        "", "", "", ""
-    );
+    println!("|{:-<42}|{:-<8}|{:-<11}|{:-<12}|", "", "", "", "");
 
     let mut mrr_sum = 0.0_f32;
     let mut recall_hits = 0_usize;
@@ -213,7 +208,10 @@ async fn run_bench(label: &str, indexer: &CodeIndexer, queries: &[(&str, &str)])
     let recall_pct = (recall_hits as f32 / n) * 100.0;
     println!(
         "mean MRR@5 = {:.3}  |  Recall@10 = {:.0}% ({}/{})",
-        mean_mrr, recall_pct, recall_hits, queries.len()
+        mean_mrr,
+        recall_pct,
+        recall_hits,
+        queries.len()
     );
     mean_mrr
 }

@@ -181,13 +181,14 @@ pub async fn chat_handler(
     };
 
     // 1. Search the index for context (best-effort — empty context is fine).
-    let context_snippet = match search_for_context(state.as_ref(), &req.index_id, &req.message).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("chat: search for context failed: {e}");
-            String::new()
-        }
-    };
+    let context_snippet =
+        match search_for_context(state.as_ref(), &req.index_id, &req.message).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("chat: search for context failed: {e}");
+                String::new()
+            }
+        };
 
     // 2. Build messages: system prompt with context, then history, then new user message.
     let system = format!(
@@ -234,7 +235,10 @@ async fn search_for_context(
 ) -> Result<String, String> {
     use trusty_search_core::{indexer::SearchQuery, registry::IndexId};
     let id = IndexId::new(index_id.to_string());
-    let handle = state.registry.get(&id).ok_or_else(|| "index not found".to_string())?;
+    let handle = state
+        .registry
+        .get(&id)
+        .ok_or_else(|| "index not found".to_string())?;
     let q = SearchQuery {
         text: query.to_string(),
         top_k: 5,
@@ -253,10 +257,7 @@ async fn search_for_context(
             r.end_line,
             r.score
         ));
-        let snippet = r
-            .compact_snippet
-            .as_deref()
-            .unwrap_or(&r.content);
+        let snippet = r.compact_snippet.as_deref().unwrap_or(&r.content);
         out.push_str(snippet);
         out.push('\n');
     }

@@ -294,8 +294,8 @@ impl Bm25Index {
                     None => continue,
                 };
                 let tf = *count as f32;
-                let tf_norm = tf * (self.k1 + 1.0)
-                    / (tf + self.k1 * (1.0 - self.b + self.b * dl / avg));
+                let tf_norm =
+                    tf * (self.k1 + 1.0) / (tf + self.k1 * (1.0 - self.b + self.b * dl / avg));
                 *acc.entry(*slot).or_insert(0.0) += idf * tf_norm;
             }
         }
@@ -329,10 +329,14 @@ impl Bm25Index {
 
         for term in tokenize(query) {
             let df = *self.doc_freqs.get(&term).unwrap_or(&0) as f32;
-            if df == 0.0 { continue; }
+            if df == 0.0 {
+                continue;
+            }
             let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
 
-            let tf = self.inverted.get(&term)
+            let tf = self
+                .inverted
+                .get(&term)
                 .and_then(|v| v.iter().find(|(id, _)| *id == doc_id))
                 .map(|(_, c)| *c as f32)
                 .unwrap_or(0.0);
@@ -347,7 +351,9 @@ impl Bm25Index {
 }
 
 impl Default for Bm25Index {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -378,7 +384,10 @@ mod tests {
         let tokens = tokenize("CodeIndexer");
         assert!(tokens.contains(&"code".to_string()), "got {tokens:?}");
         assert!(tokens.contains(&"indexer".to_string()), "got {tokens:?}");
-        assert!(tokens.contains(&"codeindexer".to_string()), "got {tokens:?}");
+        assert!(
+            tokens.contains(&"codeindexer".to_string()),
+            "got {tokens:?}"
+        );
     }
 
     #[test]

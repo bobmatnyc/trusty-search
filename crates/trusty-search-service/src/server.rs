@@ -138,7 +138,10 @@ pub fn build_router(state: SearchAppState) -> Router {
     use crate::ui::{chat_handler, ui_asset_handler, ui_index_handler};
     let router = Router::new()
         .route("/health", get(health_handler))
-        .route("/indexes", get(list_indexes_handler).post(create_index_handler))
+        .route(
+            "/indexes",
+            get(list_indexes_handler).post(create_index_handler),
+        )
         .route("/indexes/:id", delete(delete_index_handler))
         .route("/ui", get(ui_index_handler))
         .route("/ui/", get(ui_index_handler))
@@ -152,7 +155,10 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/:id/reindex", post(reindex_handler))
         .route("/indexes/:id/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/:id/chunks", get(get_index_chunks_handler))
-        .route("/indexes/:id/complexity_hotspots", get(complexity_hotspots_handler))
+        .route(
+            "/indexes/:id/complexity_hotspots",
+            get(complexity_hotspots_handler),
+        )
         .route("/indexes/:id/smells", get(smells_handler))
         .route("/indexes/:id/quality", get(quality_handler))
         .route("/facts", get(list_facts_handler).post(upsert_fact_handler))
@@ -245,9 +251,7 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
-async fn list_indexes_handler(
-    State(state): State<Arc<SearchAppState>>,
-) -> Json<IndexListResponse> {
+async fn list_indexes_handler(State(state): State<Arc<SearchAppState>>) -> Json<IndexListResponse> {
     Json(IndexListResponse {
         indexes: state.registry.list().into_iter().map(|id| id.0).collect(),
     })
@@ -366,7 +370,9 @@ async fn search_similar_handler(
         .find_chunk_id(&req.file, req.function.as_deref())
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
-    let embedding = indexer.get_embedding(&chunk_id).ok_or(StatusCode::NOT_FOUND)?;
+    let embedding = indexer
+        .get_embedding(&chunk_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
     let results = indexer
         .similar_by_embedding(&embedding, req.top_k, Some(&chunk_id))
         .await
@@ -514,17 +520,19 @@ async fn quality_handler(
     let indexer = handle.indexer.read().await;
     let chunks = indexer.all_chunks().await;
     let chunk_count = chunks.len();
-    let (sum_cyclo, grade_a, smell_count) = chunks.iter().fold(
-        (0u64, 0usize, 0usize),
-        |(s, a, sm), c| {
-            let a_inc = if c.complexity.grade == ComplexityGrade::A { 1 } else { 0 };
+    let (sum_cyclo, grade_a, smell_count) =
+        chunks.iter().fold((0u64, 0usize, 0usize), |(s, a, sm), c| {
+            let a_inc = if c.complexity.grade == ComplexityGrade::A {
+                1
+            } else {
+                0
+            };
             (
                 s + c.complexity.cyclomatic as u64,
                 a + a_inc,
                 sm + c.complexity.smells.len(),
             )
-        },
-    );
+        });
     let avg_cyclomatic = if chunk_count == 0 {
         0.0_f32
     } else {

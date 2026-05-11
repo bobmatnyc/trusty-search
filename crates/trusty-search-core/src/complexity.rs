@@ -184,9 +184,13 @@ fn estimate_param_count(content: &str) -> usize {
     }
     let Some(start) = sig_start else { return 0 };
     let after = &content[start..];
-    let Some(open) = after.find('(') else { return 0 };
+    let Some(open) = after.find('(') else {
+        return 0;
+    };
     let rest = &after[open + 1..];
-    let Some(close) = rest.find(')') else { return 0 };
+    let Some(close) = rest.find(')') else {
+        return 0;
+    };
     let params = &rest[..close];
     let trimmed = params.trim();
     if trimmed.is_empty() || trimmed == "self" || trimmed == "&self" || trimmed == "&mut self" {

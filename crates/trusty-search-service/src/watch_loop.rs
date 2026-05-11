@@ -165,6 +165,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        assert!(tracker.len().await >= 1, "expected at least one tracked file");
+        assert!(
+            tracker.len().await >= 1,
+            "expected at least one tracked file"
+        );
     }
 }

@@ -1,8 +1,14 @@
 #[test]
 fn test_query_classifier_smoke() {
     use trusty_search_core::classifier::{QueryClassifier, QueryIntent};
-    assert_eq!(QueryClassifier::classify("fn authenticate"), QueryIntent::Definition);
-    assert_eq!(QueryClassifier::classify("how does auth work"), QueryIntent::Conceptual);
+    assert_eq!(
+        QueryClassifier::classify("fn authenticate"),
+        QueryIntent::Definition
+    );
+    assert_eq!(
+        QueryClassifier::classify("how does auth work"),
+        QueryIntent::Conceptual
+    );
 }
 
 #[test]
@@ -26,12 +32,12 @@ fn test_chunker_smoke() {
 
 #[test]
 fn test_index_registry() {
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
     use trusty_search_core::{
         indexer::CodeIndexer,
         registry::{IndexHandle, IndexId, IndexRegistry},
     };
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     let registry = IndexRegistry::new();
     let id = IndexId::new("test-project");
