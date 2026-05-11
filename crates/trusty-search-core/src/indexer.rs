@@ -165,6 +165,85 @@ fn build_compact_snippet(content: &str) -> String {
     lines[..7].join("\n")
 }
 
+/// Materialize a `RawChunk` into a `CodeChunk` with the given score, match
+/// reason, and optional compact snippet.
+///
+/// Why: four call sites (`similar_by_embedding`, `all_chunks`,
+/// `enumerate_chunks`, the `search` materialization tail) used to inline the
+/// same 18-field struct literal. Consolidating them removes ~60 lines of
+/// duplication and the inevitable per-site drift when new fields are added.
+/// What: clones every metadata field, derives `chunk_depth` (clamped to u8)
+/// and `complexity_score`/`complexity` from the chunk content.
+/// Test: covered indirectly by every search/materialization test in this file.
+fn raw_to_code_chunk(
+    raw: &RawChunk,
+    score: f32,
+    match_reason: &str,
+    compact_snippet: Option<String>,
+) -> CodeChunk {
+    let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
+    CodeChunk {
+        id: raw.id.clone(),
+        file: raw.file.clone(),
+        language: raw.language.clone(),
+        start_line: raw.start_line,
+        end_line: raw.end_line,
+        content: raw.content.clone(),
+        function_name: raw.function_name.clone(),
+        score,
+        compact_snippet,
+        match_reason: match_reason.to_string(),
+        chunk_type: raw.chunk_type.clone(),
+        calls: raw.calls.clone(),
+        inherits_from: raw.inherits_from.clone(),
+        complexity_score: compute_complexity(&raw.content),
+        chunk_depth,
+        blame: None,
+        complexity: crate::complexity::compute_complexity(&raw.content),
+    }
+}
+
+/// Populate `virtual_terms` on each chunk from entities whose source line
+/// falls within the chunk's `[start_line, end_line]` range.
+///
+/// Why: two call sites (`index_file` and `parse_and_embed_files`) used the
+/// same dedupe-by-entity-text loop. Extracting prevents drift.
+/// What: for each chunk, walks `entities` once, inserting each entity's text
+/// at most once into a fresh `virtual_terms` vector.
+/// Test: covered by `test_virtual_terms_populated_from_entities`.
+fn populate_virtual_terms(chunks: &mut [RawChunk], entities: &[RawEntity]) {
+    for chunk in chunks.iter_mut() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut terms: Vec<String> = Vec::new();
+        for ent in entities {
+            if ent.line >= chunk.start_line
+                && ent.line <= chunk.end_line
+                && seen.insert(ent.text.as_str())
+            {
+                terms.push(ent.text.clone());
+            }
+        }
+        chunk.virtual_terms = terms;
+    }
+}
+
+/// Map (`in_hnsw`, `in_bm25`, `in_kg`) booleans to a stable `match_reason`
+/// label.
+///
+/// Why: lifted out of `search` to keep the materialization loop short and
+/// to make the precedence rules unit-testable in isolation.
+/// What: direct hits (HNSW and/or BM25) take precedence over KG-only paths.
+/// Test: covered indirectly by `test_kg_expansion_marks_neighbours_with_hybrid_kg`.
+fn compute_match_reason(in_v: bool, in_b: bool, in_kg: bool) -> &'static str {
+    match (in_v, in_b, in_kg) {
+        (true, true, _) => "hybrid",
+        (true, false, _) => "vector",
+        (false, true, _) => "bm25",
+        (false, false, true) => "hybrid+kg",
+        (false, false, false) => "fallback",
+    }
+}
+
 /// Output of the parse+embed phase: chunks paired with their (optional)
 /// embeddings plus the per-file entity lists, ready to be committed into the
 /// indexer's shared state. Held without any write lock so it can be shipped
@@ -336,26 +415,8 @@ impl CodeIndexer {
                 continue;
             }
             let Some(raw) = chunks.get(&id) else { continue };
-            let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
-            out.push(CodeChunk {
-                id: raw.id.clone(),
-                file: raw.file.clone(),
-                language: raw.language.clone(),
-                start_line: raw.start_line,
-                end_line: raw.end_line,
-                content: raw.content.clone(),
-                function_name: raw.function_name.clone(),
-                score,
-                compact_snippet: Some(build_compact_snippet(&raw.content)),
-                match_reason: "vector".to_string(),
-                chunk_type: raw.chunk_type.clone(),
-                calls: raw.calls.clone(),
-                inherits_from: raw.inherits_from.clone(),
-                complexity_score: compute_complexity(&raw.content),
-                chunk_depth,
-                blame: None,
-                complexity: crate::complexity::compute_complexity(&raw.content),
-            });
+            let snippet = Some(build_compact_snippet(&raw.content));
+            out.push(raw_to_code_chunk(raw, score, "vector", snippet));
             if out.len() >= top_k {
                 break;
             }
@@ -370,28 +431,7 @@ impl CodeIndexer {
         let chunks = self.chunks.read().await;
         chunks
             .values()
-            .map(|raw| {
-                let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
-                CodeChunk {
-                    id: raw.id.clone(),
-                    file: raw.file.clone(),
-                    language: raw.language.clone(),
-                    start_line: raw.start_line,
-                    end_line: raw.end_line,
-                    content: raw.content.clone(),
-                    function_name: raw.function_name.clone(),
-                    score: 0.0,
-                    compact_snippet: None,
-                    match_reason: "all".to_string(),
-                    chunk_type: raw.chunk_type.clone(),
-                    calls: raw.calls.clone(),
-                    inherits_from: raw.inherits_from.clone(),
-                    complexity_score: compute_complexity(&raw.content),
-                    chunk_depth,
-                    blame: None,
-                    complexity: crate::complexity::compute_complexity(&raw.content),
-                }
-            })
+            .map(|raw| raw_to_code_chunk(raw, 0.0, "all", None))
             .collect()
     }
 
@@ -426,28 +466,7 @@ impl CodeIndexer {
         let end = (offset + limit).min(total);
         let page: Vec<CodeChunk> = ordered[offset..end]
             .iter()
-            .map(|raw| {
-                let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
-                CodeChunk {
-                    id: raw.id.clone(),
-                    file: raw.file.clone(),
-                    language: raw.language.clone(),
-                    start_line: raw.start_line,
-                    end_line: raw.end_line,
-                    content: raw.content.clone(),
-                    function_name: raw.function_name.clone(),
-                    score: 0.0,
-                    compact_snippet: None,
-                    match_reason: "enumerate".to_string(),
-                    chunk_type: raw.chunk_type.clone(),
-                    calls: raw.calls.clone(),
-                    inherits_from: raw.inherits_from.clone(),
-                    complexity_score: compute_complexity(&raw.content),
-                    chunk_depth,
-                    blame: None,
-                    complexity: crate::complexity::compute_complexity(&raw.content),
-                }
-            })
+            .map(|raw| raw_to_code_chunk(raw, 0.0, "enumerate", None))
             .collect();
         (total, page)
     }
@@ -516,36 +535,51 @@ impl CodeIndexer {
     pub async fn index_file(&self, file_path: &str, content: &str) -> Result<()> {
         let (mut chunks, entities) = chunk_ast(file_path, content);
 
-        // Issue #19: populate virtual_terms per chunk from entities whose source
-        // line falls inside the chunk's [start_line, end_line] range. We dedupe
-        // by entity text so heavy literal repeats don't dominate IDF.
-        for chunk in chunks.iter_mut() {
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            let mut terms: Vec<String> = Vec::new();
-            for ent in &entities {
-                if ent.line >= chunk.start_line
-                    && ent.line <= chunk.end_line
-                    && seen.insert(ent.text.as_str())
-                {
-                    terms.push(ent.text.clone());
-                }
-            }
-            chunk.virtual_terms = terms;
-        }
+        // Issue #19: virtual_terms from entities so BM25 sees symbolic tokens
+        // that don't appear literally in the chunk body.
+        populate_virtual_terms(&mut chunks, &entities);
 
         // Snapshot chunk contents before move so we can run the ConceptCluster
-        // pass (Phase C, issue #22) below. Borrowing into the for-loop would
-        // hold the slice across `await`, which `add_chunk` doesn't allow.
+        // pass below. Borrowing into the for-loop would hold the slice across
+        // `await`, which `add_chunk` doesn't allow.
         let chunk_contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
         for chunk in chunks {
             self.add_chunk(chunk).await?;
         }
 
+        let all_entities = self
+            .enrich_with_nlp_entities(file_path, content, &chunk_contents, entities)
+            .await;
+
+        self.entities
+            .write()
+            .await
+            .insert(file_path.to_string(), all_entities);
+        // `add_chunk` already rebuilds, but we also rebuild once more here so a
+        // partial failure mid-file doesn't leave a stale graph; this is cheap.
+        self.rebuild_symbol_graph().await;
+        Ok(())
+    }
+
+    /// Run NER + ConceptCluster passes and merge their entities with the
+    /// AST-derived base list.
+    ///
+    /// Why: keeps `index_file` focused on chunk persistence; isolates the two
+    /// gated NLP passes (both no-ops when their respective preconditions
+    /// aren't met) behind a single helper.
+    /// What: extracts doc-comment NER entities, runs ConceptCluster when an
+    /// embedder is wired, returns the combined entity list.
+    /// Test: covered indirectly by every `index_file` integration test.
+    async fn enrich_with_nlp_entities(
+        &self,
+        file_path: &str,
+        content: &str,
+        chunk_contents: &[String],
+        base_entities: Vec<RawEntity>,
+    ) -> Vec<RawEntity> {
         // Phase D: ONNX NER over doc comments (issue #23). Gated — no-op when
-        // the model file is absent. We feed the extractor the concatenated
-        // `///` / `//!` text from the file rather than re-parsing per chunk so
-        // the (potentially expensive) ONNX session runs at most once per file.
+        // the model file is absent.
         let doc_text = crate::ner::extract_doc_comments(content);
         let ner_entities = self.ner.extract(&doc_text, file_path);
         if !ner_entities.is_empty() {
@@ -556,11 +590,11 @@ impl CodeIndexer {
             );
         }
 
-        // Phase C: ConceptCluster entities (async, non-blocking; opt-in —
-        // only runs when an embedder is wired and the file has enough doc
-        // comments to cluster).
-        let mut all_entities = entities;
+        let mut all_entities = base_entities;
         all_entities.extend(ner_entities);
+
+        // Phase C: ConceptCluster entities (issue #22). Only runs when an
+        // embedder is wired and the file has enough doc comments to cluster.
         if let Some(embedder) = &self.embedder {
             let refs: Vec<&str> = chunk_contents.iter().map(|s| s.as_str()).collect();
             let cluster_entities = crate::concept_cluster::cluster_concepts_from_contents(
@@ -579,14 +613,7 @@ impl CodeIndexer {
             }
         }
 
-        self.entities
-            .write()
-            .await
-            .insert(file_path.to_string(), all_entities);
-        // `add_chunk` already rebuilds, but we also rebuild once more here so a
-        // partial failure mid-file doesn't leave a stale graph; this is cheap.
-        self.rebuild_symbol_graph().await;
-        Ok(())
+        all_entities
     }
 
     /// Bulk-index many files in one shot.
@@ -665,36 +692,7 @@ impl CodeIndexer {
             return Ok(ParsedBatch::default());
         }
 
-        // 1) Parse every file in parallel. `chunk_ast` is sync + CPU-bound, so
-        //    rayon's worker pool is a better fit than tokio tasks.
-        let parsed: Vec<(String, Vec<RawChunk>, Vec<RawEntity>)> = {
-            use rayon::prelude::*;
-            tokio::task::spawn_blocking(move || {
-                files
-                    .par_iter()
-                    .map(|(path, content)| {
-                        let (mut chunks, entities) = chunk_ast(path, content);
-                        for chunk in chunks.iter_mut() {
-                            let mut seen: std::collections::HashSet<&str> =
-                                std::collections::HashSet::new();
-                            let mut terms: Vec<String> = Vec::new();
-                            for ent in &entities {
-                                if ent.line >= chunk.start_line
-                                    && ent.line <= chunk.end_line
-                                    && seen.insert(ent.text.as_str())
-                                {
-                                    terms.push(ent.text.clone());
-                                }
-                            }
-                            chunk.virtual_terms = terms;
-                        }
-                        (path.clone(), chunks, entities)
-                    })
-                    .collect()
-            })
-            .await
-            .context("batch parse task panicked")?
-        };
+        let parsed = Self::parse_files_parallel(files).await?;
 
         let mut all_chunks: Vec<RawChunk> = Vec::new();
         let mut entities_by_file: Vec<(String, Vec<RawEntity>)> = Vec::with_capacity(parsed.len());
@@ -703,39 +701,83 @@ impl CodeIndexer {
             entities_by_file.push((path, entities));
         }
 
-        // 2) Embed in batches if an embedder is wired. No write lock held —
-        //    other readers (search) run in parallel with this ONNX work.
-        let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; all_chunks.len()];
-        if let (Some(embedder), Some(_store)) = (&self.embedder, &self.store) {
-            let chunk_total = all_chunks.len();
-            for batch_start in (0..chunk_total).step_by(EMBED_BATCH_SIZE) {
-                let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunk_total);
-                let batch_texts: Vec<&str> = all_chunks[batch_start..batch_end]
-                    .iter()
-                    .map(|c| c.content.as_str())
-                    .collect();
-                let batch_vecs = embedder
-                    .embed_batch(&batch_texts)
-                    .await
-                    .context("batch embed_batch failed")?;
-                if batch_vecs.len() != batch_texts.len() {
-                    anyhow::bail!(
-                        "embed_batch returned {} vectors, expected {}",
-                        batch_vecs.len(),
-                        batch_texts.len()
-                    );
-                }
-                for (offset, vec) in batch_vecs.into_iter().enumerate() {
-                    embeddings[batch_start + offset] = Some(vec);
-                }
-            }
-        }
+        let embeddings = self.embed_chunks_in_batches(&all_chunks).await?;
 
         Ok(ParsedBatch {
             chunks: all_chunks,
             embeddings,
             entities_by_file,
         })
+    }
+
+    /// Parse every file in parallel via rayon and populate `virtual_terms`
+    /// from the AST-derived entity list.
+    ///
+    /// Why: `chunk_ast` is sync + CPU-bound, so rayon's worker pool is a
+    /// better fit than tokio tasks. Returning `(path, chunks, entities)`
+    /// keeps file boundaries intact for downstream entity-map insertion.
+    /// What: spawns a single blocking task that parallel-maps `chunk_ast`
+    /// across every input, then populates virtual_terms per chunk.
+    /// Test: covered indirectly by every `index_files_batch_*` test.
+    async fn parse_files_parallel(
+        files: Vec<(String, String)>,
+    ) -> Result<Vec<(String, Vec<RawChunk>, Vec<RawEntity>)>> {
+        use rayon::prelude::*;
+        tokio::task::spawn_blocking(move || {
+            files
+                .par_iter()
+                .map(|(path, content)| {
+                    let (mut chunks, entities) = chunk_ast(path, content);
+                    populate_virtual_terms(&mut chunks, &entities);
+                    (path.clone(), chunks, entities)
+                })
+                .collect()
+        })
+        .await
+        .context("batch parse task panicked")
+    }
+
+    /// Batched ONNX embed across every chunk's content.
+    ///
+    /// Why: per-chunk `embed` issues one ONNX call apiece; batching
+    /// `EMBED_BATCH_SIZE` chunks per call amortizes session setup cost and
+    /// caps the per-call tensor footprint (see `EMBED_BATCH_SIZE` doc for
+    /// the macOS Jetsam history).
+    /// What: returns `Vec<Option<Vec<f32>>>` aligned 1:1 with `chunks`,
+    /// where `None` means "no embedder wired (BM25-only mode)". Fails
+    /// fast if `embed_batch` returns a wrong-sized result.
+    /// Test: covered indirectly by `test_index_files_batch_*`.
+    async fn embed_chunks_in_batches(
+        &self,
+        chunks: &[RawChunk],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
+        let (Some(embedder), Some(_store)) = (&self.embedder, &self.store) else {
+            return Ok(embeddings);
+        };
+        let chunk_total = chunks.len();
+        for batch_start in (0..chunk_total).step_by(EMBED_BATCH_SIZE) {
+            let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunk_total);
+            let batch_texts: Vec<&str> = chunks[batch_start..batch_end]
+                .iter()
+                .map(|c| c.content.as_str())
+                .collect();
+            let batch_vecs = embedder
+                .embed_batch(&batch_texts)
+                .await
+                .context("batch embed_batch failed")?;
+            if batch_vecs.len() != batch_texts.len() {
+                anyhow::bail!(
+                    "embed_batch returned {} vectors, expected {}",
+                    batch_vecs.len(),
+                    batch_texts.len()
+                );
+            }
+            for (offset, vec) in batch_vecs.into_iter().enumerate() {
+                embeddings[batch_start + offset] = Some(vec);
+            }
+        }
+        Ok(embeddings)
     }
 
     /// Phase 3+4 of the bulk pipeline: commit a [`ParsedBatch`] into the index.
@@ -761,65 +803,114 @@ impl CodeIndexer {
         } = parsed;
         let chunk_total = all_chunks.len();
         if chunk_total == 0 {
-            let mut emap = self.entities.write().await;
-            for (path, ents) in entities_by_file {
-                emap.insert(path, ents);
-            }
+            self.commit_entities(entities_by_file).await;
             return Ok(0);
         }
 
-        // Vector store: single batched call. Drops 3N lock acquisitions to 3
-        // for a batch of N chunks (key alloc, key rev-map, HNSW write).
-        if let Some(store) = &self.store {
-            let items: Vec<(String, Vec<f32>)> = all_chunks
-                .iter()
-                .zip(embeddings.iter())
-                .filter_map(|(chunk, vec_opt)| {
-                    vec_opt.as_ref().map(|v| (chunk.id.clone(), v.clone()))
-                })
-                .collect();
-            if !items.is_empty() {
-                store
-                    .upsert_batch(&items)
-                    .await
-                    .context("batch upsert chunk vectors")?;
-            }
-        }
-
-        // BM25: upsert each chunk's body+virtual_terms before we move chunks
-        // into the corpus. Doing this first avoids a second clone of `chunk`.
-        {
-            let mut bm25 = self.bm25.write().await;
-            for chunk in &all_chunks {
-                let text = Self::bm25_doc_text(chunk);
-                bm25.upsert_document(&chunk.id, &text);
-            }
-        }
-        if self.embedder.is_some() {
-            let mut emb_cache = self.chunk_embeddings.write().await;
-            for (chunk, vec_opt) in all_chunks.iter().zip(embeddings.into_iter()) {
-                if let Some(vec) = vec_opt {
-                    emb_cache.insert(chunk.id.clone(), vec);
-                }
-            }
-        }
-        {
-            let mut corpus = self.chunks.write().await;
-            for chunk in all_chunks.drain(..) {
-                corpus.insert(chunk.id.clone(), chunk);
-            }
-        }
-        {
-            let mut emap = self.entities.write().await;
-            for (path, ents) in entities_by_file {
-                emap.insert(path, ents);
-            }
-        }
+        self.commit_vectors_batch(&all_chunks, &embeddings).await?;
+        self.commit_bm25_batch(&all_chunks).await;
+        self.commit_embeddings_cache(&all_chunks, embeddings).await;
+        self.commit_corpus(&mut all_chunks).await;
+        self.commit_entities(entities_by_file).await;
 
         if !defer_graph_rebuild {
             self.rebuild_symbol_graph().await;
         }
         Ok(chunk_total)
+    }
+
+    /// Single batched HNSW upsert across all chunks that have an embedding.
+    ///
+    /// Why: drops 3N lock acquisitions to 3 for a batch of N chunks (key
+    /// alloc, key rev-map, HNSW write).
+    /// What: filters chunks without embeddings (BM25-only mode), delegates to
+    /// `store.upsert_batch`. No-op when no store is wired or no embeddings
+    /// were computed.
+    /// Test: covered indirectly by `test_index_files_batch_*`.
+    async fn commit_vectors_batch(
+        &self,
+        chunks: &[RawChunk],
+        embeddings: &[Option<Vec<f32>>],
+    ) -> Result<()> {
+        let Some(store) = &self.store else { return Ok(()) };
+        let items: Vec<(String, Vec<f32>)> = chunks
+            .iter()
+            .zip(embeddings.iter())
+            .filter_map(|(chunk, vec_opt)| vec_opt.as_ref().map(|v| (chunk.id.clone(), v.clone())))
+            .collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+        store
+            .upsert_batch(&items)
+            .await
+            .context("batch upsert chunk vectors")
+    }
+
+    /// Upsert every chunk's BM25 document under a single write lock.
+    ///
+    /// Why: doing this **before** moving chunks into the corpus avoids a
+    /// second clone of each chunk.
+    /// What: holds the BM25 write lock once and walks `chunks` to upsert
+    /// `body + virtual_terms` for each.
+    /// Test: BM25 search correctness is covered by every search test.
+    async fn commit_bm25_batch(&self, chunks: &[RawChunk]) {
+        let mut bm25 = self.bm25.write().await;
+        for chunk in chunks {
+            let text = Self::bm25_doc_text(chunk);
+            bm25.upsert_document(&chunk.id, &text);
+        }
+    }
+
+    /// Cache per-chunk embeddings for MMR diversity (#28).
+    ///
+    /// Why: MMR needs vectors for already-ranked chunks without paying a
+    /// re-embed or HNSW round-trip per candidate. Skip entirely when no
+    /// embedder is wired (BM25-only mode).
+    /// What: walks chunks and their (consumed) embeddings, inserts each
+    /// `(id, vec)` pair under one write lock.
+    /// Test: covered indirectly by `test_get_embedding_returns_some_after_indexing`.
+    async fn commit_embeddings_cache(
+        &self,
+        chunks: &[RawChunk],
+        embeddings: Vec<Option<Vec<f32>>>,
+    ) {
+        if self.embedder.is_none() {
+            return;
+        }
+        let mut emb_cache = self.chunk_embeddings.write().await;
+        for (chunk, vec_opt) in chunks.iter().zip(embeddings.into_iter()) {
+            if let Some(vec) = vec_opt {
+                emb_cache.insert(chunk.id.clone(), vec);
+            }
+        }
+    }
+
+    /// Drain `chunks` into the corpus under a single write lock.
+    ///
+    /// Why: single-lock insertion shrinks the write-lock window to
+    /// milliseconds even for large batches.
+    /// What: consumes `chunks` via `drain` so callers don't keep a stale
+    /// copy after the corpus owns each one.
+    /// Test: covered indirectly by every search test.
+    async fn commit_corpus(&self, chunks: &mut Vec<RawChunk>) {
+        let mut corpus = self.chunks.write().await;
+        for chunk in chunks.drain(..) {
+            corpus.insert(chunk.id.clone(), chunk);
+        }
+    }
+
+    /// Insert each `(file_path, entities)` tuple into the per-file entity map.
+    ///
+    /// Why: factored so the early-return path (empty batch) and the main
+    /// commit path share one implementation.
+    /// What: holds the entities write lock once and inserts every tuple.
+    /// Test: covered indirectly by `test_entity_exact_match_*`.
+    async fn commit_entities(&self, entities_by_file: Vec<(String, Vec<RawEntity>)>) {
+        let mut emap = self.entities.write().await;
+        for (path, ents) in entities_by_file {
+            emap.insert(path, ents);
+        }
     }
 
     /// Read-only access to the entity list for a file (None if never indexed).
@@ -883,32 +974,46 @@ impl CodeIndexer {
                 .collect()
         };
         let removed = ids.len();
-        for id in &ids {
-            if let Some(store) = &self.store {
+        self.remove_chunks_from_stores(&ids).await;
+        self.entities.write().await.remove(file_path);
+        self.rebuild_symbol_graph().await;
+        Ok(removed)
+    }
+
+    /// Remove every chunk id from the HNSW store, corpus, embedding cache,
+    /// and BM25 index.
+    ///
+    /// Why: shared between `remove_file` (bulk per-file deletion) and could
+    /// be reused for future bulk-deletion paths. Each lock is acquired once
+    /// for the whole batch to bound write-lock contention.
+    /// What: best-effort `store.remove` per id (swallows store errors —
+    /// HNSW deletion is non-fatal in this codebase), then drops the id from
+    /// each in-memory structure under a single write lock per structure.
+    /// Test: covered indirectly by `test_remove_chunk_removes_from_results`.
+    async fn remove_chunks_from_stores(&self, ids: &[String]) {
+        if let Some(store) = &self.store {
+            for id in ids {
                 store.remove(id).await.ok();
             }
         }
         {
             let mut chunks = self.chunks.write().await;
-            for id in &ids {
+            for id in ids {
                 chunks.remove(id);
             }
         }
         {
             let mut emb = self.chunk_embeddings.write().await;
-            for id in &ids {
+            for id in ids {
                 emb.remove(id);
             }
         }
         {
             let mut bm25 = self.bm25.write().await;
-            for id in &ids {
+            for id in ids {
                 bm25.remove_document(id);
             }
         }
-        self.entities.write().await.remove(file_path);
-        self.rebuild_symbol_graph().await;
-        Ok(removed)
     }
 
     /// Remove a chunk from the corpus and its vector from the HNSW store.
@@ -1078,33 +1183,21 @@ impl CodeIndexer {
             beta
         );
 
-        // 1) Embed (cache-first) — None when no embedder is wired (BM25-only mode).
+        // 1) Embed (cache-first) — None when no embedder is wired.
         let embedding = self.embed_query(&query.text).await?;
 
-        // 2) Run lanes in parallel where possible.
-        let want_hnsw = query.top_k.saturating_mul(HNSW_OVERSAMPLE).max(query.top_k);
-        let want_bm25 = want_hnsw;
-
-        let bm25_fut = self.bm25_search(&query.text, want_bm25);
+        // 2) Run lanes (HNSW + BM25), then inject entity-exact-match if applicable.
+        let want = query.top_k.saturating_mul(HNSW_OVERSAMPLE).max(query.top_k);
+        let bm25_fut = self.bm25_search(&query.text, want);
         let hnsw_results = match &embedding {
-            Some(v) => self.vector_search(v, want_hnsw).await?,
+            Some(v) => self.vector_search(v, want).await?,
             None => Vec::new(),
         };
         let mut bm25_results = bm25_fut.await?;
+        self.inject_entity_exact_match(&intent, &query.text, beta, &mut bm25_results)
+            .await;
 
-        // Issue #20: when intent is Definition or Unknown (a likely symbol
-        // lookup), check the entity index for an exact-name match and inject
-        // it as the rank-1 BM25 hit so the RRF lane sees a strong signal even
-        // if the literal token didn't tokenize (e.g. an underscore-heavy name).
-        if matches!(intent, QueryIntent::Definition | QueryIntent::Unknown) {
-            if let Some(hit) = self.entity_exact_match(&query.text).await {
-                let injected_score = beta * 1.5;
-                bm25_results.retain(|(id, _)| id != &hit);
-                bm25_results.insert(0, (hit, injected_score));
-            }
-        }
-
-        // 3) RRF.
+        // 3) RRF fuse, then MMR diversity.
         let fused_raw = rrf_fuse(
             &hnsw_results,
             &bm25_results,
@@ -1113,93 +1206,135 @@ impl CodeIndexer {
             RRF_K,
             query.top_k,
         );
+        let fused = self.apply_mmr_rerank(fused_raw, query.top_k).await;
 
-        // 3b) MMR diversity pass (#28). Re-rank the fused list so adjacent
-        //     near-duplicates don't crowd the top-k. λ=0.5 balances relevance
-        //     vs diversity. If no chunk embeddings are cached (BM25-only mode),
-        //     MMR degenerates to the input order — graceful fallback.
-        let fused = {
-            let emb_map = self.chunk_embeddings.read().await;
-            if emb_map.is_empty() {
-                fused_raw
-            } else {
-                crate::mmr::mmr_rerank(fused_raw, &emb_map, crate::mmr::DEFAULT_LAMBDA, query.top_k)
-            }
+        // 4) KG expand (conditional). Track which IDs came **only** from KG
+        //    so the materialization step can label them "hybrid+kg".
+        let (all, kg_ids) = self
+            .expand_with_kg(fused, &intent, use_kg_first, query.expand_graph)
+            .await;
+
+        // 5) Materialise the top-k IDs into `CodeChunk`s.
+        let result = self
+            .materialize_search_results(all, &hnsw_results, &bm25_results, &kg_ids, query)
+            .await;
+        Ok(result)
+    }
+
+    /// Issue #20: when intent is Definition or Unknown (a likely symbol
+    /// lookup), inject the exact-name entity hit as the rank-1 BM25 result.
+    ///
+    /// Why: keeps the RRF lane seeing a strong signal even when the literal
+    /// token didn't tokenize (e.g. underscore-heavy names). Lifting this out
+    /// of `search` shrinks the latter's cyclomatic complexity.
+    /// What: scoped to two intents; when an entity match is found, dedupes
+    /// any prior occurrence and prepends a synthetic `(id, beta * 1.5)` pair.
+    /// Test: covered by `test_entity_exact_match_struct_ranks_first`.
+    async fn inject_entity_exact_match(
+        &self,
+        intent: &QueryIntent,
+        query_text: &str,
+        beta: f32,
+        bm25_results: &mut Vec<(String, f32)>,
+    ) {
+        if !matches!(intent, QueryIntent::Definition | QueryIntent::Unknown) {
+            return;
+        }
+        let Some(hit) = self.entity_exact_match(query_text).await else {
+            return;
         };
+        let injected_score = beta * 1.5;
+        bm25_results.retain(|(id, _)| id != &hit);
+        bm25_results.insert(0, (hit, injected_score));
+    }
 
-        // 4) KG expand. Only runs when intent routing requested it AND
-        //    `expand_graph` wasn't disabled by the caller.
-        let mut all = fused.clone();
-        let kg_ids: std::collections::HashSet<String> = if use_kg_first && query.expand_graph {
-            let expanded = self.kg_expand(&fused, intent.clone()).await;
-            let ids: std::collections::HashSet<String> =
-                expanded.iter().map(|(id, _)| id.clone()).collect();
-            all.extend(expanded);
-            ids
+    /// MMR diversity pass (#28) over the RRF-fused candidate list.
+    ///
+    /// Why: re-ranks so adjacent near-duplicates don't crowd the top-k.
+    /// λ=`DEFAULT_LAMBDA` (=0.5) balances relevance vs diversity.
+    /// What: snapshots the embedding cache; if empty (BM25-only mode) falls
+    /// back to the input order gracefully.
+    /// Test: covered indirectly by every search integration test.
+    async fn apply_mmr_rerank(
+        &self,
+        fused_raw: Vec<(String, f32)>,
+        top_k: usize,
+    ) -> Vec<(String, f32)> {
+        let emb_map = self.chunk_embeddings.read().await;
+        if emb_map.is_empty() {
+            fused_raw
         } else {
-            std::collections::HashSet::new()
-        };
+            crate::mmr::mmr_rerank(fused_raw, &emb_map, crate::mmr::DEFAULT_LAMBDA, top_k)
+        }
+    }
 
-        // 5) Per-result match_reason lookup tables.
+    /// KG expand the fused list when `use_kg_first` is on and the caller
+    /// hasn't disabled `expand_graph`.
+    ///
+    /// Why: lifts the conditional and the "which-ids-came-only-from-KG"
+    /// bookkeeping out of `search`.
+    /// What: returns `(all_candidates, kg_only_ids)`. `all_candidates`
+    /// starts as `fused` and is extended with KG-derived `(id, score)` pairs.
+    /// Test: covered by `test_kg_expansion_marks_neighbours_with_hybrid_kg`
+    /// and `test_kg_expansion_disabled_by_expand_graph_false`.
+    async fn expand_with_kg(
+        &self,
+        fused: Vec<(String, f32)>,
+        intent: &QueryIntent,
+        use_kg_first: bool,
+        expand_graph: bool,
+    ) -> (Vec<(String, f32)>, std::collections::HashSet<String>) {
+        let mut all = fused.clone();
+        if !(use_kg_first && expand_graph) {
+            return (all, std::collections::HashSet::new());
+        }
+        let expanded = self.kg_expand(&fused, intent.clone()).await;
+        let kg_ids: std::collections::HashSet<String> =
+            expanded.iter().map(|(id, _)| id.clone()).collect();
+        all.extend(expanded);
+        (all, kg_ids)
+    }
+
+    /// Materialize the top-k `(id, score)` pairs into `CodeChunk`s with the
+    /// correct `match_reason` derived from the source lanes.
+    ///
+    /// Why: isolates the final per-result loop (lookup table joins, snippet
+    /// construction, RawChunk → CodeChunk) so `search` stays focused on
+    /// orchestration.
+    /// What: builds lookup sets for HNSW and BM25 hit IDs, then for each of
+    /// the top-k `(id, score)` pairs picks a `match_reason` and emits a
+    /// `CodeChunk` via `raw_to_code_chunk`.
+    /// Test: covered by every search integration test.
+    async fn materialize_search_results(
+        &self,
+        all: Vec<(String, f32)>,
+        hnsw_results: &[(String, f32)],
+        bm25_results: &[(String, f32)],
+        kg_ids: &std::collections::HashSet<String>,
+        query: &SearchQuery,
+    ) -> Vec<CodeChunk> {
         let in_hnsw: std::collections::HashSet<&String> =
             hnsw_results.iter().map(|(id, _)| id).collect();
         let in_bm25: std::collections::HashSet<&String> =
             bm25_results.iter().map(|(id, _)| id).collect();
 
-        // 6) Materialise.
         let chunks = self.chunks.read().await;
-        let mut out = Vec::with_capacity(all.len());
+        let mut out = Vec::with_capacity(all.len().min(query.top_k));
         for (id, score) in all.into_iter().take(query.top_k) {
             let Some(raw) = chunks.get(&id) else {
                 tracing::trace!("fused id {id} not in corpus — likely race; skipping");
                 continue;
             };
-            let in_v = in_hnsw.contains(&id);
-            let in_b = in_bm25.contains(&id);
-            let in_kg = kg_ids.contains(&id);
-            // Per CLAUDE.md: KG-derived results carry "hybrid+kg". Direct hits
-            // (BM25 and/or vector) take precedence — KG expansion deduplicates
-            // against the seed set, so the "in_kg" arm only fires for chunks
-            // whose sole path into the result set was the call graph.
-            let match_reason = match (in_v, in_b, in_kg) {
-                (true, true, _) => "hybrid",
-                (true, false, _) => "vector",
-                (false, true, _) => "bm25",
-                (false, false, true) => "hybrid+kg",
-                (false, false, false) => "fallback",
-            }
-            .to_string();
-
-            let compact_snippet = if query.compact {
+            let match_reason =
+                compute_match_reason(in_hnsw.contains(&id), in_bm25.contains(&id), kg_ids.contains(&id));
+            let snippet = if query.compact {
                 Some(build_compact_snippet(&raw.content))
             } else {
                 None
             };
-
-            // chunk_depth on RawChunk is usize; clamp into u8 (deeply nested
-            // ASTs beyond 255 are vanishingly rare and don't help routing).
-            let chunk_depth: u8 = raw.chunk_depth.min(u8::MAX as usize) as u8;
-            out.push(CodeChunk {
-                id: raw.id.clone(),
-                file: raw.file.clone(),
-                language: raw.language.clone(),
-                start_line: raw.start_line,
-                end_line: raw.end_line,
-                content: raw.content.clone(),
-                function_name: raw.function_name.clone(),
-                score,
-                compact_snippet,
-                match_reason,
-                chunk_type: raw.chunk_type.clone(),
-                calls: raw.calls.clone(),
-                inherits_from: raw.inherits_from.clone(),
-                complexity_score: compute_complexity(&raw.content),
-                chunk_depth,
-                blame: None,
-                complexity: crate::complexity::compute_complexity(&raw.content),
-            });
+            out.push(raw_to_code_chunk(raw, score, match_reason, snippet));
         }
-        Ok(out)
+        out
     }
 }
 
