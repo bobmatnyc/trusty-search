@@ -59,8 +59,7 @@ async fn probe_health(base: &str) -> bool {
 /// currently-running executable so a `cargo run` debugging session boots its
 /// own debug daemon and a production install boots the production binary.
 fn spawn_daemon() -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow!("could not resolve current_exe: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| anyhow!("could not resolve current_exe: {e}"))?;
     // Detach stdio — we don't want the daemon's logs streaming into the
     // user's terminal session while they're waiting on a `query` result.
     std::process::Command::new(&exe)

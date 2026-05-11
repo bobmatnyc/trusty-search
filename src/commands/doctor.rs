@@ -1,6 +1,8 @@
 //! Handler for `trusty-search doctor` — 6-check diagnostic + auto-repair.
 
-use crate::{daemon_base_url, fix_stale_lock, run_doctor_checks, run_reindex, CheckResult, EmptyIndex};
+use crate::{
+    daemon_base_url, fix_stale_lock, run_doctor_checks, run_reindex, CheckResult, EmptyIndex,
+};
 use anyhow::Result;
 use colored::Colorize;
 

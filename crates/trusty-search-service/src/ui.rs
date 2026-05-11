@@ -150,16 +150,41 @@ fn cache_control_for(path: &str) -> &'static str {
 ///
 /// Why: The browser doesn't see the OpenRouter API key — the daemon proxies
 /// the request server-side using `OPENROUTER_API_KEY` from the environment.
+/// Programmatic callers (MCP, CLI) may instead supply `api_key` in the body.
 /// What: Caller supplies `index_id` (the collection to ground the question
-/// in), the new `message`, and prior `history`. The handler runs a search
-/// to gather context, then forwards a chat completion request.
-/// Test: With `OPENROUTER_API_KEY` unset → returns 503 + `{error}`.
+/// in), the new `message` (or `question`), optional prior `history`,
+/// optional `model` (default `anthropic/claude-haiku-4`), optional `top_k`
+/// (default 5), and optional `api_key`. The handler runs a search to gather
+/// context, then forwards a chat completion request to OpenRouter.
+/// Test: With `OPENROUTER_API_KEY` unset and no `api_key` in body →
+/// returns 503 + `{error}`. With both → uses env var.
 #[derive(Deserialize)]
 pub struct ChatRequest {
     pub index_id: String,
+    /// Primary user message. Accept either `message` (browser UI) or
+    /// `question` (issue #15 spec) — they're aliases.
+    #[serde(default, alias = "question")]
     pub message: String,
     #[serde(default)]
     pub history: Vec<ChatMessage>,
+    /// OpenRouter model id. Defaults to `anthropic/claude-haiku-4`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Number of context chunks to retrieve. Defaults to 5.
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    /// Fallback API key when `OPENROUTER_API_KEY` env var is not set.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Default OpenRouter model when caller doesn't specify one.
+///
+/// Why: Centralize the default so MCP, HTTP, and CLI all agree.
+/// What: Returns the model id literal.
+/// Test: `assert_eq!(default_model(), "anthropic/claude-haiku-4")`.
+pub fn default_model() -> &'static str {
+    "anthropic/claude-haiku-4"
 }
 
 #[derive(Deserialize, serde::Serialize, Clone)]
@@ -172,21 +197,45 @@ pub async fn chat_handler(
     State(state): State<Arc<SearchAppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    let Some(api_key) = std::env::var("OPENROUTER_API_KEY").ok() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "OpenRouter not configured"})),
-        )
-            .into_response();
+    // Resolve API key: prefer env var (browser flow), fall back to body
+    // (MCP / CLI / scripted callers per issue #15).
+    let api_key = match std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .or_else(|| req.api_key.clone())
+    {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "OpenRouter not configured: set OPENROUTER_API_KEY or supply api_key in request body",
+                })),
+            )
+                .into_response();
+        }
     };
 
+    if req.message.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message (or question) is required"})),
+        )
+            .into_response();
+    }
+
+    let top_k = req.top_k.unwrap_or(5).max(1);
+    let model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model().to_string());
+
     // 1. Search the index for context (best-effort — empty context is fine).
-    let context_snippet =
-        match search_for_context(state.as_ref(), &req.index_id, &req.message).await {
-            Ok(s) => s,
+    let (context_snippet, sources) =
+        match search_for_context(state.as_ref(), &req.index_id, &req.message, top_k).await {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!("chat: search for context failed: {e}");
-                String::new()
+                (String::new(), Vec::new())
             }
         };
 
@@ -218,8 +267,16 @@ pub async fn chat_handler(
 
     // 3. Forward to OpenRouter via the shared helper. Keeps every trusty-*
     //    chat caller using identical headers / decoding / error semantics.
-    match openrouter_chat(&api_key, "anthropic/claude-3.5-sonnet", messages).await {
-        Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
+    match openrouter_chat(&api_key, &model, messages).await {
+        // `reply` field preserved for backward compatibility with the Svelte UI;
+        // `answer`, `sources`, `model` added per issue #15 spec.
+        Ok(reply) => Json(serde_json::json!({
+            "reply": reply,
+            "answer": reply,
+            "sources": sources,
+            "model": model,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({"error": format!("openrouter: {e}")})),
@@ -228,11 +285,21 @@ pub async fn chat_handler(
     }
 }
 
+/// Run a hybrid search and format the results as both an LLM-ready context
+/// string and a JSON-serializable list of source chunks.
+///
+/// Why: The chat endpoint needs the formatted context for the system prompt
+/// *and* the structured chunks so callers (MCP, CLI) can cite sources.
+/// What: Performs a `top_k` search on `index_id` with `query`, returns
+/// `(context_string, sources_json_array)`.
+/// Test: With an unknown index_id, returns Err. With a valid index, the
+/// returned context contains `[File: ...]` markers and `sources.len() <= top_k`.
 async fn search_for_context(
     state: &SearchAppState,
     index_id: &str,
     query: &str,
-) -> Result<String, String> {
+    top_k: usize,
+) -> Result<(String, Vec<serde_json::Value>), String> {
     use trusty_search_core::{indexer::SearchQuery, registry::IndexId};
     let id = IndexId::new(index_id.to_string());
     let handle = state
@@ -241,27 +308,37 @@ async fn search_for_context(
         .ok_or_else(|| "index not found".to_string())?;
     let q = SearchQuery {
         text: query.to_string(),
-        top_k: 5,
+        top_k,
         expand_graph: true,
         compact: true,
     };
     let indexer = handle.indexer.read().await;
     let results = indexer.search(&q).await.map_err(|e| e.to_string())?;
     let mut out = String::new();
+    let mut sources: Vec<serde_json::Value> = Vec::with_capacity(results.len());
     for (i, r) in results.iter().enumerate() {
         out.push_str(&format!(
-            "\n--- Result {} ({}:{}-{}, score {:.3}) ---\n",
-            i + 1,
+            "\n[File: {}:{}-{}] (result {}, score {:.3})\n",
             r.file,
             r.start_line,
             r.end_line,
+            i + 1,
             r.score
         ));
         let snippet = r.compact_snippet.as_deref().unwrap_or(&r.content);
         out.push_str(snippet);
         out.push('\n');
+        sources.push(serde_json::json!({
+            "file": r.file,
+            "start_line": r.start_line,
+            "end_line": r.end_line,
+            "score": r.score,
+            "snippet": snippet,
+            "function_name": r.function_name,
+            "match_reason": r.match_reason,
+        }));
     }
-    Ok(out)
+    Ok((out, sources))
 }
 
 #[cfg(test)]

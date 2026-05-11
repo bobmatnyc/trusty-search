@@ -103,6 +103,13 @@ pub struct CodeChunk {
     // Issue #32 — per-chunk complexity & code-quality metrics.
     #[serde(default)]
     pub complexity: crate::complexity::ComplexityMetrics,
+
+    // Issue #10 — cross-project search fan-out: when a chunk is returned by
+    // the global `POST /search` endpoint (or `search_all` MCP tool), this is
+    // populated with the IndexId that produced it. `None` for per-index
+    // search responses so older clients round-trip cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_id: Option<String>,
 }
 
 /// Halstead-proxy complexity score: unique alphanumeric identifiers (operands)
@@ -200,6 +207,7 @@ fn raw_to_code_chunk(
         chunk_depth,
         blame: None,
         complexity: crate::complexity::compute_complexity(&raw.content),
+        index_id: None,
     }
 }
 

@@ -154,6 +154,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/ui/", get(ui_index_handler))
         .route("/ui/*path", get(ui_asset_handler))
         .route("/chat", post(chat_handler))
+        .route("/search", post(global_search_handler))
         .route("/indexes/:id/search", post(search_handler))
         .route("/indexes/:id/search_similar", post(search_similar_handler))
         .route("/indexes/:id/status", get(index_status_handler))
@@ -354,6 +355,154 @@ async fn search_handler(
         "results": results,
         "intent": format!("{:?}", intent),
         "latency_ms": latency_ms,
+    })))
+}
+
+/// Body for the global `POST /search` endpoint (issue #10 — cross-project
+/// search fan-out).
+///
+/// Why: callers (LLM agents, the UI search bar) often don't know which
+/// project an answer lives in. A single fan-out search across every
+/// registered index, with results re-ranked via Reciprocal Rank Fusion, lets
+/// them ask one question and get one merged answer.
+#[derive(Deserialize)]
+pub struct GlobalSearchRequest {
+    pub query: String,
+    #[serde(default = "default_global_top_k")]
+    pub top_k: usize,
+    /// When true, response chunks include the full `content` field. When
+    /// false (default), the daemon still returns chunks with content — clients
+    /// that want compact responses can read `compact_snippet`.
+    #[serde(default)]
+    pub full_content: bool,
+}
+
+fn default_global_top_k() -> usize {
+    10
+}
+
+/// `POST /search` — fan-out hybrid search across every registered index.
+///
+/// Why: see [`GlobalSearchRequest`] doc. This is distinct from
+/// `POST /indexes/:id/search`, which targets a single index.
+/// What: runs per-index search concurrently, tags each result with its
+/// `index_id`, then re-runs RRF (k=60) over the per-index ranked lists
+/// (each index treated as an equally-weighted lane) and returns the top-k
+/// merged results. Indexes that error during search are skipped (logged) so
+/// one bad index doesn't take down the whole fan-out.
+/// Test: `test_global_search_fans_out_and_merges` registers two indexes,
+/// indexes a file into each, and asserts both contribute results tagged with
+/// the right `index_id`.
+async fn global_search_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Json(req): Json<GlobalSearchRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use trusty_search_core::search::rrf::{rrf_fuse, RRF_K};
+
+    let index_ids = state.registry.list();
+    let total_indexes = index_ids.len();
+    if index_ids.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "results": Vec::<trusty_search_core::indexer::CodeChunk>::new(),
+            "indexes_searched": Vec::<String>::new(),
+            "total_indexes": 0_usize,
+            "latency_ms": 0_u64,
+            "intent": format!("{:?}", QueryClassifier::classify(&req.query)),
+        })));
+    }
+
+    let started = std::time::Instant::now();
+    let intent = QueryClassifier::classify(&req.query);
+
+    // Build the same SearchQuery shape every per-index search uses. We
+    // oversample per-index by passing the user's top_k unchanged: each lane
+    // contributes up to top_k candidates, then RRF picks the best top_k
+    // overall.
+    let per_index_query = SearchQuery {
+        text: req.query.clone(),
+        top_k: req.top_k,
+        expand_graph: true,
+        compact: !req.full_content,
+    };
+
+    // Run all per-index searches concurrently. Any index that errors is
+    // skipped with a log line so a single broken index doesn't 500 the
+    // whole fan-out.
+    let registry = state.registry.clone();
+    let futures = index_ids.into_iter().map(|id| {
+        let registry = registry.clone();
+        let query = per_index_query.clone();
+        async move {
+            let handle = registry.get(&id)?;
+            let indexer = handle.indexer.read().await;
+            match indexer.search(&query).await {
+                Ok(results) => Some((id, results)),
+                Err(e) => {
+                    tracing::warn!("global search: index {} errored: {e}", id);
+                    None
+                }
+            }
+        }
+    });
+    let per_index_results: Vec<(IndexId, Vec<trusty_search_core::indexer::CodeChunk>)> =
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+    // Build a flat lookup table from "namespaced" chunk_id
+    // ({index_id}::{chunk.id}) back to the tagged CodeChunk, plus per-index
+    // ranked id lists for RRF. Namespacing is required because different
+    // indexes can produce colliding chunk_ids (same relative file path in
+    // two projects).
+    let mut chunk_lookup: std::collections::HashMap<
+        String,
+        trusty_search_core::indexer::CodeChunk,
+    > = std::collections::HashMap::new();
+    let mut lanes: Vec<Vec<(String, f32)>> = Vec::with_capacity(per_index_results.len());
+    let mut indexes_searched: Vec<String> = Vec::with_capacity(per_index_results.len());
+    for (id, results) in per_index_results {
+        indexes_searched.push(id.0.clone());
+        let mut lane: Vec<(String, f32)> = Vec::with_capacity(results.len());
+        for mut chunk in results {
+            let namespaced = format!("{}::{}", id.0, chunk.id);
+            // Tag the chunk with its origin index before storing it so the
+            // returned CodeChunks know where they came from.
+            chunk.index_id = Some(id.0.clone());
+            lane.push((namespaced.clone(), chunk.score));
+            chunk_lookup.insert(namespaced, chunk);
+        }
+        lanes.push(lane);
+    }
+
+    // RRF fuse across lanes. `rrf_fuse` takes exactly two lanes, so we fold
+    // pairwise: start with empty + lane0, then merge each subsequent lane.
+    // Each fold step uses alpha=1, beta=1 — every index lane contributes
+    // equally. The output is sorted by fused score desc.
+    let mut fused: Vec<(String, f32)> = Vec::new();
+    let oversample = req.top_k.saturating_mul(4).max(req.top_k).max(10);
+    for lane in lanes {
+        fused = rrf_fuse(&fused, &lane, 1.0, 1.0, RRF_K, oversample);
+    }
+    fused.truncate(req.top_k);
+
+    let results: Vec<trusty_search_core::indexer::CodeChunk> = fused
+        .into_iter()
+        .filter_map(|(id, fused_score)| {
+            let mut chunk = chunk_lookup.remove(&id)?;
+            chunk.score = fused_score;
+            Some(chunk)
+        })
+        .collect();
+
+    let latency_ms = started.elapsed().as_millis() as u64;
+    Ok(Json(serde_json::json!({
+        "results": results,
+        "indexes_searched": indexes_searched,
+        "total_indexes": total_indexes,
+        "latency_ms": latency_ms,
+        "intent": format!("{:?}", intent),
     })))
 }
 
@@ -730,5 +879,107 @@ mod tests {
         assert_eq!(resp.indexes, 1);
         // uptime_secs is u64 — always >= 0 by type; just exercise the path.
         let _ = resp.uptime_secs;
+    }
+
+    /// Issue #10 — `POST /search` fan-out: with two registered indexes each
+    /// holding a single file, the global search must return results tagged
+    /// with the correct `index_id` and the response must list both indexes
+    /// as searched. BM25-only path (no embedder) keeps the test hermetic.
+    #[tokio::test]
+    async fn global_search_fans_out_and_merges() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        use trusty_search_core::{
+            indexer::CodeIndexer,
+            registry::{IndexHandle, IndexId, IndexRegistry},
+        };
+
+        let registry = IndexRegistry::new();
+        for name in ["proj-a", "proj-b"] {
+            let id = IndexId::new(name);
+            let indexer = CodeIndexer::new(name, format!("/tmp/{name}"));
+            // Seed one file per index with content matching the query "alpha".
+            indexer
+                .index_file(
+                    &format!("{name}/lib.rs"),
+                    &format!("fn alpha_{name}() {{ println!(\"alpha hit\"); }}"),
+                )
+                .await
+                .expect("index_file ok");
+            registry.register(IndexHandle {
+                id: id.clone(),
+                indexer: Arc::new(RwLock::new(indexer)),
+                root_path: format!("/tmp/{name}").into(),
+            });
+        }
+
+        let state = Arc::new(SearchAppState::new(registry, None));
+        let Json(value) = global_search_handler(
+            State(state),
+            Json(GlobalSearchRequest {
+                query: "alpha".into(),
+                top_k: 10,
+                full_content: false,
+            }),
+        )
+        .await
+        .expect("handler ok");
+
+        let total = value["total_indexes"].as_u64().expect("total_indexes");
+        assert_eq!(total, 2, "both indexes counted");
+
+        let searched: Vec<String> = value["indexes_searched"]
+            .as_array()
+            .expect("indexes_searched array")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(searched.len(), 2);
+        assert!(searched.contains(&"proj-a".to_string()));
+        assert!(searched.contains(&"proj-b".to_string()));
+
+        let results = value["results"].as_array().expect("results array");
+        assert!(!results.is_empty(), "expected at least one hit");
+        // Every result must carry an index_id tagged with one of the two
+        // registered indexes.
+        let mut from_a = false;
+        let mut from_b = false;
+        for r in results {
+            let idx = r["index_id"]
+                .as_str()
+                .expect("each result must be tagged with index_id");
+            assert!(
+                idx == "proj-a" || idx == "proj-b",
+                "unexpected index_id: {idx}"
+            );
+            from_a |= idx == "proj-a";
+            from_b |= idx == "proj-b";
+        }
+        // Both indexes share the same query term "alpha", so RRF should
+        // surface at least one hit from each.
+        assert!(from_a, "expected a result tagged with proj-a");
+        assert!(from_b, "expected a result tagged with proj-b");
+    }
+
+    /// Issue #10 — `POST /search` with no indexes registered must return an
+    /// empty result set (not 500). This guards the empty-registry edge case
+    /// the fan-out path checks before spawning per-index futures.
+    #[tokio::test]
+    async fn global_search_empty_registry_returns_empty_results() {
+        use trusty_search_core::registry::IndexRegistry;
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new(), None));
+        let Json(value) = global_search_handler(
+            State(state),
+            Json(GlobalSearchRequest {
+                query: "anything".into(),
+                top_k: 5,
+                full_content: false,
+            }),
+        )
+        .await
+        .expect("handler ok");
+        assert_eq!(value["total_indexes"].as_u64(), Some(0));
+        assert!(value["results"].as_array().unwrap().is_empty());
+        assert!(value["indexes_searched"].as_array().unwrap().is_empty());
     }
 }

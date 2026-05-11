@@ -15,10 +15,10 @@
 //! pre-refactor implementation.
 
 use crate::{
-    check_daemon_running, check_data_dir, check_lock_file, check_model_cache,
-    check_port_reachable, daemon_base_url, doctor_data_dir, fetch_index_names,
-    fetch_index_statuses, print_index_breakdown, probe_daemon_health, read_daemon_port,
-    summarize_indexes, CheckResult, EmptyIndex,
+    check_daemon_running, check_data_dir, check_lock_file, check_model_cache, check_port_reachable,
+    daemon_base_url, doctor_data_dir, fetch_index_names, fetch_index_statuses,
+    print_index_breakdown, probe_daemon_health, read_daemon_port, summarize_indexes, CheckResult,
+    EmptyIndex,
 };
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -113,12 +113,7 @@ impl DoctorState {
     }
 
     fn take_empty_indexes(&self) -> Vec<EmptyIndex> {
-        std::mem::take(
-            &mut *self
-                .empty_indexes
-                .lock()
-                .expect("doctor state poisoned"),
-        )
+        std::mem::take(&mut *self.empty_indexes.lock().expect("doctor state poisoned"))
     }
 }
 

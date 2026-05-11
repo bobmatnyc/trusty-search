@@ -161,6 +161,23 @@ impl McpServer {
 
     async fn call_tool(&self, tool: &str, args: &Value) -> Result<Value, DispatchError> {
         match tool {
+            "search_all" => {
+                // Issue #10 — cross-project fan-out search. Maps directly to
+                // `POST /search` (the top-level endpoint, distinct from
+                // per-index `/indexes/:id/search`).
+                let query = require_str(args, "query")?;
+                let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(10);
+                let full_content = args
+                    .get("full_content")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let body = serde_json::json!({
+                    "query": query,
+                    "top_k": top_k,
+                    "full_content": full_content,
+                });
+                self.post("/search", &body).await
+            }
             "search_code" => {
                 let index_id = require_str(args, "index_id")?;
                 // Accept the spec form `{query: string, top_k?: int}` and
@@ -252,13 +269,31 @@ impl McpServer {
             }
             "chat" => {
                 let index_id = require_str(args, "index_id")?;
-                let message = require_str(args, "message")?;
+                // Accept either `message` (legacy / UI) or `question` (issue #15 spec).
+                let message = args
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| args.get("question").and_then(Value::as_str))
+                    .ok_or_else(|| {
+                        DispatchError::InvalidParams(
+                            "missing required string field: message (or question)".into(),
+                        )
+                    })?;
                 let mut body = serde_json::json!({
                     "index_id": index_id,
                     "message": message,
                 });
                 if let Some(history) = args.get("history") {
                     body["history"] = history.clone();
+                }
+                if let Some(model) = args.get("model").and_then(Value::as_str) {
+                    body["model"] = Value::String(model.to_string());
+                }
+                if let Some(top_k) = args.get("top_k").and_then(Value::as_u64) {
+                    body["top_k"] = Value::from(top_k);
+                }
+                if let Some(key) = args.get("api_key").and_then(Value::as_str) {
+                    body["api_key"] = Value::String(key.to_string());
                 }
                 self.post("/chat", &body).await
             }
@@ -418,6 +453,19 @@ fn wrap_tool_error(msg: &str) -> Value {
 pub fn tool_descriptors() -> Value {
     serde_json::json!([
         {
+            "name": "search_all",
+            "description": "Cross-project hybrid search: fan out to every registered index, merge results via RRF, tag each chunk with its index_id (issue #10).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query":        { "type": "string" },
+                    "top_k":        { "type": "integer", "default": 10 },
+                    "full_content": { "type": "boolean", "default": false }
+                }
+            }
+        },
+        {
             "name": "search_code",
             "description": "Hybrid code search (BM25+vector+KG)",
             "inputSchema": {
@@ -571,14 +619,23 @@ pub fn tool_descriptors() -> Value {
         },
         {
             "name": "chat",
-            "description": "Ask a question about code using OpenRouter LLM with search context (requires OPENROUTER_API_KEY)",
+            "description": "Ask a natural-language question about the indexed codebase. \
+                            Automatically searches for the top_k most relevant chunks and \
+                            sends them as context to an OpenRouter LLM (default model: \
+                            anthropic/claude-haiku-4). Returns {answer, sources, model}. \
+                            Requires OPENROUTER_API_KEY env var on the daemon, or an \
+                            `api_key` field in the request.",
             "inputSchema": {
                 "type": "object",
-                "required": ["index_id", "message"],
+                "required": ["index_id"],
                 "properties": {
                     "index_id": { "type": "string" },
-                    "message":  { "type": "string" },
-                    "history":  { "type": "array", "items": { "type": "object" } }
+                    "message":  { "type": "string", "description": "User question (alias: question)" },
+                    "question": { "type": "string", "description": "User question (alias: message)" },
+                    "history":  { "type": "array", "items": { "type": "object" } },
+                    "model":    { "type": "string", "description": "OpenRouter model id (default: anthropic/claude-haiku-4)" },
+                    "top_k":    { "type": "integer", "description": "Number of context chunks (default: 5)", "default": 5 },
+                    "api_key":  { "type": "string", "description": "Fallback OpenRouter API key when OPENROUTER_API_KEY env is unset" }
                 }
             }
         }
@@ -779,12 +836,25 @@ mod tests {
             "index_status",
             "list_chunks",
             "chat",
+            "search_all",
         ] {
             assert!(
                 names.contains(&required),
                 "tools/list missing '{required}' (got {names:?})"
             );
         }
+    }
+
+    /// Issue #10 — `search_all` requires the `query` arg and rejects missing it
+    /// before any HTTP round-trip.
+    #[tokio::test]
+    async fn search_all_missing_query_returns_invalid_params() {
+        let server = McpServer::new("http://127.0.0.1:1");
+        let resp = server
+            .dispatch(req("search_all", serde_json::json!({})))
+            .await;
+        let err = resp.error.expect("expected error");
+        assert_eq!(err.code, error_codes::INVALID_PARAMS);
     }
 
     #[tokio::test]

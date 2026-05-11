@@ -275,6 +275,7 @@ mod tests {
             chunk_depth: 0,
             blame: None,
             complexity: ComplexityMetrics::default(),
+            index_id: None,
         }
     }
 
