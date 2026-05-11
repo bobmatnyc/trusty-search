@@ -181,6 +181,9 @@ fn language_for(file: &str) -> Option<(&'static str, Language)> {
         "rb" => ("ruby", tree_sitter_ruby::LANGUAGE),
         "php" => ("php", tree_sitter_php::LANGUAGE_PHP),
         "scala" => ("scala", tree_sitter_scala::LANGUAGE),
+        "cs" => ("csharp", tree_sitter_c_sharp::LANGUAGE),
+        "kt" | "kts" => ("kotlin", tree_sitter_kotlin_ng::LANGUAGE),
+        "swift" => ("swift", tree_sitter_swift::LANGUAGE),
         _ => return None,
     };
     Some((tag, lang_fn.into()))
@@ -253,6 +256,13 @@ fn collect_calls(node: Node<'_>, src: &[u8], lang: &str) -> Vec<String> {
                 | ("php", "function_definition")
                 | ("php", "method_declaration")
                 | ("scala", "function_definition")
+                | ("csharp", "method_declaration")
+                | ("csharp", "constructor_declaration")
+                | ("kotlin", "function_declaration")
+                | ("kotlin", "secondary_constructor")
+                | ("swift", "function_declaration")
+                | ("swift", "init_declaration")
+                | ("swift", "protocol_function_declaration")
         );
 
         // Don't descend into nested function bodies (we treat them as their own chunks).
@@ -275,6 +285,9 @@ fn collect_calls(node: Node<'_>, src: &[u8], lang: &str) -> Vec<String> {
                 | ("php", "scoped_call_expression")
                 | ("php", "nullsafe_member_call_expression")
                 | ("scala", "call_expression")
+                | ("csharp", "invocation_expression")
+                | ("kotlin", "call_expression")
+                | ("swift", "call_expression")
         );
 
         if is_call {
@@ -406,6 +419,23 @@ fn nlp_from_doc(doc: &str) -> (Vec<String>, Vec<String>) {
     (keywords, code_refs)
 }
 
+/// Swift's tree-sitter grammar folds `struct`, `enum`, and `extension`
+/// declarations into the same `class_declaration` node kind, distinguished
+/// by the first child being the keyword token (kind `class`/`struct`/etc.).
+/// Map that keyword to the appropriate `ChunkType`.
+fn swift_class_decl_kind(node: Node<'_>) -> ChunkType {
+    let kw = node
+        .child(0)
+        .map(|c| c.kind().to_string())
+        .unwrap_or_default();
+    match kw.as_str() {
+        "struct" => ChunkType::Struct,
+        "enum" => ChunkType::Enum,
+        "extension" => ChunkType::Module,
+        _ => ChunkType::Class, // includes `class`, `actor`, fallback
+    }
+}
+
 /// Per-language: AST node kinds we promote to top-level chunks, plus their
 /// (default `ChunkType`, parent-context-overrides).
 fn classify_node(lang: &str, node: Node<'_>) -> Option<ChunkType> {
@@ -470,6 +500,55 @@ fn classify_node(lang: &str, node: Node<'_>) -> Option<ChunkType> {
         ("scala", "class_definition") => ChunkType::Class,
         ("scala", "object_definition") => ChunkType::Class,
         ("scala", "trait_definition") => ChunkType::Trait,
+
+        // C#
+        ("csharp", "method_declaration") => {
+            if ancestor_kind(node, "class_declaration").is_some()
+                || ancestor_kind(node, "interface_declaration").is_some()
+                || ancestor_kind(node, "struct_declaration").is_some()
+            {
+                ChunkType::Method
+            } else {
+                ChunkType::Function
+            }
+        }
+        ("csharp", "constructor_declaration") => ChunkType::Method,
+        ("csharp", "class_declaration") => ChunkType::Class,
+        ("csharp", "interface_declaration") => ChunkType::Trait,
+        ("csharp", "struct_declaration") => ChunkType::Class,
+        ("csharp", "namespace_declaration") => ChunkType::Module,
+        ("csharp", "enum_declaration") => ChunkType::Enum,
+
+        // Kotlin (tree-sitter-kotlin-ng grammar)
+        ("kotlin", "function_declaration") => {
+            if ancestor_kind(node, "class_declaration").is_some()
+                || ancestor_kind(node, "object_declaration").is_some()
+            {
+                ChunkType::Method
+            } else {
+                ChunkType::Function
+            }
+        }
+        ("kotlin", "secondary_constructor") => ChunkType::Method,
+        ("kotlin", "class_declaration") => ChunkType::Class,
+        ("kotlin", "object_declaration") => ChunkType::Class,
+        ("kotlin", "companion_object") => ChunkType::Class,
+        ("kotlin", "interface_declaration") => ChunkType::Trait,
+
+        // Swift: tree-sitter-swift folds struct/enum/extension into
+        // `class_declaration`, distinguished by the keyword token at child(0).
+        ("swift", "class_declaration") => swift_class_decl_kind(node),
+        ("swift", "protocol_declaration") => ChunkType::Trait,
+        ("swift", "function_declaration") | ("swift", "protocol_function_declaration") => {
+            if ancestor_kind(node, "class_declaration").is_some()
+                || ancestor_kind(node, "protocol_declaration").is_some()
+            {
+                ChunkType::Method
+            } else {
+                ChunkType::Function
+            }
+        }
+        ("swift", "init_declaration") => ChunkType::Method,
 
         _ => return None,
     })
@@ -616,6 +695,10 @@ fn walk_for_chunks(
                 | "function_definition"
                 | "method_declaration"
                 | "method_definition"
+                | "constructor_declaration"
+                | "secondary_constructor"
+                | "init_declaration"
+                | "protocol_function_declaration"
         );
         if recurse {
             let mut cursor = node.walk();
@@ -878,6 +961,127 @@ fn f() -> Result<(), anyhow::Error> {
             any_err,
             "expected at least one ErrorVariant entity, got {ents:#?}"
         );
+    }
+
+    #[test]
+    fn test_csharp_chunking() {
+        let src = r#"
+namespace MyApp {
+    class Foo {
+        public void Bar() { Baz(); this.Qux(); }
+        public Foo() {}
+    }
+    interface IThing { void Do(); }
+}
+"#;
+        let (chunks, _) = chunk_ast("a.cs", src);
+        // Expect: namespace (Module), class Foo (Class), Bar (Method),
+        //   ctor (Method), IThing (Trait), Do (Method).
+        let classes: Vec<&RawChunk> = chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|c| c.function_name.as_deref() == Some("Foo")),
+            "expected class Foo, got {chunks:#?}"
+        );
+        let traits: Vec<&RawChunk> = chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::Trait)
+            .collect();
+        assert!(
+            traits.iter().any(|c| c.function_name.as_deref() == Some("IThing")),
+            "expected interface IThing as Trait"
+        );
+        let bar = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("Bar"))
+            .expect("Bar method chunk");
+        assert_eq!(bar.chunk_type, ChunkType::Method);
+        assert!(bar.calls.contains(&"Baz".to_string()), "calls={:?}", bar.calls);
+        assert!(bar.calls.contains(&"Qux".to_string()), "calls={:?}", bar.calls);
+    }
+
+    #[test]
+    fn test_kotlin_chunking() {
+        // Avoid the top-level `package` statement which the kotlin-ng grammar
+        // parses oddly without a following file body terminator; the chunker
+        // still walks into ERROR-recovered subtrees, but the cleaner case
+        // exercises the happy path.
+        let src = r#"
+class Foo {
+    fun bar() { baz(); this.qux() }
+}
+object Singleton {
+    fun run() { other() }
+}
+"#;
+        let (chunks, _) = chunk_ast("a.kt", src);
+        assert!(
+            chunks.iter().any(|c| c.function_name.as_deref() == Some("Foo")
+                && c.chunk_type == ChunkType::Class),
+            "expected class Foo, got {chunks:#?}"
+        );
+        let bar = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("bar"))
+            .expect("bar method chunk");
+        assert_eq!(bar.chunk_type, ChunkType::Method);
+        assert!(bar.calls.contains(&"baz".to_string()), "calls={:?}", bar.calls);
+        assert!(bar.calls.contains(&"qux".to_string()), "calls={:?}", bar.calls);
+    }
+
+    #[test]
+    fn test_swift_chunking() {
+        let src = r#"
+class Foo {
+    func bar() { baz(); self.qux() }
+    init() {}
+}
+struct S {}
+enum E { case a }
+protocol P { func d() }
+extension Foo { func ext() {} }
+"#;
+        let (chunks, _) = chunk_ast("a.swift", src);
+        // class Foo
+        assert!(
+            chunks.iter().any(|c| c.function_name.as_deref() == Some("Foo")
+                && c.chunk_type == ChunkType::Class),
+            "expected class Foo, got {chunks:#?}"
+        );
+        // struct S
+        assert!(
+            chunks.iter().any(|c| c.function_name.as_deref() == Some("S")
+                && c.chunk_type == ChunkType::Struct),
+            "expected struct S"
+        );
+        // enum E
+        assert!(
+            chunks.iter().any(|c| c.function_name.as_deref() == Some("E")
+                && c.chunk_type == ChunkType::Enum),
+            "expected enum E"
+        );
+        // protocol P → Trait
+        assert!(
+            chunks.iter().any(|c| c.function_name.as_deref() == Some("P")
+                && c.chunk_type == ChunkType::Trait),
+            "expected protocol P as Trait"
+        );
+        // extension Foo → Module
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::Module && c.function_name.as_deref() == Some("Foo")),
+            "expected extension Foo as Module"
+        );
+        // method calls
+        let bar = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("bar"))
+            .expect("bar method chunk");
+        assert!(bar.calls.contains(&"baz".to_string()), "calls={:?}", bar.calls);
+        assert!(bar.calls.contains(&"qux".to_string()), "calls={:?}", bar.calls);
     }
 
     #[test]
