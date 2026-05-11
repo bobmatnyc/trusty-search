@@ -714,7 +714,16 @@ async fn run_reindex_with(
         .unwrap_or_else(|| format!("/indexes/{}/reindex/stream", index_id));
     let stream_url = format!("{}{}", base, stream_path);
 
-    let resp = client
+    // SSE streams must NOT use the short request timeout from
+    // `daemon_http_client()` (currently 5s) — a large repo reindex can run for
+    // minutes. We build a dedicated client with only a connect timeout so the
+    // byte stream stays open until the daemon emits the `complete` event.
+    let sse_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::MAX)
+        .build()
+        .map_err(|e| anyhow::anyhow!("could not build SSE client: {e}"))?;
+    let resp = sse_client
         .get(&stream_url)
         .send()
         .await

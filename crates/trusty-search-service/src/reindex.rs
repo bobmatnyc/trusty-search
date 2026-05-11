@@ -21,8 +21,25 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use trusty_search_core::registry::{IndexHandle, IndexId};
+
+/// Machine-wide reindex serializer.
+///
+/// Why: The ONNX fastembed model allocates large working buffers per session
+/// (~7–10 GB virtual mem per concurrent `embed()` call on a real codebase).
+/// When multiple `POST /indexes/:id/reindex` requests arrive concurrently
+/// (e.g. benchmark agents, parallel CLI runs), each `spawn_reindex` task
+/// races into `parse_and_embed_files` and the daemon balloons to 28–46 GB,
+/// triggering macOS Jetsam to kill the process.
+///
+/// What: A 1-permit semaphore. Waiting reindexes queue (the SSE stream is
+/// already connected and will start emitting events once the permit is held).
+/// The permit is released when the spawned task's async block returns.
+fn reindex_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| Semaphore::new(1))
+}
 
 /// Files per parallel batch. Each batch is parsed in parallel via rayon and
 /// embedded in a single ONNX call (256 chunks at a time inside the batch).
@@ -138,6 +155,15 @@ impl Default for ReindexProgress {
 pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, force: bool) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
+
+        // Serialize reindexes machine-wide to avoid stacking multiple
+        // simultaneous ONNX embedder sessions (Jetsam kill at ~28GB on macOS).
+        // Late arrivals queue here; their SSE stream is already attached and
+        // will replay buffered events once the permit is acquired.
+        let _permit = reindex_semaphore()
+            .acquire()
+            .await
+            .expect("reindex semaphore is never closed");
 
         let started = Instant::now();
         let root = handle.root_path.clone();
