@@ -30,7 +30,7 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        Json,
+        Json, Redirect,
     },
     routing::{delete, get, post},
     Router,
@@ -207,14 +207,24 @@ pub fn build_router(state: SearchAppState) -> Router {
     use crate::service::ui::{
         chat_handler, list_chat_providers, ui_asset_handler, ui_index_handler,
     };
+    // Why: Vite builds the UI bundle with `base: './'` so `index.html` references
+    // assets via relative paths (e.g. `./assets/index-XXX.js`). When the browser
+    // loads the page at `/ui` (no trailing slash) it resolves those relative
+    // URLs against `/`, requesting `/assets/...` which 404s. Redirecting
+    // `/ui` → `/ui/` forces the browser to use `/ui/` as the base so asset
+    // requests land on `/ui/assets/...` and hit `ui_asset_handler`. The root
+    // `/` redirect makes the daemon's landing page friendly (mirrors the
+    // `.fallback(static_handler)` shape trusty-memory uses to serve its SPA
+    // at `/`).
     let router = Router::new()
+        .route("/", get(|| async { Redirect::permanent("/ui/") }))
         .route("/health", get(health_handler))
         .route(
             "/indexes",
             get(list_indexes_handler).post(create_index_handler),
         )
         .route("/indexes/{id}", delete(delete_index_handler))
-        .route("/ui", get(ui_index_handler))
+        .route("/ui", get(|| async { Redirect::permanent("/ui/") }))
         .route("/ui/", get(ui_index_handler))
         .route("/ui/{*path}", get(ui_asset_handler))
         .route("/chat", post(chat_handler))
