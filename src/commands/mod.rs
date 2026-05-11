@@ -30,5 +30,4 @@ pub mod service;
 pub mod start;
 pub mod status;
 pub mod stop;
-pub mod ui;
 pub mod watch;

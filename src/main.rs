@@ -348,9 +348,16 @@ enum Commands {
     /// URL if the browser fails to launch. Errors clearly if no daemon is
     /// running (no discovery file).
     ///
+    /// Why: Provides quick access to the embedded web management UI.
+    /// What: Discovers the daemon URL and opens it in the system browser.
+    /// Test: `cargo run -- dashboard` (also `dash` / `ui`) opens the browser
+    /// when a daemon is running; otherwise auto-starts the daemon first.
+    ///
     /// Examples:
     ///   trusty-search dashboard
-    #[command(display_order = 23)]
+    ///   trusty-search dash
+    ///   trusty-search ui
+    #[command(display_order = 23, aliases = ["dash", "ui"])]
     Dashboard,
 
     /// Migrate mcp-vector-search project(s) to trusty-search
@@ -376,21 +383,6 @@ enum Commands {
         /// Maximum concurrent conversions for "all"
         #[arg(long, default_value = "4")]
         concurrency: usize,
-    },
-
-    /// Open the web management UI in the default browser
-    ///
-    /// Why: One-command access to the embedded admin panel — auto-detects
-    /// a running daemon (or asks the user to start one) and pops the
-    /// browser at `/ui`.
-    /// Examples:
-    ///   trusty-search ui
-    ///   trusty-search ui --port 7878
-    #[command(display_order = 23)]
-    Ui {
-        /// Port the daemon is listening on (default: read port file or 7878)
-        #[arg(long)]
-        port: Option<u16>,
     },
 
     /// Diagnose configuration, model cache, and index health
@@ -2399,10 +2391,6 @@ async fn main() -> Result<()> {
             concurrency,
         } => {
             commands::convert::handle_convert(target, dry_run, concurrency).await?;
-        }
-
-        Commands::Ui { port } => {
-            commands::ui::handle_ui(port).await?;
         }
 
         Commands::Doctor { fix } => {
