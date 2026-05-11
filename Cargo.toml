@@ -37,13 +37,14 @@ path = "src/main.rs"
 trusty-common = { path = "../trusty-common/crates/trusty-common" }
 trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
 trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+trusty-symgraph = { path = "../trusty-common/crates/trusty-symgraph" }
 
 [dependencies]
 # ── Shared trusty-common crates ────────────────────────────────────────────
 trusty-common = { version = "0.3.1", features = ["axum-server"] }
 trusty-mcp-core = { version = "0.1.0" }
 trusty-embedder = { version = "0.1.2", features = ["test-support"] }
-trusty-contracts = { version = "0.1.0" }
+trusty-symgraph = { version = "0.2.1", default-features = false }  # contracts surface only — no tree-sitter
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }

@@ -17,17 +17,20 @@
 use tree_sitter::{Node, Tree};
 
 // The data shapes (EntityType, EdgeKind, RawEntity, fact_hash_str, tables)
-// live in `trusty-contracts` so analyzer crates can consume them without
-// pulling in the 16 tree-sitter language grammars below. Tree-sitter–driven
-// extraction stays here.
-pub use trusty_contracts::{fact_hash_str, EdgeKind, EntityType, RawEntity};
+// live in `trusty-symgraph::contracts` so analyzer crates can consume them
+// without pulling in the 16 tree-sitter language grammars below.
+// trusty-symgraph is depended on with `default-features = false` so only the
+// pure-data contracts surface is linked (no tree-sitter, no parser deps).
+// Tree-sitter–driven extraction stays here.
+pub use trusty_symgraph::contracts::EdgeKind;
+pub use trusty_symgraph::{fact_hash_str, EntityType, RawEntity};
 
 /// redb table name constants for entity storage.
 ///
-/// Re-exported from `trusty-contracts::tables` for backward compatibility with
-/// existing `crate::core::entity::tables::*` call sites.
+/// Re-exported from `trusty_symgraph::contracts::tables` for backward
+/// compatibility with existing `crate::core::entity::tables::*` call sites.
 pub mod tables {
-    pub use trusty_contracts::tables::*;
+    pub use trusty_symgraph::contracts::tables::*;
 }
 
 /// Slice the source text for a node and return it as an owned string.
