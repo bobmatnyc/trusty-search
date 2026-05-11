@@ -350,6 +350,64 @@ fn collect_inherits(node: Node<'_>, src: &[u8], lang: &str) -> Vec<String> {
                 }
             }
         }
+    } else if lang == "scala"
+        && matches!(
+            node.kind(),
+            "class_definition" | "object_definition" | "trait_definition"
+        )
+    {
+        // Phase 2 (issue #55): Scala's `extends T1 with T2 with T3` is encoded
+        // as an `extends_clause` containing one or more `type_identifier`
+        // children. Each becomes an `Implements` edge in the SymbolGraph.
+        let mut cur = node.walk();
+        for child in node.children(&mut cur) {
+            if child.kind() != "extends_clause" {
+                continue;
+            }
+            let mut cur2 = child.walk();
+            for sub in child.children(&mut cur2) {
+                if sub.kind() == "type_identifier" {
+                    let t = std::str::from_utf8(&src[sub.start_byte()..sub.end_byte()])
+                        .unwrap_or("")
+                        .to_string();
+                    if !t.is_empty() {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+    } else if lang == "php"
+        && matches!(
+            node.kind(),
+            "class_declaration" | "interface_declaration" | "trait_declaration"
+        )
+    {
+        // Phase 2 (issue #49): PHP exposes inheritance via two siblings of
+        // `class_declaration`:
+        //   - `base_clause`  → `extends Parent` (single parent class)
+        //   - `class_interface_clause` → `implements I1, I2` (interfaces)
+        // For `interface_declaration`, `base_clause` carries `extends I1, I2`
+        // (interfaces can extend multiple). We walk both kinds and extract
+        // every `name`-kind child as a parent symbol.
+        let mut cur = node.walk();
+        for child in node.children(&mut cur) {
+            if !matches!(child.kind(), "base_clause" | "class_interface_clause") {
+                continue;
+            }
+            let mut cur2 = child.walk();
+            for sub in child.children(&mut cur2) {
+                // `name` is the type identifier; ignore keyword tokens like
+                // `extends`/`implements` and punctuation `,`.
+                if sub.kind() == "name" || sub.kind() == "qualified_name" {
+                    let t = std::str::from_utf8(&src[sub.start_byte()..sub.end_byte()])
+                        .unwrap_or("")
+                        .to_string();
+                    if !t.is_empty() {
+                        out.push(t);
+                    }
+                }
+            }
+        }
     }
     out.retain(|s| !s.is_empty());
     out
@@ -496,7 +554,19 @@ fn classify_node(lang: &str, node: Node<'_>) -> Option<ChunkType> {
         ("php", "trait_declaration") => ChunkType::Trait,
         ("php", "namespace_definition") => ChunkType::Module,
 
-        ("scala", "function_definition") => ChunkType::Function,
+        ("scala", "function_definition") => {
+            // Phase 2 (issue #55): a `def` inside a class/object/trait template
+            // body is a method; standalone defs (top-level or inside another
+            // function) are plain functions.
+            if ancestor_kind(node, "class_definition").is_some()
+                || ancestor_kind(node, "object_definition").is_some()
+                || ancestor_kind(node, "trait_definition").is_some()
+            {
+                ChunkType::Method
+            } else {
+                ChunkType::Function
+            }
+        }
         ("scala", "class_definition") => ChunkType::Class,
         ("scala", "object_definition") => ChunkType::Class,
         ("scala", "trait_definition") => ChunkType::Trait,
@@ -574,6 +644,77 @@ fn rust_impl_type_name(node: Node<'_>, src: &[u8]) -> Option<String> {
             .unwrap_or("")
             .to_string(),
     )
+}
+
+/// For Scala methods (issue #55): walk up to the enclosing
+/// `class_definition` / `object_definition` / `trait_definition` and grab its
+/// `name` field so the method can be qualified as `ClassName::methodName`.
+///
+/// Why: Phase 2 caller-scoped call edges need stable, container-qualified
+/// symbol names. Without qualification, `Foo.bar` and `Baz.bar` collide in the
+/// symbol graph and `callers_of("bar")` returns false positives.
+/// What: returns the first ancestor template owner's `name` field text, or
+/// None for top-level / standalone defs.
+/// Test: covered by `test_scala_method_qualified_name`.
+fn scala_enclosing_class_name(node: Node<'_>, src: &[u8]) -> Option<String> {
+    let owner = ancestor_kind_any(
+        node,
+        &["class_definition", "object_definition", "trait_definition"],
+    )?;
+    let n = owner.child_by_field_name("name")?;
+    Some(
+        std::str::from_utf8(&src[n.start_byte()..n.end_byte()])
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+/// For PHP methods (issue #49): walk up to the enclosing
+/// `class_declaration` / `interface_declaration` / `trait_declaration` and
+/// grab its `name` field so the method can be qualified as
+/// `ClassName::methodName`.
+///
+/// Why: same rationale as `scala_enclosing_class_name` — symbol-graph
+/// uniqueness across classes that share method names like `handle` or `run`.
+/// What: returns the first ancestor declaration's `name` field text, or None
+/// for free functions.
+/// Test: covered by `test_php_method_qualified_name`.
+fn php_enclosing_class_name(node: Node<'_>, src: &[u8]) -> Option<String> {
+    let owner = ancestor_kind_any(
+        node,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "trait_declaration",
+        ],
+    )?;
+    let n = owner.child_by_field_name("name")?;
+    Some(
+        std::str::from_utf8(&src[n.start_byte()..n.end_byte()])
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+/// Like `ancestor_kind`, but accepts a slice of candidate node kinds.
+///
+/// Why: Scala and PHP each have several container kinds (class/object/trait
+/// for Scala; class/interface/trait for PHP) that can own a method. A single
+/// `ancestor_kind` call per kind would do three linear walks; this collapses
+/// them into one.
+/// What: walks up from `node` and returns the first ancestor whose kind appears
+/// in `kinds`.
+/// Test: indirectly covered by `test_scala_method_qualified_name` and
+/// `test_php_method_qualified_name`.
+fn ancestor_kind_any<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    let mut cur = node.parent();
+    while let Some(c) = cur {
+        if kinds.contains(&c.kind()) {
+            return Some(c);
+        }
+        cur = c.parent();
+    }
+    None
 }
 
 /// Maximum lines for a JSON file to be indexed as a single chunk. Files
@@ -1143,6 +1284,28 @@ fn walk_for_chunks(
         if lang == "rust" && chunk_type == ChunkType::Method {
             if let Some(ty) = rust_impl_type_name(node, src) {
                 if !name.is_empty() {
+                    name = format!("{ty}::{name}");
+                }
+            }
+        }
+
+        // Phase 2 (issue #55): qualify Scala methods with their enclosing
+        // class/object/trait, e.g. `Foo::bar`. Mirrors the Rust impl-type
+        // qualification above so SymbolGraph caller edges resolve unambiguously
+        // across classes that share method names.
+        if lang == "scala" && chunk_type == ChunkType::Method {
+            if let Some(ty) = scala_enclosing_class_name(node, src) {
+                if !name.is_empty() && !ty.is_empty() {
+                    name = format!("{ty}::{name}");
+                }
+            }
+        }
+
+        // Phase 2 (issue #49): qualify PHP methods with their enclosing
+        // class/interface/trait, e.g. `Foo::doIt`. Same rationale as Scala.
+        if lang == "php" && chunk_type == ChunkType::Method {
+            if let Some(ty) = php_enclosing_class_name(node, src) {
+                if !name.is_empty() && !ty.is_empty() {
                     name = format!("{ty}::{name}");
                 }
             }
@@ -1786,6 +1949,283 @@ fn fuse() {}
             f.nlp_keywords.iter().any(|k| k == "Implements"),
             "keywords={:?}",
             f.nlp_keywords
+        );
+    }
+
+    // ----- Scala Phase 2 (issue #55) -----
+
+    #[test]
+    fn test_scala_method_qualified_name() {
+        // Why: SymbolGraph caller edges need `ClassName::methodName` so that
+        // two classes with a `run` method don't share a single graph node.
+        // What: a class method is chunked as `Foo::bar`, a top-level def as `freefn`.
+        // Test: assert both chunks emit the expected qualified / unqualified names.
+        let src = r#"
+class Foo extends Bar with Mixin {
+  def bar(): Unit = baz()
+}
+object O {
+  def run(): Unit = other()
+}
+def freefn(): Unit = ()
+"#;
+        let (chunks, _) = chunk_ast("a.scala", src);
+        let bar = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("Foo::bar"))
+            .expect("expected qualified method Foo::bar, got: {chunks:#?}");
+        assert_eq!(bar.chunk_type, ChunkType::Method);
+        let run = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("O::run"))
+            .expect("expected qualified method O::run");
+        assert_eq!(run.chunk_type, ChunkType::Method);
+        // Top-level def remains unqualified.
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.function_name.as_deref() == Some("freefn")
+                    && c.chunk_type == ChunkType::Function),
+            "expected unqualified Function freefn, got {chunks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_scala_caller_scoped_call_edges() {
+        // Why: Phase 2 needs caller-scoped call edges so `who calls baz?`
+        // returns `Foo::bar`, not the whole file.
+        // What: `Foo::bar`'s `calls` field includes `baz`, and the call is
+        // attached to the method chunk (not the class).
+        // Test: assert `calls` membership on the method chunk.
+        let src = r#"
+class Foo {
+  def bar(): Unit = {
+    baz()
+    this.qux()
+  }
+}
+"#;
+        let (chunks, _) = chunk_ast("a.scala", src);
+        let bar = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("Foo::bar"))
+            .expect("Foo::bar chunk");
+        assert!(
+            bar.calls.contains(&"baz".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
+        assert!(
+            bar.calls.contains(&"qux".to_string()),
+            "calls={:?}",
+            bar.calls
+        );
+    }
+
+    #[test]
+    fn test_scala_extends_and_with_emit_inherits() {
+        // Why: `extends T1 with T2 with T3` describes a layered Scala class
+        // mixin chain; Phase 2 turns each parent into an `Implements` edge so
+        // intent-gated KG expansion can surface the parent.
+        // What: `inherits_from` on the class chunk lists all three parents.
+        // Test: assert membership.
+        let src = r#"
+class Foo extends Bar with Mixin with Other {
+  def m(): Unit = ()
+}
+"#;
+        let (chunks, _) = chunk_ast("a.scala", src);
+        let foo = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("Foo") && c.chunk_type == ChunkType::Class)
+            .expect("Foo class chunk");
+        for parent in ["Bar", "Mixin", "Other"] {
+            assert!(
+                foo.inherits_from.iter().any(|p| p == parent),
+                "expected parent {parent} in inherits_from={:?}",
+                foo.inherits_from
+            );
+        }
+    }
+
+    #[test]
+    fn test_scala_symbol_graph_resolves_caller() {
+        // Why: end-to-end check that the chunker output, once fed to
+        // SymbolGraph::build_from_chunks, yields a usable caller→callee edge.
+        // What: build the graph from two scala chunks and assert
+        // `callers_of("baz")` returns the qualified method.
+        // Test: integrates chunker + symbol_graph for Phase 2.
+        use crate::symbol_graph::SymbolGraph;
+        let src = r#"
+class Foo {
+  def bar(): Unit = baz()
+}
+def baz(): Unit = ()
+"#;
+        let (chunks, _) = chunk_ast("s.scala", src);
+        let tuples: Vec<_> = chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.file.clone(),
+                    c.function_name.clone(),
+                    c.calls.clone(),
+                    c.inherits_from.clone(),
+                    c.chunk_type.clone(),
+                )
+            })
+            .collect();
+        let g = SymbolGraph::build_from_chunks(&tuples);
+        let callers = g.callers_of("baz", 1);
+        assert!(
+            callers.iter().any(|(s, _)| s == "Foo::bar"),
+            "callers={callers:?}"
+        );
+    }
+
+    // ----- PHP Phase 2 (issue #49) -----
+
+    #[test]
+    fn test_php_method_qualified_name() {
+        // Why: same rationale as Scala — class-qualified method names avoid
+        // symbol collisions in the call graph.
+        // What: `Foo::doIt` is the chunk's function_name; a free function in
+        // the same file remains unqualified.
+        // Test: assert both forms.
+        let src = r#"<?php
+class Foo extends Bar implements I1, I2 {
+    public function doIt(): void {
+        $this->helper();
+    }
+}
+function freefn(): void {}
+"#;
+        let (chunks, _) = chunk_ast("a.php", src);
+        let doit = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("Foo::doIt"))
+            .expect("expected qualified Foo::doIt, got: {chunks:#?}");
+        assert_eq!(doit.chunk_type, ChunkType::Method);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.function_name.as_deref() == Some("freefn")
+                    && c.chunk_type == ChunkType::Function),
+            "expected unqualified Function freefn"
+        );
+    }
+
+    #[test]
+    fn test_php_caller_scoped_call_edges() {
+        // Why: caller-scoped edges must capture all three PHP call shapes
+        // (`$this->m()`, `Class::m()`, `func()`).
+        // What: assert each callee appears in the method's `calls` field.
+        let src = r#"<?php
+class Foo {
+    public function doIt(): void {
+        $this->helper();
+        Foo::staticCall();
+        regularFunc();
+    }
+}
+"#;
+        let (chunks, _) = chunk_ast("a.php", src);
+        let doit = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("Foo::doIt"))
+            .expect("Foo::doIt chunk");
+        for callee in ["helper", "staticCall", "regularFunc"] {
+            assert!(
+                doit.calls.iter().any(|c| c == callee),
+                "expected callee {callee} in calls={:?}",
+                doit.calls
+            );
+        }
+    }
+
+    #[test]
+    fn test_php_implements_and_extends_emit_inherits() {
+        // Why: PHP's `class Foo extends Bar implements I1, I2` carries one
+        // parent class plus N interfaces; Phase 2 emits one `Implements` edge
+        // for each.
+        // What: assert all three names appear in `inherits_from`.
+        let src = r#"<?php
+class Foo extends Bar implements I1, I2 {}
+"#;
+        let (chunks, _) = chunk_ast("a.php", src);
+        let foo = chunks
+            .iter()
+            .find(|c| c.function_name.as_deref() == Some("Foo") && c.chunk_type == ChunkType::Class)
+            .expect("Foo class chunk");
+        for parent in ["Bar", "I1", "I2"] {
+            assert!(
+                foo.inherits_from.iter().any(|p| p == parent),
+                "expected parent {parent} in inherits_from={:?}",
+                foo.inherits_from
+            );
+        }
+    }
+
+    #[test]
+    fn test_php_interface_extends_emits_inherits() {
+        // Why: PHP interfaces can extend multiple interfaces; the grammar
+        // packages those parents in a `base_clause` (same shape as a class's
+        // extends clause).
+        // What: `interface Child extends P1, P2` → inherits_from = [P1, P2].
+        let src = r#"<?php
+interface Child extends P1, P2 {}
+"#;
+        let (chunks, _) = chunk_ast("a.php", src);
+        let child = chunks
+            .iter()
+            .find(|c| {
+                c.function_name.as_deref() == Some("Child") && c.chunk_type == ChunkType::Trait
+            })
+            .expect("Child interface (chunked as Trait)");
+        for parent in ["P1", "P2"] {
+            assert!(
+                child.inherits_from.iter().any(|p| p == parent),
+                "expected parent {parent} in inherits_from={:?}",
+                child.inherits_from
+            );
+        }
+    }
+
+    #[test]
+    fn test_php_symbol_graph_resolves_caller() {
+        // Why: end-to-end Phase 2 integration: chunker → symbol_graph yields
+        // a usable PHP caller→callee edge for KG expansion.
+        // What: assert `callers_of("helper")` returns `Foo::doIt`.
+        use crate::symbol_graph::SymbolGraph;
+        let src = r#"<?php
+class Foo {
+    public function doIt(): void {
+        $this->helper();
+    }
+    public function helper(): void {}
+}
+"#;
+        let (chunks, _) = chunk_ast("p.php", src);
+        let tuples: Vec<_> = chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.file.clone(),
+                    c.function_name.clone(),
+                    c.calls.clone(),
+                    c.inherits_from.clone(),
+                    c.chunk_type.clone(),
+                )
+            })
+            .collect();
+        let g = SymbolGraph::build_from_chunks(&tuples);
+        // `helper` resolves to `Foo::helper` via the suffix lookup.
+        let callers = g.callers_of("Foo::helper", 1);
+        assert!(
+            callers.iter().any(|(s, _)| s == "Foo::doIt"),
+            "callers={callers:?}"
         );
     }
 }
