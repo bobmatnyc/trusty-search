@@ -1,0 +1,112 @@
+# Publishes all crates in the trusty-search workspace to crates.io.
+#
+# Triggered by:
+#   - Push of a tag matching v* (e.g. v0.1.58)
+#   - Manual workflow_dispatch (with optional dry-run mode)
+#   - Downstream trigger from trusty-common's publish workflow
+#
+# Cross-repo dependency:
+#   trusty-search-core depends on trusty-embedder (from trusty-common).
+#   trusty-search-service and trusty-search-mcp depend on trusty-common.
+#   Ensure trusty-common crates are published first before running this
+#   workflow with updated version pins.
+#
+# Publish order (dependency-first within workspace):
+#   1. trusty-search-core    — depends on trusty-embedder (external)
+#   2. trusty-search-service — depends on trusty-search-core + trusty-common
+#   3. trusty-search-mcp     — depends on trusty-search-core + trusty-search-service + trusty-mcp-core
+#   4. trusty-search (bin)   — depends on all three crates above
+#
+# Required repository secret:
+#   CARGO_REGISTRY_TOKEN — crates.io API token with publish scope.
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (publish --dry-run, skip actual upload)"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish:
+    name: Publish crates to crates.io
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # ── Quality gate ──────────────────────────────────────────────────────
+      - name: Clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+      # ── Publish ───────────────────────────────────────────────────────────
+      # Note: [patch] overrides in Cargo.toml are ignored by `cargo publish`
+      # (by design — published crates must not rely on path patches). The
+      # workspace.dependencies entries reference the git-tagged versions of
+      # trusty-common crates which must already exist on crates.io.
+
+      - name: Publish trusty-search-core
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p trusty-search-core --dry-run
+          else
+            cargo publish -p trusty-search-core --no-verify
+          fi
+
+      - name: Wait for index propagation (trusty-search-core)
+        if: ${{ inputs.dry_run != true }}
+        run: sleep 20
+
+      - name: Publish trusty-search-service
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p trusty-search-service --dry-run
+          else
+            cargo publish -p trusty-search-service --no-verify
+          fi
+
+      - name: Wait for index propagation (trusty-search-service)
+        if: ${{ inputs.dry_run != true }}
+        run: sleep 20
+
+      - name: Publish trusty-search-mcp
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p trusty-search-mcp --dry-run
+          else
+            cargo publish -p trusty-search-mcp --no-verify
+          fi
+
+      - name: Wait for index propagation (trusty-search-mcp)
+        if: ${{ inputs.dry_run != true }}
+        run: sleep 20
+
+      - name: Publish trusty-search (binary crate)
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p trusty-search --dry-run
+          else
+            cargo publish -p trusty-search --no-verify
+          fi
