@@ -42,15 +42,21 @@ fn reindex_semaphore() -> &'static Semaphore {
 }
 
 /// Files per parallel batch. Each batch is parsed in parallel via rayon and
-/// embedded in a single ONNX call (256 chunks at a time inside the batch).
+/// embedded in ONNX batches (`EMBED_BATCH_SIZE` chunks at a time inside the
+/// batch). The full `ParsedBatch` (chunk content + embeddings + entities for
+/// every file in the batch) is held in memory until the commit phase finishes.
 ///
-/// 512 files maximizes lock-acquisition amortization across the indexer's
-/// write-lock-protected commit phase: with the split parse/embed-vs-commit
-/// pipeline, each batch acquires the corpus write lock exactly once. Larger
-/// batches mean fewer lock cycles and better ONNX-session saturation; the
-/// downside is coarser-grained SSE progress updates, which is acceptable
-/// because progress events are batch-level by design.
-const REINDEX_BATCH_SIZE: usize = 512;
+/// 128 files bounds peak memory during reindex. On a 595-file repo with ~8
+/// chunks/file, a 512-file batch held ~4k chunks of source content plus their
+/// 384-dim f32 embeddings plus ONNX intermediate activation tensors retained
+/// across the embed loop — pushing RSS to 33–50 GB and triggering macOS Jetsam
+/// kill. With 128 files per batch, the working set caps at ~1k chunks worth of
+/// memory, and the ONNX session arena gets multiple opportunities to release
+/// transient buffers between commits. SSE progress events fire per batch, so a
+/// smaller batch size also gives more granular progress updates — the downside
+/// is slightly more lock-acquisition overhead, which is negligible vs. the
+/// per-batch parse+embed cost.
+const REINDEX_BATCH_SIZE: usize = 128;
 
 /// Per-index, per-process content-hash cache. Used to skip reindexing files
 /// whose content hasn't changed since the last reindex in this daemon's
@@ -58,8 +64,7 @@ const REINDEX_BATCH_SIZE: usize = 512;
 /// restarts (acceptable: cold start re-embeds everything anyway, and on warm
 /// daemons the user expects "skip unchanged" behaviour).
 fn file_hashes() -> &'static DashMap<IndexId, Arc<DashMap<PathBuf, String>>> {
-    static FILE_HASHES: OnceLock<DashMap<IndexId, Arc<DashMap<PathBuf, String>>>> =
-        OnceLock::new();
+    static FILE_HASHES: OnceLock<DashMap<IndexId, Arc<DashMap<PathBuf, String>>>> = OnceLock::new();
     FILE_HASHES.get_or_init(DashMap::new)
 }
 
@@ -238,10 +243,7 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, f
                 // that don't carry a `.min.js` suffix — detected after read so
                 // we can inspect the actual line structure.
                 if should_skip_content(&path, &content) {
-                    tracing::debug!(
-                        "reindex: skipping minified content in {}",
-                        path.display()
-                    );
+                    tracing::debug!("reindex: skipping minified content in {}", path.display());
                     progress.skipped.fetch_add(1, Ordering::Release);
                     let indexed = progress.indexed.fetch_add(1, Ordering::Release) + 1;
                     progress
@@ -298,14 +300,15 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, f
             .await;
             match result {
                 Ok(new_chunks) => {
-                    progress.total_chunks.fetch_add(new_chunks, Ordering::Release);
+                    progress
+                        .total_chunks
+                        .fetch_add(new_chunks, Ordering::Release);
                     let batch_files = to_index.len();
                     let indexed =
                         progress.indexed.fetch_add(batch_files, Ordering::Release) + batch_files;
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     let chunks_per_sec = if elapsed_ms > 0 {
-                        (progress.total_chunks.load(Ordering::Acquire) as u64 * 1000)
-                            / elapsed_ms
+                        (progress.total_chunks.load(Ordering::Acquire) as u64 * 1000) / elapsed_ms
                     } else {
                         0
                     };
@@ -331,12 +334,7 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, f
                     // individually via `index_file`.
                     let files_in_batch: Vec<String> = to_index_paths
                         .iter()
-                        .map(|p| {
-                            p.strip_prefix(&root)
-                                .unwrap_or(p)
-                                .display()
-                                .to_string()
-                        })
+                        .map(|p| p.strip_prefix(&root).unwrap_or(p).display().to_string())
                         .collect();
                     progress
                         .errors
@@ -422,7 +420,13 @@ mod tests {
         assert_eq!(progress.indexed.load(Ordering::Acquire), 2);
 
         let events = progress.events.lock().await;
-        assert!(events.first().map(|s| s.contains("\"start\"")).unwrap_or(false));
-        assert!(events.last().map(|s| s.contains("\"complete\"")).unwrap_or(false));
+        assert!(events
+            .first()
+            .map(|s| s.contains("\"start\""))
+            .unwrap_or(false));
+        assert!(events
+            .last()
+            .map(|s| s.contains("\"complete\""))
+            .unwrap_or(false));
     }
 }

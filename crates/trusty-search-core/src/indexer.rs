@@ -39,9 +39,15 @@ const QUERY_CACHE_CAPACITY: usize = 256;
 /// Oversample factor for the HNSW lane before RRF fusion.
 const HNSW_OVERSAMPLE: usize = 4;
 /// Batch size for the fastembed ONNX call when bulk-indexing files.
-/// 256 chunks per batch lets ONNX/SIMD amortise tensor setup; larger batches
-/// risk transient memory spikes on machines with many cores.
-const EMBED_BATCH_SIZE: usize = 256;
+///
+/// 128 chunks per batch balances SIMD/tensor-setup amortisation against ONNX
+/// session arena growth. ORT retains per-session activation buffers sized to
+/// the largest batch it has seen; on large repos a 256-chunk batch combined
+/// with a 512-file reindex batch caused the arena to grow into the tens of
+/// GBs and trigger macOS Jetsam kills. 128 keeps the per-call tensor footprint
+/// bounded while still being large enough to amortise ONNX kernel launch
+/// overhead.
+const EMBED_BATCH_SIZE: usize = 128;
 /// Legacy default score multiplier applied to chunks brought in via KG
 /// expansion. Retained for backwards-compat documentation: the live pipeline
 /// now uses [`EdgeKind::score_multiplier`] (issue #18) so each edge type
@@ -218,8 +224,8 @@ impl CodeIndexer {
     /// [`Self::with_components`] before invoking [`Self::search`] — otherwise
     /// search returns `Ok(vec![])` (BM25-only fallback uses the same path).
     pub fn new(index_id: impl Into<String>, root_path: impl Into<std::path::PathBuf>) -> Self {
-        let cap = NonZeroUsize::new(QUERY_CACHE_CAPACITY)
-            .expect("QUERY_CACHE_CAPACITY must be non-zero");
+        let cap =
+            NonZeroUsize::new(QUERY_CACHE_CAPACITY).expect("QUERY_CACHE_CAPACITY must be non-zero");
         Self {
             index_id: index_id.into(),
             root_path: root_path.into(),
@@ -295,11 +301,7 @@ impl CodeIndexer {
     /// `function_name` equals `function`. When `function` is `None`, returns
     /// the lowest-line-numbered chunk in the matching file. Returns the chunk
     /// id, or `None` when nothing matches.
-    pub async fn find_chunk_id(
-        &self,
-        file_suffix: &str,
-        function: Option<&str>,
-    ) -> Option<String> {
+    pub async fn find_chunk_id(&self, file_suffix: &str, function: Option<&str>) -> Option<String> {
         let chunks = self.chunks.read().await;
         let matching: Vec<&RawChunk> = chunks
             .values()
@@ -397,10 +399,7 @@ impl CodeIndexer {
     pub fn chunk_count(&self) -> usize {
         // blocking_read is fine on a tokio worker thread for a quick stat probe;
         // we never await across this call.
-        self.chunks
-            .try_read()
-            .map(|g| g.len())
-            .unwrap_or(0)
+        self.chunks.try_read().map(|g| g.len()).unwrap_or(0)
     }
 
     /// Compose the BM25 document text for a chunk: body + virtual_terms,
@@ -411,7 +410,11 @@ impl CodeIndexer {
         } else {
             let mut s = String::with_capacity(
                 chunk.content.len()
-                    + chunk.virtual_terms.iter().map(|t| t.len() + 1).sum::<usize>(),
+                    + chunk
+                        .virtual_terms
+                        .iter()
+                        .map(|t| t.len() + 1)
+                        .sum::<usize>(),
             );
             s.push_str(&chunk.content);
             for t in &chunk.virtual_terms {
@@ -438,19 +441,13 @@ impl CodeIndexer {
                 .context("upsert chunk vector")?;
             // Cache for MMR diversity (#28). Cheap O(1) write under the corpus
             // mutation path so the search hot loop never has to re-embed.
-            self.chunk_embeddings
-                .write()
-                .await
-                .insert(id.clone(), vec);
+            self.chunk_embeddings.write().await.insert(id.clone(), vec);
         }
 
         // Maintain the persistent BM25 index. Doing this on every write keeps
         // the search path O(query_terms · postings) instead of O(corpus).
         let bm25_text = Self::bm25_doc_text(&chunk);
-        self.bm25
-            .write()
-            .await
-            .upsert_document(&id, &bm25_text);
+        self.bm25.write().await.upsert_document(&id, &bm25_text);
 
         self.chunks.write().await.insert(id, chunk);
         self.rebuild_symbol_graph().await;
@@ -482,8 +479,7 @@ impl CodeIndexer {
         // Snapshot chunk contents before move so we can run the ConceptCluster
         // pass (Phase C, issue #22) below. Borrowing into the for-loop would
         // hold the slice across `await`, which `add_chunk` doesn't allow.
-        let chunk_contents: Vec<String> =
-            chunks.iter().map(|c| c.content.clone()).collect();
+        let chunk_contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
         for chunk in chunks {
             self.add_chunk(chunk).await?;
@@ -554,10 +550,7 @@ impl CodeIndexer {
     /// chunker returned no chunks contribute zero; per-file embed/upsert
     /// failures are surfaced as `Err` and abort the batch (the caller should
     /// fall back to per-file `index_file` for diagnostics).
-    pub async fn index_files_batch(
-        &self,
-        files: &[(String, String)],
-    ) -> Result<usize> {
+    pub async fn index_files_batch(&self, files: &[(String, String)]) -> Result<usize> {
         self.index_files_batch_inner(files, false).await
     }
 
@@ -573,10 +566,7 @@ impl CodeIndexer {
     /// Single-file paths (`add_chunk`, `index_file`, file watcher) keep the
     /// per-call rebuild for correctness — they're not in the bulk-cold-start
     /// hot path.
-    pub async fn index_files_batch_no_rebuild(
-        &self,
-        files: &[(String, String)],
-    ) -> Result<usize> {
+    pub async fn index_files_batch_no_rebuild(&self, files: &[(String, String)]) -> Result<usize> {
         self.index_files_batch_inner(files, true).await
     }
 
@@ -613,10 +603,7 @@ impl CodeIndexer {
     /// `embed_batch` call). Returns a [`ParsedBatch`] ready for
     /// [`Self::commit_parsed_batch`].
     /// Test: covered indirectly by every `index_files_batch*` test.
-    pub async fn parse_and_embed_files(
-        &self,
-        files: Vec<(String, String)>,
-    ) -> Result<ParsedBatch> {
+    pub async fn parse_and_embed_files(&self, files: Vec<(String, String)>) -> Result<ParsedBatch> {
         if files.is_empty() {
             return Ok(ParsedBatch::default());
         }
@@ -942,11 +929,9 @@ impl CodeIndexer {
     /// Score for each neighbour = `seed_score * edge_kind.score_multiplier()`.
     fn edge_kinds_for_intent(intent: QueryIntent) -> Vec<EdgeKind> {
         match intent {
-            QueryIntent::Definition => vec![
-                EdgeKind::Implements,
-                EdgeKind::Aliases,
-                EdgeKind::UsesType,
-            ],
+            QueryIntent::Definition => {
+                vec![EdgeKind::Implements, EdgeKind::Aliases, EdgeKind::UsesType]
+            }
             QueryIntent::Usage => vec![
                 EdgeKind::CallsFunction,
                 EdgeKind::CalledByFunction,
@@ -961,10 +946,7 @@ impl CodeIndexer {
                 EdgeKind::ErrorDescribes,
                 EdgeKind::Configures,
             ],
-            QueryIntent::Unknown => vec![
-                EdgeKind::CallsFunction,
-                EdgeKind::CalledByFunction,
-            ],
+            QueryIntent::Unknown => vec![EdgeKind::CallsFunction, EdgeKind::CalledByFunction],
         }
     }
 
@@ -976,19 +958,14 @@ impl CodeIndexer {
     ///
     /// Deduplicates: a chunk already in the seed set is never re-emitted; a
     /// chunk reachable through multiple seed/edge paths keeps its best score.
-    async fn kg_expand(
-        &self,
-        seeds: &[(String, f32)],
-        intent: QueryIntent,
-    ) -> Vec<(String, f32)> {
+    async fn kg_expand(&self, seeds: &[(String, f32)], intent: QueryIntent) -> Vec<(String, f32)> {
         let graph = self.symbol_graph().await;
         if graph.node_count() == 0 || seeds.is_empty() {
             return Vec::new();
         }
 
         let edge_kinds = Self::edge_kinds_for_intent(intent);
-        let seed_ids: std::collections::HashSet<&String> =
-            seeds.iter().map(|(id, _)| id).collect();
+        let seed_ids: std::collections::HashSet<&String> = seeds.iter().map(|(id, _)| id).collect();
         let mut best: HashMap<String, f32> = HashMap::new();
 
         for (seed_id, seed_score) in seeds {
@@ -1089,12 +1066,7 @@ impl CodeIndexer {
             if emb_map.is_empty() {
                 fused_raw
             } else {
-                crate::mmr::mmr_rerank(
-                    fused_raw,
-                    &emb_map,
-                    crate::mmr::DEFAULT_LAMBDA,
-                    query.top_k,
-                )
+                crate::mmr::mmr_rerank(fused_raw, &emb_map, crate::mmr::DEFAULT_LAMBDA, query.top_k)
             }
         };
 
@@ -1204,8 +1176,7 @@ mod tests {
     fn make_indexer() -> CodeIndexer {
         let dim = 32;
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(dim));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(UsearchStore::new(dim).expect("usearch new"));
+        let store: Arc<dyn VectorStore> = Arc::new(UsearchStore::new(dim).expect("usearch new"));
         CodeIndexer::new("test", "/tmp/test").with_components(embedder, store)
     }
 
@@ -1244,7 +1215,8 @@ mod tests {
         let results = idx.search(&q).await.expect("search");
         assert!(!results.is_empty(), "search should return at least one hit");
         assert_eq!(
-            results[0].id, "src/auth.rs:1:5",
+            results[0].id,
+            "src/auth.rs:1:5",
             "auth chunk must rank first; got {:?}",
             results.iter().map(|r| &r.id).collect::<Vec<_>>()
         );
@@ -1286,13 +1258,9 @@ mod tests {
         // Indexer without `with_components` → embedder/store None → BM25-only.
         let idx = CodeIndexer::new("bm25-only", "/tmp/test");
         // We can't call add_chunk's vector path, but no embedder means it skips.
-        idx.add_chunk(raw(
-            "f.rs:1:1",
-            "f.rs",
-            "fn authenticate() {}",
-        ))
-        .await
-        .unwrap();
+        idx.add_chunk(raw("f.rs:1:1", "f.rs", "fn authenticate() {}"))
+            .await
+            .unwrap();
         idx.add_chunk(raw("g.rs:1:1", "g.rs", "fn unrelated() {}"))
             .await
             .unwrap();
@@ -1503,7 +1471,10 @@ mod tests {
         let hit_id = hit.unwrap();
         let chunks = idx.chunks.read().await;
         assert!(
-            chunks.get(&hit_id).map(|c| c.file == "e.rs").unwrap_or(false),
+            chunks
+                .get(&hit_id)
+                .map(|c| c.file == "e.rs")
+                .unwrap_or(false),
             "matched chunk should live in e.rs",
         );
     }
@@ -1534,7 +1505,8 @@ mod tests {
         let results = idx.search(&q).await.expect("search");
         assert!(!results.is_empty(), "search must return at least one hit");
         assert_eq!(
-            results[0].file, "src/types.rs",
+            results[0].file,
+            "src/types.rs",
             "FooBar's defining file must rank first; got {:?}",
             results.iter().map(|r| &r.file).collect::<Vec<_>>(),
         );
@@ -1551,12 +1523,9 @@ mod tests {
         // exact-name boosts. A LiteralString like "this is a long literal"
         // appearing in a file must not be returned as an entity match.
         let idx = make_indexer();
-        idx.index_file(
-            "lit.rs",
-            "fn f() { let _ = \"this is a long literal\"; }\n",
-        )
-        .await
-        .unwrap();
+        idx.index_file("lit.rs", "fn f() { let _ = \"this is a long literal\"; }\n")
+            .await
+            .unwrap();
         // Single-word literal subset that exists as a string token but is
         // neither a NamedType nor a ModulePath — must miss.
         assert!(
