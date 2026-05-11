@@ -3,26 +3,6 @@
 use anyhow::Result;
 use colored::Colorize;
 
-/// Build the canonical `FactStore` next to the daemon lockfile.
-///
-/// Why: facts persist across daemon restarts and are scoped per-machine
-/// (single install). Falling back to `None` keeps the daemon usable if the
-/// data dir is read-only — `/facts` endpoints will return 503.
-fn open_facts_store() -> Option<trusty_search_core::FactStore> {
-    let dir = dirs::data_local_dir()?.join("trusty-search");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("could not create facts dir {}: {e}", dir.display());
-        return None;
-    }
-    match trusty_search_core::FactStore::open(&dir.join("facts.redb")) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!("could not open facts store: {e}");
-            None
-        }
-    }
-}
-
 /// Build a shared `FastEmbedder` for every index registered during the
 /// daemon's lifetime.
 ///
@@ -41,7 +21,8 @@ async fn build_embedder() -> Option<std::sync::Arc<dyn trusty_search_core::Embed
 }
 
 /// Why: extracted from `main()`. The boot sequence is intricate (lockfile probe,
-/// facts store, embedder, app state) and benefits from being its own unit.
+/// embedder, app state) and benefits from being its own unit. Facts storage
+/// moved to trusty-analyzer (issue #40).
 /// What: probes the lockfile fast-path, then constructs `SearchAppState` and
 /// hands off to `run_daemon`. Maps `DaemonError::AlreadyRunning` to a friendly
 /// exit-1 message.
@@ -66,12 +47,10 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
         std::process::exit(1);
     }
 
-    let facts = open_facts_store();
     let embedder = build_embedder().await;
 
     let mut state = trusty_search_service::SearchAppState::new(
         trusty_search_core::registry::IndexRegistry::new(),
-        facts,
     );
     if let Some(e) = embedder {
         state = state.with_embedder(e);

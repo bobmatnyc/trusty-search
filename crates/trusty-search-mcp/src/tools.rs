@@ -297,31 +297,6 @@ impl McpServer {
                 }
                 self.post("/chat", &body).await
             }
-            "complexity_hotspots" => {
-                let index_id = args
-                    .get("index")
-                    .and_then(Value::as_str)
-                    .unwrap_or("default");
-                let top_n = args.get("top_n").and_then(Value::as_u64).unwrap_or(20);
-                self.get(&format!(
-                    "/indexes/{index_id}/complexity_hotspots?top_n={top_n}"
-                ))
-                .await
-            }
-            "find_smells" => {
-                let index_id = args
-                    .get("index")
-                    .and_then(Value::as_str)
-                    .unwrap_or("default");
-                self.get(&format!("/indexes/{index_id}/smells")).await
-            }
-            "analyze_quality" => {
-                let index_id = args
-                    .get("index")
-                    .and_then(Value::as_str)
-                    .unwrap_or("default");
-                self.get(&format!("/indexes/{index_id}/quality")).await
-            }
             "list_chunks" => {
                 // Issue #54 — paginated enumeration of an index's corpus.
                 // Mirrors `GET /indexes/:id/chunks?offset=&limit=`.
@@ -538,37 +513,6 @@ pub fn tool_descriptors() -> Value {
             "name": "search_health",
             "description": "Probe daemon liveness and version",
             "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
-            "name": "complexity_hotspots",
-            "description": "Top-N chunks ranked by cyclomatic complexity (issue #32)",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "index": { "type": "string" },
-                    "top_n": { "type": "number" }
-                }
-            }
-        },
-        {
-            "name": "find_smells",
-            "description": "Chunks with at least one detected code smell (issue #32)",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "index": { "type": "string" }
-                }
-            }
-        },
-        {
-            "name": "analyze_quality",
-            "description": "Aggregate quality stats: avg cyclomatic, %A, smell count (issue #32)",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "index": { "type": "string" }
-                }
-            }
         },
         {
             "name": "delete_index",

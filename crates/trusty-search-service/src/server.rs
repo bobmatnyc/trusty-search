@@ -38,7 +38,6 @@ use tokio_stream::wrappers::BroadcastStream;
 use trusty_search_core::{
     classifier::QueryClassifier,
     embed::Embedder,
-    facts::{FactRecord, FactStore},
     indexer::{CodeIndexer, SearchQuery},
     registry::{IndexHandle, IndexId, IndexRegistry},
     store::{UsearchStore, VectorStore},
@@ -50,10 +49,6 @@ use crate::reindex::{spawn_reindex, ReindexProgress, ReindexStatus};
 #[derive(Clone)]
 pub struct SearchAppState {
     pub registry: IndexRegistry,
-    /// Optional canonical facts store. `None` disables the `/facts` endpoints
-    /// (they return 503 when unavailable) — useful for tests that don't need
-    /// persistence.
-    pub facts: Option<FactStore>,
     /// Per-index reindex progress (live counters + SSE replay buffer). Started
     /// by `POST /indexes/:id/reindex`, consumed by
     /// `GET /indexes/:id/reindex/stream`. Lazily populated.
@@ -80,10 +75,9 @@ impl SearchAppState {
     /// reindex tracking without hand-rolling the `Arc<DashMap<…>>`. Defaults
     /// to BM25-only mode (no embedder); use [`Self::with_embedder`] to enable
     /// the vector lane.
-    pub fn new(registry: IndexRegistry, facts: Option<FactStore>) -> Self {
+    pub fn new(registry: IndexRegistry) -> Self {
         Self {
             registry,
-            facts,
             reindex_progress: Arc::new(DashMap::new()),
             embedder: None,
             daemon_port: None,
@@ -163,93 +157,10 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/:id/reindex", post(reindex_handler))
         .route("/indexes/:id/reindex/stream", get(reindex_stream_handler))
         .route("/indexes/:id/chunks", get(get_index_chunks_handler))
-        .route(
-            "/indexes/:id/complexity_hotspots",
-            get(complexity_hotspots_handler),
-        )
-        .route("/indexes/:id/smells", get(smells_handler))
-        .route("/indexes/:id/quality", get(quality_handler))
-        .route("/facts", get(list_facts_handler).post(upsert_fact_handler))
-        .route("/facts/:id", delete(delete_fact_handler))
         .with_state(Arc::new(state));
     // Standard middleware stack (CORS, tracing, gzip) lives in trusty-common
     // so every trusty-* daemon ships with the same defaults.
     trusty_common::server::with_standard_middleware(router)
-}
-
-#[derive(Deserialize)]
-pub struct FactQueryParams {
-    pub subject: Option<String>,
-    pub predicate: Option<String>,
-    pub object: Option<String>,
-}
-
-/// Inbound payload for upserting a fact. `id` and `created_at` are derived
-/// server-side; callers don't need to compute the hash.
-#[derive(Deserialize)]
-pub struct UpsertFactRequest {
-    pub subject: String,
-    pub predicate: String,
-    pub object: String,
-    pub index_id: String,
-    #[serde(default = "default_confidence")]
-    pub confidence: f32,
-    #[serde(default)]
-    pub provenance: Vec<String>,
-}
-
-fn default_confidence() -> f32 {
-    1.0
-}
-
-async fn list_facts_handler(
-    State(state): State<Arc<SearchAppState>>,
-    Query(params): Query<FactQueryParams>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let Some(store) = &state.facts else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    let hits = store
-        .query(
-            params.subject.as_deref(),
-            params.predicate.as_deref(),
-            params.object.as_deref(),
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({
-        "facts": hits,
-        "count": hits.len(),
-    })))
-}
-
-async fn upsert_fact_handler(
-    State(state): State<Arc<SearchAppState>>,
-    Json(req): Json<UpsertFactRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let Some(store) = &state.facts else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    let mut fact = FactRecord::new(req.subject, req.predicate, req.object, req.index_id)
-        .with_confidence(req.confidence);
-    fact.provenance = req.provenance;
-    let id = fact.id;
-    store
-        .upsert(fact)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "id": id, "upserted": true })))
-}
-
-async fn delete_fact_handler(
-    State(state): State<Arc<SearchAppState>>,
-    Path(id): Path<u64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let Some(store) = &state.facts else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    let removed = store
-        .delete(id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "id": id, "removed": removed })))
 }
 
 async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<HealthResponse> {
@@ -604,17 +515,6 @@ async fn remove_file_handler(
     })))
 }
 
-/// Query params for `GET /indexes/:id/complexity_hotspots`.
-#[derive(Deserialize)]
-pub struct HotspotsParams {
-    #[serde(default = "default_hotspots_top_n")]
-    pub top_n: usize,
-}
-
-fn default_hotspots_top_n() -> usize {
-    20
-}
-
 /// Query params for `GET /indexes/:id/chunks` (issue #54).
 #[derive(Deserialize)]
 pub struct ChunksParams {
@@ -661,85 +561,6 @@ async fn get_index_chunks_handler(
         "offset": params.offset,
         "limit": limit,
         "chunks": chunks,
-    })))
-}
-
-async fn complexity_hotspots_handler(
-    State(state): State<Arc<SearchAppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<HotspotsParams>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let index_id = IndexId::new(id);
-    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
-    let indexer = handle.indexer.read().await;
-    let mut chunks = indexer.all_chunks().await;
-    chunks.sort_by(|a, b| b.complexity.cyclomatic.cmp(&a.complexity.cyclomatic));
-    chunks.truncate(params.top_n);
-    Ok(Json(serde_json::json!({
-        "index_id": index_id.0,
-        "top_n": params.top_n,
-        "hotspots": chunks,
-    })))
-}
-
-async fn smells_handler(
-    State(state): State<Arc<SearchAppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let index_id = IndexId::new(id);
-    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
-    let indexer = handle.indexer.read().await;
-    let chunks: Vec<_> = indexer
-        .all_chunks()
-        .await
-        .into_iter()
-        .filter(|c| !c.complexity.smells.is_empty())
-        .collect();
-    Ok(Json(serde_json::json!({
-        "index_id": index_id.0,
-        "count": chunks.len(),
-        "chunks": chunks,
-    })))
-}
-
-async fn quality_handler(
-    State(state): State<Arc<SearchAppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    use trusty_search_core::complexity::ComplexityGrade;
-    let index_id = IndexId::new(id);
-    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
-    let indexer = handle.indexer.read().await;
-    let chunks = indexer.all_chunks().await;
-    let chunk_count = chunks.len();
-    let (sum_cyclo, grade_a, smell_count) =
-        chunks.iter().fold((0u64, 0usize, 0usize), |(s, a, sm), c| {
-            let a_inc = if c.complexity.grade == ComplexityGrade::A {
-                1
-            } else {
-                0
-            };
-            (
-                s + c.complexity.cyclomatic as u64,
-                a + a_inc,
-                sm + c.complexity.smells.len(),
-            )
-        });
-    let avg_cyclomatic = if chunk_count == 0 {
-        0.0_f32
-    } else {
-        sum_cyclo as f32 / chunk_count as f32
-    };
-    let pct_grade_a = if chunk_count == 0 {
-        0.0_f32
-    } else {
-        grade_a as f32 / chunk_count as f32
-    };
-    Ok(Json(serde_json::json!({
-        "avg_cyclomatic": avg_cyclomatic,
-        "pct_grade_a": pct_grade_a,
-        "smell_count": smell_count,
-        "chunk_count": chunk_count,
     })))
 }
 
@@ -872,7 +693,7 @@ mod tests {
             ))),
             root_path: "/tmp/health-test".into(),
         });
-        let state = Arc::new(SearchAppState::new(registry, None));
+        let state = Arc::new(SearchAppState::new(registry));
         let Json(resp) = health_handler(State(state)).await;
         assert_eq!(resp.status, "ok");
         assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
@@ -913,7 +734,7 @@ mod tests {
             });
         }
 
-        let state = Arc::new(SearchAppState::new(registry, None));
+        let state = Arc::new(SearchAppState::new(registry));
         let Json(value) = global_search_handler(
             State(state),
             Json(GlobalSearchRequest {
@@ -967,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn global_search_empty_registry_returns_empty_results() {
         use trusty_search_core::registry::IndexRegistry;
-        let state = Arc::new(SearchAppState::new(IndexRegistry::new(), None));
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
         let Json(value) = global_search_handler(
             State(state),
             Json(GlobalSearchRequest {
