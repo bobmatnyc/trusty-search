@@ -18,7 +18,7 @@ use walkdir::WalkDir;
 /// tree-sitter grammars aren't compiled in.
 pub const SOURCE_EXTS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c", "cpp",
-    "h", "hpp", "cs", "rb", "swift", "kt", "kts", "scala", "groovy", "gradle",
+    "h", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "scala", "groovy", "gradle",
     "sh", "yaml", "yml", "toml", "json", "md",
 ];
 

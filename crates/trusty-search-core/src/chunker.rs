@@ -172,6 +172,8 @@ fn language_for(file: &str) -> Option<(&'static str, Language)> {
         "java" => ("java", tree_sitter_java::LANGUAGE),
         "c" | "h" => ("c", tree_sitter_c::LANGUAGE),
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => ("cpp", tree_sitter_cpp::LANGUAGE),
+        "rb" => ("ruby", tree_sitter_ruby::LANGUAGE),
+        "php" => ("php", tree_sitter_php::LANGUAGE_PHP),
         _ => return None,
     };
     Some((tag, lang_fn.into()))
@@ -233,6 +235,10 @@ fn collect_calls(node: Node<'_>, src: &[u8], lang: &str) -> Vec<String> {
                 | ("go", "function_declaration")
                 | ("java", "method_declaration")
                 | ("c" | "cpp", "function_definition")
+                | ("ruby", "method")
+                | ("ruby", "singleton_method")
+                | ("php", "function_definition")
+                | ("php", "method_declaration")
         );
 
         // Don't descend into nested function bodies (we treat them as their own chunks).
@@ -249,6 +255,11 @@ fn collect_calls(node: Node<'_>, src: &[u8], lang: &str) -> Vec<String> {
                 | ("go", "call_expression")
                 | ("java", "method_invocation")
                 | ("c" | "cpp", "call_expression")
+                | ("ruby", "call")
+                | ("php", "function_call_expression")
+                | ("php", "member_call_expression")
+                | ("php", "scoped_call_expression")
+                | ("php", "nullsafe_member_call_expression")
         );
 
         if is_call {
@@ -424,6 +435,18 @@ fn classify_node(lang: &str, node: Node<'_>) -> Option<ChunkType> {
         ("c" | "cpp", "function_definition") => ChunkType::Function,
         ("cpp", "class_specifier") => ChunkType::Class,
         ("c" | "cpp", "struct_specifier") => ChunkType::Class,
+
+        ("ruby", "method") => ChunkType::Function,
+        ("ruby", "singleton_method") => ChunkType::Method,
+        ("ruby", "module") => ChunkType::Module,
+        ("ruby", "class") => ChunkType::Class,
+
+        ("php", "function_definition") => ChunkType::Function,
+        ("php", "method_declaration") => ChunkType::Method,
+        ("php", "class_declaration") => ChunkType::Class,
+        ("php", "interface_declaration") => ChunkType::Trait,
+        ("php", "trait_declaration") => ChunkType::Trait,
+        ("php", "namespace_definition") => ChunkType::Module,
 
         _ => return None,
     })

@@ -58,6 +58,8 @@ pub struct CodeChunk {
     /// Collision-safe ID: "{path}:{start}:{end}"
     pub id: String,
     pub file: String,
+    #[serde(default)]
+    pub language: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
     pub content: String,
@@ -336,6 +338,7 @@ impl CodeIndexer {
             out.push(CodeChunk {
                 id: raw.id.clone(),
                 file: raw.file.clone(),
+                language: raw.language.clone(),
                 start_line: raw.start_line,
                 end_line: raw.end_line,
                 content: raw.content.clone(),
@@ -370,6 +373,7 @@ impl CodeIndexer {
                 CodeChunk {
                     id: raw.id.clone(),
                     file: raw.file.clone(),
+                    language: raw.language.clone(),
                     start_line: raw.start_line,
                     end_line: raw.end_line,
                     content: raw.content.clone(),
@@ -1149,6 +1153,7 @@ impl CodeIndexer {
             out.push(CodeChunk {
                 id: raw.id.clone(),
                 file: raw.file.clone(),
+                language: raw.language.clone(),
                 start_line: raw.start_line,
                 end_line: raw.end_line,
                 content: raw.content.clone(),

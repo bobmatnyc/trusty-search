@@ -151,6 +151,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/:id/remove-file", post(remove_file_handler))
         .route("/indexes/:id/reindex", post(reindex_handler))
         .route("/indexes/:id/reindex/stream", get(reindex_stream_handler))
+        .route("/indexes/:id/chunks", get(get_index_chunks_handler))
         .route("/indexes/:id/complexity_hotspots", get(complexity_hotspots_handler))
         .route("/indexes/:id/smells", get(smells_handler))
         .route("/indexes/:id/quality", get(quality_handler))
@@ -439,6 +440,30 @@ pub struct HotspotsParams {
 
 fn default_hotspots_top_n() -> usize {
     20
+}
+
+/// `GET /indexes/:id/chunks` — bulk export of every chunk in an index.
+///
+/// Why: trusty-analyzer (sidecar daemon) needs the full corpus to run static
+/// analysis without round-tripping through the search pipeline. This endpoint
+/// is the single source of truth for the chunk corpus.
+/// What: Returns `{ index_id, count, chunks: [...] }` containing every
+/// `CodeChunk` currently held by the indexer for the given index id.
+/// Test: register an index, index a file, call this endpoint, assert chunks
+/// non-empty and contain the indexed file's content.
+async fn get_index_chunks_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let indexer = handle.indexer.read().await;
+    let chunks = indexer.all_chunks().await;
+    Ok(Json(serde_json::json!({
+        "index_id": index_id.0,
+        "count": chunks.len(),
+        "chunks": chunks,
+    })))
 }
 
 async fn complexity_hotspots_handler(
