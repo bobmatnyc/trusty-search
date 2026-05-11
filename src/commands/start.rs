@@ -23,14 +23,20 @@ use colored::Colorize;
 /// accepted. Force a failure (e.g. delete the model cache while offline)
 /// and the daemon must exit non-zero, not start in BM25 mode.
 async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
-    let embedder = crate::core::FastEmbedder::new()
-        .await
-        .map_err(|e| {
-            tracing::error!("FastEmbedder init failed: {e:#}");
-            anyhow::anyhow!("FastEmbedder init failed: {e}")
-        })?;
+    let embedder = crate::core::FastEmbedder::new().await.map_err(|e| {
+        tracing::error!("FastEmbedder init failed: {e:#}");
+        anyhow::anyhow!("FastEmbedder init failed: {e}")
+    })?;
     let dim = <crate::core::FastEmbedder as crate::core::Embedder>::dimension(&embedder);
-    tracing::info!("embedder initialized: model=AllMiniLML6V2(Q) dim={dim}");
+    let provider = embedder.provider();
+    let metal_hint = match provider {
+        trusty_embedder::ExecutionProvider::CoreML => " (Metal GPU / ANE)",
+        trusty_embedder::ExecutionProvider::Cuda => " (CUDA GPU)",
+        trusty_embedder::ExecutionProvider::Cpu => "",
+    };
+    tracing::info!(
+        "embedder initialized: model=AllMiniLML6V2(Q) dim={dim} provider={provider}{metal_hint}"
+    );
     Ok(std::sync::Arc::new(embedder))
 }
 
@@ -72,29 +78,49 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // Fall through to `run_daemon` — its `acquire_lock` will either succeed
     // (lock now free) or return AlreadyRunning, handled below.
 
-    // Block daemon startup on embedder readiness. If the embedder fails to
-    // load, exit non-zero rather than silently degrading to BM25-only mode —
-    // a degraded daemon is worse than no daemon because callers can't tell
-    // their search results are missing the vector lane.
-    let embedder = match build_embedder().await {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!(
-                "{} embedder failed to initialize: {e}\n\
-                 Daemon refuses to start in BM25-only mode (vector search would be silently disabled).\n\
-                 Check the model cache at ~/Library/Caches/trusty-search/models/ and network access.",
-                "✗".red()
-            );
-            std::process::exit(1);
-        }
-    };
+    // Why (v0.3.12 fix — deferred embedder init): previously `build_embedder()`
+    // was awaited before the HTTP listener bound, so the daemon's port stayed
+    // closed for 15–30 s on first run while ONNX/CoreML loaded the model.
+    // That blew past the 10 s readiness budget in `daemon_guard.rs` and made
+    // `trusty-search index` think the daemon had failed to start. Now: we
+    // construct the `SearchAppState` immediately, kick off model loading on
+    // a background task, and let `run_daemon` bind the HTTP port right away.
+    // Handlers that need the embedder return `503 Service Unavailable` until
+    // `state.install_embedder()` flips the watch channel.
     let cfg = crate::service::load_user_config();
 
     let state = crate::service::SearchAppState::new(crate::core::registry::IndexRegistry::new())
         .with_local_model(cfg.local_model)
         .with_openrouter_model(cfg.openrouter_model)
-        .with_openrouter_api_key(cfg.openrouter_api_key)
-        .with_embedder(embedder);
+        .with_openrouter_api_key(cfg.openrouter_api_key);
+
+    // Spawn embedder load on a background task; the daemon's HTTP server
+    // starts serving requests in parallel. On success, `install_embedder`
+    // populates the slot and flips the readiness watch so the next inbound
+    // request transitions out of the "initializing" branch. On failure, we
+    // log loudly but leave the daemon running in BM25-only mode — operators
+    // can `/health`-check `embedder: "unavailable"` and intervene. We can't
+    // exit the process here without racing the HTTP server's shutdown path.
+    let install_state = state.clone();
+    tokio::spawn(async move {
+        match build_embedder().await {
+            Ok(embedder) => {
+                install_state.install_embedder(embedder).await;
+                tracing::info!("embedder ready — vector lane online");
+            }
+            Err(e) => {
+                tracing::error!(
+                    "embedder failed to initialize: {e:#} — daemon will continue in BM25-only mode"
+                );
+                eprintln!(
+                    "{} embedder failed to initialize: {e}\n\
+                     Daemon is up but running BM25-only. Check the model cache at \
+                     ~/Library/Caches/trusty-search/models/ and network access.",
+                    "✗".red()
+                );
+            }
+        }
+    });
     match crate::service::run_daemon(state, port).await {
         Ok(()) => {}
         Err(crate::service::DaemonError::AlreadyRunning(p)) => {

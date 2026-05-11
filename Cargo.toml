@@ -1,6 +1,6 @@
 [package]
 name = "trusty-search"
-version = "0.3.11"
+version = "0.3.13"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -142,5 +142,8 @@ test-support = []
 ner = ["dep:ort", "dep:tokenizers"]
 # GPU-accelerated embedding via fastembed-rs CUDA backend.
 cuda = ["trusty-embedder/cuda"]
-# Apple Silicon GPU/ANE acceleration via ONNX Runtime's CoreML provider.
+# Deprecated: CoreML / Metal GPU acceleration is now auto-detected at runtime
+# on Apple Silicon and requires no opt-in. The `coreml` feature is kept as a
+# no-op alias for backward compatibility so `cargo install --features coreml`
+# still works.
 coreml = ["trusty-embedder/coreml"]

@@ -588,33 +588,38 @@ The feature flag chain is:
 `trusty-search/cuda` → `trusty-search-core/cuda` → `trusty-embedder/cuda` →
 `fastembed/cuda`.
 
-### Apple Silicon GPU acceleration (CoreML, optional)
+### Apple Silicon GPU acceleration (CoreML, auto-detected)
 
-On M1/M2/M3/M4 Macs the same ONNX session (all-MiniLM-L6-v2) can run on the
-GPU / Neural Engine via ONNX Runtime's CoreML execution provider, opt in with
-the `coreml` Cargo feature:
+On M1/M2/M3/M4 Macs the same ONNX session (all-MiniLM-L6-v2) runs on the
+GPU / Neural Engine via ONNX Runtime's CoreML execution provider **with no
+opt-in required**. As of v0.3.13 the `coreml` Cargo feature is no longer
+needed — `trusty-embedder` always pulls in the `ort` dep with the `coreml`
+feature on macOS, and at runtime registers the CoreML EP whenever
+`cfg(all(target_arch = "aarch64", target_os = "macos"))` is true. The
+startup log reports which provider is active:
 
-```bash
-# Install with CoreML support (Apple Silicon — no CUDA toolkit needed)
-cargo install trusty-search --features coreml
-
-# Dev build with CoreML support
-cargo build --features coreml
+```
+embedder initialized: model=AllMiniLML6V2(Q) dim=384 provider=CoreML (Metal GPU / ANE)
 ```
 
-Requirements when compiling with `--features coreml`:
-- macOS (M1/M2/M3/M4 — CoreML EP is a no-op on Intel Macs and Linux/Windows)
-- Routes embeddings through Apple GPU/ANE instead of CPU ONNX
+```bash
+# Standard install — no feature flag needed
+cargo install trusty-search
+```
 
-The feature flag chain is:
-`trusty-search/coreml` → `trusty-search-core/coreml` →
-`trusty-embedder/coreml` → direct `ort` dep with `coreml` feature.
+The legacy `coreml` feature flag is kept as a no-op alias for backward
+compatibility, so `cargo install trusty-search --features coreml` still
+works but is equivalent to a plain install.
 
-`trusty-embedder` injects `ort::ep::CoreML::default().build()` into
-fastembed's `TextInitOptions::with_execution_providers` (fastembed does
-not expose a `coreml` passthrough feature, but it does accept an external
-`Vec<ExecutionProviderDispatch>`). The `ort` dep is pinned to
-`=2.0.0-rc.12` to match fastembed-rs's exact-version requirement.
+Implementation notes:
+- `trusty-embedder` injects `ort::ep::CoreML::default().build()` into
+  fastembed's `TextInitOptions::with_execution_providers` (fastembed does
+  not expose a `coreml` passthrough feature, but it does accept an external
+  `Vec<ExecutionProviderDispatch>`).
+- The `ort` dep is pinned to `=2.0.0-rc.12` to match fastembed-rs's
+  exact-version requirement.
+- On Intel Macs / Linux / Windows the runtime cfg gate is false and the
+  default CPU provider is used.
 
 ## Project Status
 

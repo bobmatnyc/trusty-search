@@ -33,13 +33,13 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use std::time::Duration;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::{broadcast, OnceCell};
+use tokio::sync::{broadcast, watch, OnceCell, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use trusty_common::{ChatProvider, LocalModelConfig};
 
@@ -100,6 +100,39 @@ pub struct SearchAppState {
     /// in BM25-only mode — useful for tests that don't want to download the
     /// model. The vector dimensionality is read from the embedder.
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// Mutable embedder slot used by the deferred-init flow: the daemon binds
+    /// its HTTP port immediately, then a background task loads the fastembed
+    /// model and writes it here before flipping `embedder_ready` to `true`.
+    ///
+    /// Why: ONNX/CoreML model loading takes 15–30 s on first run, but the
+    /// outer `Option<Arc<dyn Embedder>>` is captured by reference in many
+    /// places. A separate `Arc<RwLock<…>>` lets the init task replace the
+    /// value once without rewriting handler signatures.
+    /// Test: start daemon; `/health` returns `embedder: "initializing"` for a
+    /// few seconds, then flips to `"ready"`.
+    pub embedder_slot: Arc<RwLock<Option<Arc<dyn Embedder>>>>,
+    /// Watch channel signalling embedder readiness. Handlers that need the
+    /// embedder (search, create_index in hybrid mode, index-file) check
+    /// `*embedder_ready.borrow()` and return `503 Service Unavailable` until
+    /// the value flips to `true`.
+    ///
+    /// Why: lets `trusty-search index` and `trusty-search start` connect to
+    /// the daemon within ~1 s instead of waiting 15–30 s for the embedder to
+    /// finish loading. Callers can poll `/health` (cheap) or just hit the
+    /// real endpoint and retry on 503.
+    /// Test: start daemon; `POST /indexes` immediately returns 503 with
+    /// `{"error":"embedder initializing"}`; after a few seconds the same call
+    /// succeeds.
+    pub embedder_ready: watch::Receiver<bool>,
+    /// Sender half of the readiness watch, held by the AppState so the
+    /// background embedder-init task can flip readiness from `false` to
+    /// `true` once `FastEmbedder::new()` completes.
+    ///
+    /// Why: kept inside the state (rather than handed off as a free variable)
+    /// so test code constructing a fresh `SearchAppState` doesn't have to
+    /// thread a sender through every helper. The Arc lets `start.rs` clone
+    /// it into the background task.
+    pub embedder_ready_tx: Arc<watch::Sender<bool>>,
     /// Port the daemon ended up listening on. Injected into the served
     /// `index.html` as `window.__DAEMON_PORT__` so the SPA knows which host
     /// to call when opened directly. `None` falls back to 7878 in the UI.
@@ -144,10 +177,18 @@ impl SearchAppState {
     pub fn new(registry: IndexRegistry) -> Self {
         let openrouter_api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
         let (events_tx, _) = broadcast::channel::<DaemonEvent>(128);
+        // Default-constructed state has no embedder and the readiness watch
+        // stays at `false`. Tests exercising BM25-only paths use this default.
+        // Production daemon boot overrides via `with_embedder_ready_channel`
+        // so the background init task can flip readiness once the model loads.
+        let (ready_tx, ready_rx) = watch::channel(false);
         Self {
             registry,
             reindex_progress: Arc::new(DashMap::new()),
             embedder: None,
+            embedder_slot: Arc::new(RwLock::new(None)),
+            embedder_ready: ready_rx,
+            embedder_ready_tx: Arc::new(ready_tx),
             daemon_port: None,
             openrouter_enabled: !openrouter_api_key.is_empty(),
             started_at: Instant::now(),
@@ -237,8 +278,49 @@ impl SearchAppState {
     /// run the full hybrid pipeline. The embedder is shared across every
     /// index registered after this point.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
-        self.embedder = Some(embedder);
+        self.embedder = Some(Arc::clone(&embedder));
+        // Tests that wire a pre-built embedder expect the daemon to behave as
+        // if init has already completed. Mirror that to the slot + watch so
+        // handlers using the deferred-init path see a ready embedder too.
+        if let Ok(mut slot) = self.embedder_slot.try_write() {
+            *slot = Some(embedder);
+        }
+        let _ = self.embedder_ready_tx.send(true);
         self
+    }
+
+    /// Install the embedder produced by the background init task and flip the
+    /// readiness watch to `true`.
+    ///
+    /// Why: the daemon starts serving HTTP before the embedder is loaded so
+    /// readiness probes from `trusty-search start` / `trusty-search index`
+    /// don't time out waiting for ONNX model load (15–30 s on first run).
+    /// The init task calls this when `FastEmbedder::new()` completes; any
+    /// in-flight handler observes the readiness flip via the watch channel.
+    /// What: writes the embedder into `embedder_slot` and broadcasts `true`
+    /// on `embedder_ready_tx` so all `*embedder_ready.borrow()` callers
+    /// transition out of the "initializing" branch.
+    /// Test: spawn a task that calls this after 1 s; assert `embedder_ready`
+    /// flips and subsequent `POST /indexes` calls succeed.
+    pub async fn install_embedder(&self, embedder: Arc<dyn Embedder>) {
+        let mut slot = self.embedder_slot.write().await;
+        *slot = Some(embedder);
+        drop(slot);
+        let _ = self.embedder_ready_tx.send(true);
+    }
+
+    /// Snapshot the currently-installed embedder (post-init) or `None` when
+    /// the daemon is still warming up. Handlers prefer this over
+    /// `self.embedder` so the deferred-init flow works transparently.
+    pub async fn current_embedder(&self) -> Option<Arc<dyn Embedder>> {
+        let slot = self.embedder_slot.read().await;
+        slot.clone()
+    }
+
+    /// Cheap, non-blocking readiness check. Returns `true` once the
+    /// background embedder-init task has flipped the watch channel.
+    pub fn is_embedder_ready(&self) -> bool {
+        *self.embedder_ready.borrow()
     }
 }
 
@@ -378,10 +460,22 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
         version: env!("CARGO_PKG_VERSION"),
         indexes: state.registry.list().len(),
         uptime_secs: state.started_at.elapsed().as_secs(),
-        embedder: if state.embedder.is_some() {
+        embedder: if state.is_embedder_ready() {
+            "ready"
+        } else if state.embedder.is_some()
+            || state
+                .embedder_slot
+                .try_read()
+                .map(|g| g.is_some())
+                .unwrap_or(false)
+        {
+            // Slot populated but readiness flag not yet flipped — treat as ready.
             "ready"
         } else {
-            "unavailable"
+            // Daemon is up but embedder still loading. Callers should retry
+            // mutating endpoints; `/health` itself always returns 200 so
+            // `trusty-search start`'s readiness probe succeeds quickly.
+            "initializing"
         },
     })
 }
@@ -457,22 +551,34 @@ async fn list_indexes_handler(State(state): State<Arc<SearchAppState>>) -> Json<
 async fn create_index_handler(
     State(state): State<Arc<SearchAppState>>,
     Json(req): Json<CreateIndexRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Response {
     let id = IndexId::new(req.id.clone());
     if state.registry.get(&id).is_some() {
-        return Ok(Json(serde_json::json!({
+        return Json(serde_json::json!({
             "id": req.id,
             "created": false,
             "reason": "already exists",
-        })));
+        }))
+        .into_response();
     }
+    // Why (issue: 10s readiness timeout): the embedder may still be loading
+    // when the daemon accepts its first request. Reject hybrid-index creation
+    // with `503 Service Unavailable` so the caller (`trusty-search index`)
+    // retries instead of producing a BM25-only index that will quietly miss
+    // the vector lane forever.
+    let embedder = state.current_embedder().await;
+    if embedder.is_none() {
+        return embedder_initializing_response();
+    }
+    let embedder = embedder.unwrap();
     // Bug A fix: when an embedder is attached to the shared state, wire the
     // newly created indexer with both an `Embedder` and a `VectorStore` so
     // the HNSW lane actually contributes results. Previously every index
     // was BM25-only because `with_components` was never called, which is
     // why the benchmark observed `match_reason: "bm25"` for 100% of hits.
     let mut indexer = CodeIndexer::new(req.id.clone(), req.root_path.clone());
-    if let Some(embedder) = &state.embedder {
+    {
+        let embedder = &embedder;
         let dim = embedder.dimension();
         match UsearchStore::new(dim) {
             Ok(store) => {
@@ -496,10 +602,28 @@ async fn create_index_handler(
     state.registry.register(handle);
     // Push event so connected dashboards refresh their index list without a
     // page reload (mirrors the trusty-memory `palace_created` pattern).
-    state.emit(DaemonEvent::IndexRegistered {
-        id: req.id.clone(),
-    });
-    Ok(Json(serde_json::json!({ "id": req.id, "created": true })))
+    state.emit(DaemonEvent::IndexRegistered { id: req.id.clone() });
+    Json(serde_json::json!({ "id": req.id, "created": true })).into_response()
+}
+
+/// Build a `503 Service Unavailable` response for handlers that require the
+/// embedder before the background init task has finished.
+///
+/// Why: callers (CLI, MCP, integrators) need to distinguish "transient — try
+/// again in a few seconds" from real failures. A standard 503 with a typed
+/// JSON body lets `trusty-search index` retry, while exposing a clear
+/// `embedder initializing` reason for human operators reading logs.
+/// What: returns `(503, {"error": "embedder initializing, retry in a few seconds"})`.
+/// Test: hit `POST /indexes` immediately after daemon boot; assert 503 and
+/// JSON body shape.
+fn embedder_initializing_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "embedder initializing, retry in a few seconds"
+        })),
+    )
+        .into_response()
 }
 
 /// `DELETE /indexes/:id` — drop an index from the registry.
@@ -940,11 +1064,9 @@ async fn reindex_stream_handler(
     } else {
         let live = BroadcastStream::new(rx).map(|res| match res {
             Ok(line) => frame(line),
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                Ok(axum::body::Bytes::from(format!(
-                    "data: {{\"type\":\"lag\",\"skipped\":{n}}}\n\n"
-                )))
-            }
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => Ok(
+                axum::body::Bytes::from(format!("data: {{\"type\":\"lag\",\"skipped\":{n}}}\n\n")),
+            ),
         });
         Body::from_stream(replay_stream.chain(live))
     };
@@ -993,8 +1115,12 @@ mod tests {
         assert_eq!(resp.indexes, 1);
         // uptime_secs is u64 — always >= 0 by type; just exercise the path.
         let _ = resp.uptime_secs;
-        // No embedder attached in this test → "unavailable".
-        assert_eq!(resp.embedder, "unavailable");
+        // No embedder attached in this test. With the deferred-init flow,
+        // a fresh `SearchAppState::new()` reports "initializing" (the
+        // background task hasn't installed an embedder yet) rather than
+        // "unavailable". "unavailable" is reserved for the post-failure
+        // case where the init task explicitly errored.
+        assert_eq!(resp.embedder, "initializing");
     }
 
     /// Issue #10 — `POST /search` fan-out: with two registered indexes each
