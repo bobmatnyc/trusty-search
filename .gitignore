@@ -10,6 +10,9 @@ trusty-search.pid
 .fastembed_cache/
 **/.fastembed_cache/
 
+# UI build artifacts (source; ui-dist/ is the embedded copy tracked in git)
+ui/dist/
+
 # Local tooling
 .claude-mpm/
 .claude/settings.local.json

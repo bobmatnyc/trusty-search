@@ -38,11 +38,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout trusty-common (for [patch.crates-io] path deps)
-        uses: actions/checkout@v4
-        with:
-          repository: bobmatnyc/trusty-common
-          path: ../trusty-common
+      - name: Remove local [patch.crates-io] overrides (CI uses published crates)
+        run: |
+          python3 - <<'EOF'
+          import re
+          content = open("Cargo.toml").read()
+          content = re.sub(
+              r"\[patch\.crates-io\].*?(?=\n\[|\Z)",
+              "",
+              content,
+              flags=re.DOTALL,
+          )
+          open("Cargo.toml", "w").write(content)
+          EOF
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
@@ -52,11 +60,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout trusty-common (for [patch.crates-io] path deps)
-        uses: actions/checkout@v4
-        with:
-          repository: bobmatnyc/trusty-common
-          path: ../trusty-common
+      - name: Remove local [patch.crates-io] overrides (CI uses published crates)
+        run: |
+          python3 - <<'EOF'
+          import re
+          content = open("Cargo.toml").read()
+          content = re.sub(
+              r"\[patch\.crates-io\].*?(?=\n\[|\Z)",
+              "",
+              content,
+              flags=re.DOTALL,
+          )
+          open("Cargo.toml", "w").write(content)
+          EOF
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install --path . --locked
