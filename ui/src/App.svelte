@@ -1,69 +1,95 @@
 <script>
+  /*
+   * Why: Shell layout that mirrors trusty-memory — fixed dark sidebar on
+   * the left, sticky topbar with breadcrumbs + version badge, and a
+   * hash-routed content pane that renders one of three views.
+   * What: Bootstraps the centralized state (health + indexes), then
+   * dispatches the route to Dashboard / Search / Indexes.
+   * Test: Open /ui in a browser, verify the three nav items render and the
+   * version badge turns green once /health responds.
+   */
+  import Sidebar from './lib/components/Sidebar.svelte';
+  import Topbar from './lib/components/Topbar.svelte';
+  import Dashboard from './lib/views/Dashboard.svelte';
+  import Search from './lib/views/Search.svelte';
+  import Indexes from './lib/views/Indexes.svelte';
+  import Config from './lib/views/Config.svelte';
+  import { getRoute } from './lib/router.svelte.js';
+  import { refreshHealth, refreshIndexes } from './lib/state.svelte.js';
   import { onMount } from 'svelte';
-  import TopBar from './components/TopBar.svelte';
-  import Sidebar from './components/Sidebar.svelte';
-  import Collections from './components/Collections.svelte';
-  import Search from './components/Search.svelte';
-  import Chat from './components/Chat.svelte';
-  import Admin from './components/Admin.svelte';
-  import { health, indexes } from './lib/stores.svelte.js';
 
-  // Why: Single-page navigation without a router — admin UIs are tiny and a
-  // hash-based route avoids pulling in svelte-spa-router.
-  // What: `view` is one of collections | search | chat | admin.
-  // Test: Click sidebar nav items → main panel swaps without reload.
-  let view = $state('collections');
-
-  function setHashFromView(v) {
-    if (typeof window !== 'undefined') {
-      window.location.hash = v;
-    }
-  }
-  function viewFromHash() {
-    if (typeof window === 'undefined') return 'collections';
-    const h = (window.location.hash || '').replace(/^#/, '');
-    if (['collections', 'search', 'chat', 'admin'].includes(h)) return h;
-    return 'collections';
-  }
-
-  function navigate(v) {
-    view = v;
-    setHashFromView(v);
-  }
+  let bootError = $state(null);
 
   onMount(() => {
-    view = viewFromHash();
-    health.refresh();
-    indexes.refresh();
-    // Poll daemon health every 10s — cheap and keeps the badge live.
-    const t = setInterval(() => health.refresh(), 10_000);
-    const onHash = () => { view = viewFromHash(); };
-    window.addEventListener('hashchange', onHash);
-    return () => {
-      clearInterval(t);
-      window.removeEventListener('hashchange', onHash);
-    };
+    refreshHealth().catch((e) => {
+      bootError = e.message || String(e);
+    });
+    refreshIndexes().catch(() => {});
+    // Poll /health every 10s so the version badge stays live.
+    const t = setInterval(() => {
+      refreshHealth().catch(() => {});
+    }, 10_000);
+    return () => clearInterval(t);
   });
 
-  let openrouterEnabled = $derived(
-    typeof window !== 'undefined' && window.__OPENROUTER_ENABLED__ === true
-  );
+  let route = $derived(getRoute());
+
+  let view = $derived.by(() => {
+    const segs = route.segments;
+    if (segs.length === 0) return { kind: 'dashboard' };
+    if (segs[0] === 'search') return { kind: 'search' };
+    if (segs[0] === 'indexes' || segs[0] === 'index') return { kind: 'indexes' };
+    if (segs[0] === 'config') return { kind: 'config' };
+    return { kind: 'dashboard' };
+  });
 </script>
 
-<div class="app-shell">
-  <TopBar />
-  <Sidebar {view} {openrouterEnabled} onnavigate={navigate} />
-  <main class="main">
-    {#if view === 'collections'}
-      <Collections />
-    {:else if view === 'search'}
-      <Search />
-    {:else if view === 'chat' && openrouterEnabled}
-      <Chat />
-    {:else if view === 'admin'}
-      <Admin />
-    {:else}
-      <Collections />
-    {/if}
-  </main>
+<div class="layout">
+  <Sidebar />
+  <div class="main">
+    <Topbar />
+    <div class="content">
+      {#if bootError}
+        <div class="card" style="border-color: var(--trusty-danger)">
+          <div class="card-header" style="color: var(--trusty-danger)">
+            Connection error
+          </div>
+          <div class="card-body">
+            <p>{bootError}</p>
+            <p class="text-muted text-sm">
+              Make sure trusty-search is running with
+              <code>trusty-search serve</code>.
+            </p>
+          </div>
+        </div>
+      {:else if view.kind === 'dashboard'}
+        <Dashboard />
+      {:else if view.kind === 'search'}
+        <Search />
+      {:else if view.kind === 'indexes'}
+        <Indexes />
+      {:else if view.kind === 'config'}
+        <Config />
+      {/if}
+    </div>
+  </div>
 </div>
+
+<style>
+  .layout {
+    display: flex;
+    min-height: 100vh;
+  }
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    margin-left: var(--trusty-sidebar-width);
+    min-width: 0;
+  }
+  .content {
+    padding: var(--trusty-space-5) var(--trusty-space-6);
+    flex: 1;
+    min-width: 0;
+  }
+</style>

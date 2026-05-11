@@ -66,6 +66,7 @@ repos:
             __pycache__/.*|
             .*\.lock|
             .*package-lock\.json|
+            .*pnpm-lock\.yaml|
             .*\.pyc
           )$
 

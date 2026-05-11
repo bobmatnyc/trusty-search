@@ -8,7 +8,8 @@ repository = "https://github.com/bobmatnyc/trusty-search"
 homepage = "https://github.com/bobmatnyc/trusty-search"
 keywords = ["search", "code-search", "axum", "daemon", "mcp"]
 categories = ["development-tools", "web-programming::http-server"]
-include = ["src/**/*", "ui-dist/**/*", "Cargo.toml", "README.md"]
+build = "build.rs"
+include = ["src/**/*", "build.rs", "ui-dist/**/*", "Cargo.toml", "README.md"]
 
 [dependencies]
 trusty-search-core = { version = "0.1.7", path = "../trusty-search-core" }

@@ -1,95 +1,70 @@
-// Why: Centralize fetch wrappers so components never hardcode URLs.
-// What: Resolves the daemon base URL from window.__DAEMON_PORT__ (injected by
-// the Rust server) and exposes typed-ish helpers for every endpoint we use.
-// Test: in dev, vite proxy forwards /indexes etc. to 127.0.0.1:7878; in
-// production the same-origin URL hits the embedded server directly.
-
-function baseUrl() {
-  // When served by the daemon, all requests are same-origin.
-  // When running `vite dev`, vite.config.js proxies /indexes → daemon.
-  // Both cases: empty string base works.
-  return '';
-}
+/*
+ * Why: All UI components hit the same daemon REST surface; centralizing fetch
+ * logic gives us one place to handle errors, base URL, and JSON parsing.
+ * The daemon serves the bundle at /ui and the API at flat paths
+ * (/health, /indexes, /search, ...) so requests are always same-origin in
+ * production. In `vite dev`, vite.config.js proxies the API paths through to
+ * 127.0.0.1:7878.
+ * What: Thin wrappers returning parsed JSON or throwing on non-2xx.
+ * Test: Console-call api.health() and confirm shape matches /health.
+ */
 
 async function request(path, opts = {}) {
-  const url = baseUrl() + path;
-  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
-  const resp = await fetch(url, { ...opts, headers });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`${opts.method || 'GET'} ${path} → ${resp.status}: ${text}`);
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    ...opts
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = await res.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`${res.status} ${res.statusText}: ${detail}`);
   }
-  // Accept empty bodies (e.g. some POSTs).
-  const ct = resp.headers.get('content-type') || '';
-  if (ct.includes('application/json')) return resp.json();
-  return resp.text();
+  if (res.status === 204) return null;
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  return res.text();
 }
 
 export const api = {
   health: () => request('/health'),
 
   listIndexes: () => request('/indexes'),
-
   createIndex: (id, root_path) =>
     request('/indexes', {
       method: 'POST',
-      body: JSON.stringify({ id, root_path }),
+      body: JSON.stringify({ id, root_path })
     }),
-
   deleteIndex: (id) =>
     request(`/indexes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-
   indexStatus: (id) => request(`/indexes/${encodeURIComponent(id)}/status`),
 
+  /** Per-index hybrid search. */
   search: (id, text, top_k = 10) =>
     request(`/indexes/${encodeURIComponent(id)}/search`, {
       method: 'POST',
-      body: JSON.stringify({ text, top_k }),
+      body: JSON.stringify({ text, top_k })
     }),
 
-  indexFile: (id, path, content = '') =>
-    request(`/indexes/${encodeURIComponent(id)}/index-file`, {
+  /** Cross-collection fan-out search across every registered index. */
+  globalSearch: (query, top_k = 10, full_content = false) =>
+    request('/search', {
       method: 'POST',
-      body: JSON.stringify({ path, content }),
-    }),
-
-  removeFile: (id, path) =>
-    request(`/indexes/${encodeURIComponent(id)}/remove-file`, {
-      method: 'POST',
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ query, top_k, full_content })
     }),
 
   reindex: (id, root_path) =>
     request(`/indexes/${encodeURIComponent(id)}/reindex`, {
       method: 'POST',
-      body: JSON.stringify(root_path ? { root_path } : {}),
+      body: JSON.stringify(root_path ? { root_path } : {})
     }),
 
-  chat: (index_id, message, history) =>
+  chat: (index_id, message, history = []) =>
     request('/chat', {
       method: 'POST',
-      body: JSON.stringify({ index_id, message, history }),
-    }),
-};
-
-// Why: Cross-collection search runs N parallel /search calls and merges the
-// returned ranked lists by score (descending).
-// What: Returns a flat list with `{ ...result, _index_id }` so the UI can
-// label each row with its source index.
-// Test: with two indexes, results from both appear sorted by score.
-export async function searchAcross(indexIds, text, top_k = 10) {
-  const all = await Promise.all(
-    indexIds.map(async (id) => {
-      try {
-        const body = await api.search(id, text, top_k);
-        return (body.results || []).map((r) => ({ ...r, _index_id: id }));
-      } catch (e) {
-        console.error('search failed for', id, e);
-        return [];
-      }
+      body: JSON.stringify({ index_id, message, history })
     })
-  );
-  const merged = all.flat();
-  merged.sort((a, b) => (b.score || 0) - (a.score || 0));
-  return merged.slice(0, top_k);
-}
+};
