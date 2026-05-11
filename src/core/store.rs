@@ -10,6 +10,24 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 /// Initial reserved capacity for a new HNSW index. Grows geometrically on demand.
 const INITIAL_CAPACITY: usize = 1_024;
 
+/// Default hard cap on the HNSW index size. The usearch `IndexOptions` API
+/// (v2.25) does not expose a `max_elements` field directly, so we enforce the
+/// cap in `ensure_capacity` / `upsert_batch`: once the index would grow past
+/// this many vectors, subsequent inserts return an error so the daemon can
+/// bound RAM (~6 GB at 1M × 384-dim × 4 bytes plus graph overhead).
+const DEFAULT_HNSW_MAX_ELEMENTS: usize = 1_000_000;
+
+/// Read the HNSW max-elements cap from the environment, with a sane default.
+/// Shared with `TRUSTY_MAX_CHUNKS` so a single knob bounds both the chunk
+/// corpus and the vector store.
+fn hnsw_max_elements() -> usize {
+    std::env::var("TRUSTY_MAX_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_HNSW_MAX_ELEMENTS)
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorHit {
     pub chunk_id: String,
@@ -108,7 +126,11 @@ impl UsearchStore {
             multi: false,
         };
         let index = Index::new(&options).map_err(|e| anyhow!("usearch Index::new failed: {e}"))?;
-        let initial = expected_chunks.max(INITIAL_CAPACITY);
+        // Clamp initial reserve to the env-configured max so a runaway
+        // `expected_chunks` doesn't pre-allocate hundreds of GB.
+        let initial = expected_chunks
+            .max(INITIAL_CAPACITY)
+            .min(hnsw_max_elements());
         index
             .reserve(initial)
             .map_err(|e| anyhow!("usearch reserve failed: {e}"))?;
@@ -128,12 +150,24 @@ impl UsearchStore {
     }
 
     /// Ensure the underlying HNSW has room for at least one more vector.
-    /// Grows geometrically (×2) to amortize the cost of reserve calls.
+    /// Grows geometrically (×2) to amortize the cost of reserve calls. Refuses
+    /// to grow past `hnsw_max_elements()` so the daemon's RAM is bounded
+    /// (issue #75).
     fn ensure_capacity(index: &Index) -> Result<()> {
         let size = index.size();
         let cap = index.capacity();
+        let max_elem = hnsw_max_elements();
+        if size >= max_elem {
+            return Err(anyhow!(
+                "usearch index at TRUSTY_MAX_CHUNKS cap ({} elements) — refusing further upserts",
+                max_elem
+            ));
+        }
         if size + 1 > cap {
-            let new_cap = (cap.max(1)).saturating_mul(2);
+            let mut new_cap = (cap.max(1)).saturating_mul(2);
+            if new_cap > max_elem {
+                new_cap = max_elem;
+            }
             index
                 .reserve(new_cap)
                 .map_err(|e| anyhow!("usearch reserve grow failed: {e}"))?;
@@ -282,10 +316,20 @@ impl VectorStore for UsearchStore {
         // Reserve once for the worst case (every item is new) so we don't
         // re-enter the reserve path inside the hot loop.
         let want = index.size() + items.len();
+        let max_elem = hnsw_max_elements();
+        if index.size() >= max_elem {
+            return Err(anyhow!(
+                "usearch index at TRUSTY_MAX_CHUNKS cap ({} elements) — refusing batch upsert",
+                max_elem
+            ));
+        }
         if want > index.capacity() {
             let mut new_cap = index.capacity().max(1);
             while new_cap < want {
                 new_cap = new_cap.saturating_mul(2);
+            }
+            if new_cap > max_elem {
+                new_cap = max_elem;
             }
             index
                 .reserve(new_cap)

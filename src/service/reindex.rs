@@ -75,6 +75,60 @@ fn hashes_for(id: &IndexId) -> Arc<DashMap<PathBuf, String>> {
         .clone()
 }
 
+/// Per-index ceiling on the content-hash cache (issue #75). Each entry holds
+/// a `PathBuf` + 64-char hex SHA-256 string, so 200k entries ≈ ~30–60 MB.
+/// When exceeded we drain ~10% of the entries (DashMap has no ordering, so
+/// the eviction set is arbitrary — those files are simply re-hashed on the
+/// next reindex, which is the safe, correct fallback).
+const MAX_FILE_HASHES_PER_INDEX: usize = 200_000;
+
+/// Drop ~10% of entries from `map` when above `MAX_FILE_HASHES_PER_INDEX`.
+///
+/// Why: prevents an unbounded growth in the per-daemon content-hash cache
+/// when a project gets ever-larger or files are renamed many times. The
+/// hash cache is a pure speed optimisation (skip re-embed for unchanged
+/// files), so evicting entries is always safe — affected files just get
+/// re-hashed and re-embedded on the next reindex.
+/// What: collects an arbitrary subset of keys and removes them. DashMap has
+/// no insertion-order metadata so we can't do "true" LRU; arbitrary eviction
+/// is acceptable for a cache whose miss penalty is just extra work.
+/// Test: covered indirectly by the reindex test (oversizing not exercised).
+fn shrink_hashes_if_needed(map: &DashMap<PathBuf, String>) {
+    let len = map.len();
+    if len <= MAX_FILE_HASHES_PER_INDEX {
+        return;
+    }
+    let target = MAX_FILE_HASHES_PER_INDEX * 9 / 10;
+    let to_remove = len.saturating_sub(target);
+    let keys: Vec<PathBuf> = map
+        .iter()
+        .take(to_remove)
+        .map(|e| e.key().clone())
+        .collect();
+    for k in keys {
+        map.remove(&k);
+    }
+    tracing::info!(
+        "file-hash cache exceeded {} entries — dropped {} to bound memory",
+        MAX_FILE_HASHES_PER_INDEX,
+        to_remove
+    );
+}
+
+/// Max replay events buffered on a `ReindexProgress`. A full reindex emits
+/// ~100 events for a 14k-file repo (one per batch + start/complete), but
+/// pathological cases (per-file errors) could otherwise grow the vector
+/// without bound. Late SSE subscribers still see the most recent 500 events,
+/// which is more than enough to replay context.
+const MAX_REPLAY_EVENTS: usize = 500;
+
+/// How long to keep a completed (`Complete` / `Failed`) `ReindexProgress`
+/// on `SearchAppState::reindex_progress` before garbage-collecting it.
+/// 60 s is enough for late SSE subscribers to attach and read the final
+/// state but short enough that long-running daemons don't accumulate
+/// thousands of stale progress entries.
+const REINDEX_PROGRESS_TTL_SECS: u64 = 60;
+
 /// Stable content fingerprint for the "skip unchanged file" optimization.
 ///
 /// Why: SHA-256 is collision-resistant and stable across processes, builds,
@@ -138,9 +192,18 @@ impl ReindexProgress {
     }
 
     /// Push an event onto the replay buffer and broadcast it to live subscribers.
+    /// Caps the replay buffer at `MAX_REPLAY_EVENTS` to bound memory under
+    /// pathological reindexes (e.g. one error event per file).
     pub async fn push(&self, event: serde_json::Value) {
         let line = event.to_string();
-        self.events.lock().await.push(line.clone());
+        {
+            let mut buf = self.events.lock().await;
+            if buf.len() >= MAX_REPLAY_EVENTS {
+                // Drop the oldest event. `remove(0)` is O(n) but n ≤ 500.
+                buf.remove(0);
+            }
+            buf.push(line.clone());
+        }
         // Broadcast errors (no receivers) are fine — replay buffer still has it.
         let _ = self.sender.send(line);
     }
@@ -156,8 +219,24 @@ impl Default for ReindexProgress {
 /// source file, and emits progress events into `progress`.
 ///
 /// Returns immediately; the caller (the HTTP handler) drops its reference and
-/// the task runs to completion.
+/// the task runs to completion. When `cleanup_map` is `Some`, the entry for
+/// `handle.id` is removed from the map `REINDEX_PROGRESS_TTL_SECS` after
+/// completion (issue #75: bounds long-running daemon memory by GC'ing stale
+/// progress entries while still letting late SSE subscribers read the final
+/// state for a short window).
 pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, force: bool) {
+    spawn_reindex_with_cleanup(handle, progress, force, None);
+}
+
+/// Variant of `spawn_reindex` that GC's the progress map after completion.
+/// See `spawn_reindex` for the rationale.
+pub fn spawn_reindex_with_cleanup(
+    handle: Arc<IndexHandle>,
+    progress: Arc<ReindexProgress>,
+    force: bool,
+    cleanup_map: Option<Arc<DashMap<IndexId, Arc<ReindexProgress>>>>,
+) {
+    let cleanup_id = handle.id.clone();
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
 
@@ -316,6 +395,10 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, f
                     for (path, h) in new_hashes {
                         hashes.insert(path, h);
                     }
+                    // Issue #75: cap per-index hash-cache size. This is a
+                    // pure speed cache (skip-unchanged) so arbitrary
+                    // eviction is always safe.
+                    shrink_hashes_if_needed(&hashes);
                     progress
                         .push(serde_json::json!({
                             "event": "batch",
@@ -380,6 +463,17 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, f
                 "chunks_per_sec": chunks_per_sec,
             }))
             .await;
+
+        // Issue #75: GC the progress entry after a short delay so the
+        // `reindex_progress` map doesn't grow unboundedly on long-running
+        // daemons. The delay lets late SSE subscribers read the final
+        // `complete`/`error` event before the map drops its reference.
+        if let Some(map) = cleanup_map {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(REINDEX_PROGRESS_TTL_SECS)).await;
+                map.remove(&cleanup_id);
+            });
+        }
     });
 }
 

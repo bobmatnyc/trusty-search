@@ -45,7 +45,7 @@ use tokio::sync::OnceCell;
 use tokio_stream::wrappers::BroadcastStream;
 use trusty_common::{ChatProvider, LocalModelConfig};
 
-use crate::service::reindex::{spawn_reindex, ReindexProgress, ReindexStatus};
+use crate::service::reindex::{spawn_reindex_with_cleanup, ReindexProgress, ReindexStatus};
 
 /// Shared state injected into every axum handler.
 #[derive(Clone)]
@@ -680,7 +680,12 @@ async fn reindex_handler(
         .reindex_progress
         .insert(index_id.clone(), Arc::clone(&progress));
 
-    spawn_reindex(handle, progress, force);
+    spawn_reindex_with_cleanup(
+        handle,
+        progress,
+        force,
+        Some(Arc::clone(&state.reindex_progress)),
+    );
 
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,

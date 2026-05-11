@@ -432,6 +432,23 @@ Serves the embedded Svelte admin UI. Not part of the integration contract.
   `AllMiniLML6V2Q`, batch upsert into HNSW, split lock via
   `parse_and_embed_files` / `commit_parsed_batch`, batch size 512)
 
+## Memory Tuning (Environment Variables)
+
+The daemon caps several in-memory structures to keep RAM bounded on
+long-running deployments (issue #75). Defaults are conservative; override
+via env when needed.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRUSTY_MAX_CHUNKS` | `500000` | Hard cap on chunks per index. Also clamps HNSW reserve growth, so a single index never holds more than this many vectors. New chunks past the cap are dropped with a warning. |
+| `TRUSTY_EMBEDDING_CACHE` | `10000` | LRU capacity for the in-memory chunk-embedding cache (≈15 MB at 384-dim f32). Evicted entries are gracefully re-embedded or fall back to relevance-only MMR. |
+
+Additional internal caps (not env-tunable):
+
+- Per-index file-hash cache: ~200 000 entries (excess shrunk by ~10% on overflow).
+- Reindex SSE replay buffer: 500 events (oldest dropped on overflow).
+- Reindex progress entries on `SearchAppState`: GC'd 60 s after completion.
+
 ## CLI
 
 ```bash

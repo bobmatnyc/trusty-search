@@ -38,6 +38,37 @@ use crate::core::symbol_graph::{ChunkTuple, SymbolGraph};
 const QUERY_CACHE_CAPACITY: usize = 256;
 /// Oversample factor for the HNSW lane before RRF fusion.
 const HNSW_OVERSAMPLE: usize = 4;
+/// Default LRU capacity for the per-indexer chunk embedding cache.
+///
+/// Each entry is `dim × 4` bytes (384-dim f32 ≈ 1 536 B). 10 000 entries ≈
+/// ~15 MB of RAM per index. Evicted entries are simply re-embedded on demand
+/// (MMR rerank gracefully falls back when an embedding is missing). Override
+/// at runtime via `TRUSTY_EMBEDDING_CACHE`.
+const DEFAULT_EMBEDDING_CACHE_CAP: usize = 10_000;
+
+/// Read the embedding-cache LRU cap from the environment, with a sane default.
+fn embedding_cache_cap() -> usize {
+    std::env::var("TRUSTY_EMBEDDING_CACHE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_EMBEDDING_CACHE_CAP)
+}
+
+/// Default hard cap on chunks per index. Also used as the HNSW
+/// `max_elements`-style sanity guard. 500 000 chunks × ~5 KB metadata ≈ 2.5 GB
+/// of RAM-resident chunk corpus on a single index, which is roughly the limit
+/// we want a single daemon to attempt. Override via `TRUSTY_MAX_CHUNKS`.
+const DEFAULT_MAX_CHUNKS_PER_INDEX: usize = 500_000;
+
+/// Read the per-index chunk cap from the environment, with a sane default.
+fn max_chunks_per_index() -> usize {
+    std::env::var("TRUSTY_MAX_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_MAX_CHUNKS_PER_INDEX)
+}
 /// Batch size for the fastembed ONNX call when bulk-indexing files.
 ///
 /// 128 chunks per batch balances SIMD/tensor-setup amortisation against ONNX
@@ -248,7 +279,12 @@ pub struct CodeIndexer {
     /// embedder is wired (`add_chunk` writes here). Used by the MMR diversity
     /// pass (#28) which needs vectors for already-ranked chunks without paying
     /// a re-embed or HNSW round-trip per candidate.
-    chunk_embeddings: Arc<RwLock<HashMap<String, Vec<f32>>>>,
+    ///
+    /// Bounded by `embedding_cache_cap()` to keep the daemon from holding the
+    /// entire corpus's embeddings in RAM (issue #75). Evicted entries are
+    /// gracefully re-embedded on demand (MMR falls back to relevance-only when
+    /// an entry is missing). Use `LruCache::put` / `peek` / `pop`.
+    chunk_embeddings: Arc<RwLock<LruCache<String, Vec<f32>>>>,
 
     /// Persistent BM25 index kept hot alongside the HNSW index. Mutated by
     /// `add_chunk` / `index_files_batch` / `remove_*` so the search hot path
@@ -278,6 +314,8 @@ impl CodeIndexer {
     pub fn new(index_id: impl Into<String>, root_path: impl Into<std::path::PathBuf>) -> Self {
         let cap =
             NonZeroUsize::new(QUERY_CACHE_CAPACITY).expect("QUERY_CACHE_CAPACITY must be non-zero");
+        let emb_cap = NonZeroUsize::new(embedding_cache_cap())
+            .expect("embedding_cache_cap must be non-zero (env var filtered)");
         Self {
             index_id: index_id.into(),
             root_path: root_path.into(),
@@ -285,7 +323,7 @@ impl CodeIndexer {
             store: None,
             chunks: Arc::new(RwLock::new(HashMap::new())),
             entities: Arc::new(RwLock::new(HashMap::new())),
-            chunk_embeddings: Arc::new(RwLock::new(HashMap::new())),
+            chunk_embeddings: Arc::new(RwLock::new(LruCache::new(emb_cap))),
             bm25: Arc::new(RwLock::new(Bm25Index::new())),
             query_cache: Arc::new(Mutex::new(LruCache::new(cap))),
             symbol_graph: Arc::new(RwLock::new(Arc::new(SymbolGraph::new()))),
@@ -343,10 +381,13 @@ impl CodeIndexer {
     /// lookup. Returns `None` when the chunk doesn't exist or was indexed in
     /// BM25-only mode (no embedder wired).
     pub fn get_embedding(&self, chunk_id: &str) -> Option<Vec<f32>> {
+        // `peek` doesn't promote the entry — we read through an `&RwLockReadGuard`
+        // (immutable), and we don't want background reads to disturb LRU order
+        // (only the write paths in `add_chunk` / batch commit promote on insert).
         self.chunk_embeddings
             .try_read()
             .ok()
-            .and_then(|g| g.get(chunk_id).cloned())
+            .and_then(|g| g.peek(chunk_id).cloned())
     }
 
     /// Find a chunk whose `file` ends with `file_suffix` and (optionally) whose
@@ -479,6 +520,23 @@ impl CodeIndexer {
     pub async fn add_chunk(&self, chunk: RawChunk) -> Result<()> {
         let id = chunk.id.clone();
 
+        // Issue #75: hard cap per-index chunk count to bound RAM growth.
+        // Upserts (existing id) are always allowed; only brand-new ids hit
+        // the cap. Failing fast here keeps HNSW / BM25 / corpus in sync.
+        {
+            let chunks = self.chunks.read().await;
+            let cap = max_chunks_per_index();
+            if !chunks.contains_key(&id) && chunks.len() >= cap {
+                tracing::warn!(
+                    "index '{}' chunk cap ({}) reached — skipping chunk {}",
+                    self.index_id,
+                    cap,
+                    id
+                );
+                return Ok(());
+            }
+        }
+
         if let (Some(embedder), Some(store)) = (&self.embedder, &self.store) {
             let vec = embedder
                 .embed(&chunk.content)
@@ -490,7 +548,8 @@ impl CodeIndexer {
                 .context("upsert chunk vector")?;
             // Cache for MMR diversity (#28). Cheap O(1) write under the corpus
             // mutation path so the search hot loop never has to re-embed.
-            self.chunk_embeddings.write().await.insert(id.clone(), vec);
+            // LRU `put` evicts the oldest entry when at capacity.
+            self.chunk_embeddings.write().await.put(id.clone(), vec);
         }
 
         // Maintain the persistent BM25 index. Doing this on every write keeps
@@ -853,7 +912,10 @@ impl CodeIndexer {
         let mut emb_cache = self.chunk_embeddings.write().await;
         for (chunk, vec_opt) in chunks.iter().zip(embeddings.into_iter()) {
             if let Some(vec) = vec_opt {
-                emb_cache.insert(chunk.id.clone(), vec);
+                // LRU `put` evicts the oldest entry when over capacity. Cache
+                // eviction here is harmless: MMR rerank treats a missing entry
+                // as zero diversity contribution.
+                emb_cache.put(chunk.id.clone(), vec);
             }
         }
     }
@@ -863,12 +925,28 @@ impl CodeIndexer {
     /// Why: single-lock insertion shrinks the write-lock window to
     /// milliseconds even for large batches.
     /// What: consumes `chunks` via `drain` so callers don't keep a stale
-    /// copy after the corpus owns each one.
+    /// copy after the corpus owns each one. Honours `max_chunks_per_index()`
+    /// (issue #75): once the cap is reached new chunk ids are dropped (warned)
+    /// while existing ids continue to be upserted.
     /// Test: covered indirectly by every search test.
     async fn commit_corpus(&self, chunks: &mut Vec<RawChunk>) {
+        let cap = max_chunks_per_index();
         let mut corpus = self.chunks.write().await;
+        let mut dropped = 0usize;
         for chunk in chunks.drain(..) {
+            if !corpus.contains_key(&chunk.id) && corpus.len() >= cap {
+                dropped += 1;
+                continue;
+            }
             corpus.insert(chunk.id.clone(), chunk);
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                "index '{}' chunk cap ({}) reached — dropped {} new chunks in batch",
+                self.index_id,
+                cap,
+                dropped
+            );
         }
     }
 
@@ -977,7 +1055,7 @@ impl CodeIndexer {
         {
             let mut emb = self.chunk_embeddings.write().await;
             for id in ids {
-                emb.remove(id);
+                emb.pop(id);
             }
         }
         {
@@ -994,7 +1072,7 @@ impl CodeIndexer {
             store.remove(chunk_id).await.ok();
         }
         self.chunks.write().await.remove(chunk_id);
-        self.chunk_embeddings.write().await.remove(chunk_id);
+        self.chunk_embeddings.write().await.pop(chunk_id);
         self.bm25.write().await.remove_document(chunk_id);
         self.rebuild_symbol_graph().await;
         Ok(())
@@ -1232,17 +1310,26 @@ impl CodeIndexer {
         fused_raw: Vec<(String, f32)>,
         top_k: usize,
     ) -> Vec<(String, f32)> {
+        // Snapshot only the candidate embeddings out of the LRU into a
+        // transient `HashMap` for MMR. `peek` avoids promoting entries on
+        // read (we only want the embed pipeline / batch commit to reorder
+        // the LRU). Missing entries are handled gracefully by MMR — it
+        // simply contributes zero diversity for that candidate.
         let emb_map = self.chunk_embeddings.read().await;
         if emb_map.is_empty() {
-            fused_raw
-        } else {
-            crate::core::mmr::mmr_rerank(
-                fused_raw,
-                &emb_map,
-                crate::core::mmr::DEFAULT_LAMBDA,
-                top_k,
-            )
+            return fused_raw;
         }
+        let snapshot: HashMap<String, Vec<f32>> = fused_raw
+            .iter()
+            .filter_map(|(id, _)| emb_map.peek(id).map(|v| (id.clone(), v.clone())))
+            .collect();
+        drop(emb_map);
+        crate::core::mmr::mmr_rerank(
+            fused_raw,
+            &snapshot,
+            crate::core::mmr::DEFAULT_LAMBDA,
+            top_k,
+        )
     }
 
     /// KG expand the fused list when `use_kg_first` is on and the caller
