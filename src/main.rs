@@ -635,7 +635,7 @@ fn fmt_secs(secs: u64) -> String {
 /// Layout:
 ///   ⟳ Indexing <index>
 ///     [████████░░░░] 7,234/14,445 files (50%) — ETA 50s
-///     Chunks: 58,402  Skipped: 12  Speed: 142 files/s  Elapsed: 50s  ETA: ~50s
+///     Files: 7,234/14,445  Chunks: 58,402  Skipped: 12  Speed: 142 files/s  Elapsed: 50s  ETA: 50s
 struct ReindexUi {
     /// Held to keep the MultiProgress draw target alive for the bars' lifetime.
     #[allow(dead_code)]
@@ -686,13 +686,22 @@ impl ReindexUi {
     }
 
     fn update_stats(&self, indexed: u64, total_chunks: u64, skipped: u64, elapsed_secs: u64) {
+        let total = self.files.length().unwrap_or(0);
         let files_per_sec = indexed.checked_div(elapsed_secs).unwrap_or(0);
+        let eta = if files_per_sec > 0 && total > indexed {
+            fmt_secs((total - indexed) / files_per_sec)
+        } else {
+            "?".to_string()
+        };
         self.stats.set_message(format!(
-            "Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}",
+            "Files: {indexed}/{total}  Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}  ETA: {eta}",
+            indexed = format_with_commas(indexed),
+            total = format_with_commas(total),
             chunks = format_with_commas(total_chunks),
             skipped = format_with_commas(skipped),
             fps = files_per_sec,
             elapsed = fmt_secs(elapsed_secs),
+            eta = eta,
         ));
     }
 
@@ -883,7 +892,9 @@ async fn run_reindex_with(
                     "?".to_string()
                 };
                 stats_bar.set_message(format!(
-                    "Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}s  ETA: ~{eta}",
+                    "Files: {indexed}/{total}  Chunks: {chunks}  Skipped: {skipped}  Speed: {fps} files/s  Elapsed: {elapsed}s  ETA: {eta}",
+                    indexed = format_with_commas(indexed),
+                    total = format_with_commas(total),
                     chunks = format_with_commas(chunks),
                     skipped = format_with_commas(skipped),
                     fps = fps,
