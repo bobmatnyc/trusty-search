@@ -559,6 +559,34 @@ The feature flag chain is:
 `trusty-search/cuda` → `trusty-search-core/cuda` → `trusty-embedder/cuda` →
 `fastembed/cuda`.
 
+### Apple Silicon GPU acceleration (CoreML, optional)
+
+On M1/M2/M3/M4 Macs the same ONNX session (all-MiniLM-L6-v2) can run on the
+GPU / Neural Engine via ONNX Runtime's CoreML execution provider, opt in with
+the `coreml` Cargo feature:
+
+```bash
+# Install with CoreML support (Apple Silicon — no CUDA toolkit needed)
+cargo install trusty-search --features coreml
+
+# Dev build with CoreML support
+cargo build --features coreml
+```
+
+Requirements when compiling with `--features coreml`:
+- macOS (M1/M2/M3/M4 — CoreML EP is a no-op on Intel Macs and Linux/Windows)
+- Routes embeddings through Apple GPU/ANE instead of CPU ONNX
+
+The feature flag chain is:
+`trusty-search/coreml` → `trusty-search-core/coreml` →
+`trusty-embedder/coreml` → direct `ort` dep with `coreml` feature.
+
+`trusty-embedder` injects `ort::ep::CoreML::default().build()` into
+fastembed's `TextInitOptions::with_execution_providers` (fastembed does
+not expose a `coreml` passthrough feature, but it does accept an external
+`Vec<ExecutionProviderDispatch>`). The `ort` dep is pinned to
+`=2.0.0-rc.12` to match fastembed-rs's exact-version requirement.
+
 ## Project Status
 
 **Phase**: Production-ready. Full hybrid search pipeline, web UI, MCP server, and

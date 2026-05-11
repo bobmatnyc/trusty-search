@@ -253,16 +253,22 @@ pub async fn chat_handler(
     messages.push(CommonChatMessage {
         role: "system".into(),
         content: system,
+        tool_call_id: None,
+        tool_calls: None,
     });
     for m in &req.history {
         messages.push(CommonChatMessage {
             role: m.role.clone(),
             content: m.content.clone(),
+            tool_call_id: None,
+            tool_calls: None,
         });
     }
     messages.push(CommonChatMessage {
         role: "user".into(),
         content: req.message.clone(),
+        tool_call_id: None,
+        tool_calls: None,
     });
 
     // 3. Forward to OpenRouter via the shared helper. Keeps every trusty-*

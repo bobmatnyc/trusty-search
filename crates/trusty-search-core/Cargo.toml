@@ -1,6 +1,6 @@
 [package]
 name = "trusty-search-core"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Core library for trusty-search: BM25, HNSW vector search, tree-sitter chunking, KG expansion, query classification"
 license = "MIT"
@@ -89,3 +89,8 @@ ner = ["dep:ort", "dep:tokenizers"]
 # `trusty-embedder/cuda`. Default builds stay CPU-only; opt in with
 # `--features cuda` (requires CUDA toolkit + compatible NVIDIA GPU).
 cuda = ["trusty-embedder/cuda"]
+# Apple Silicon GPU/ANE acceleration. Forwarded to `trusty-embedder/coreml`,
+# which injects ONNX Runtime's CoreML execution provider into the fastembed
+# session so embeddings run on M-series GPU instead of CPU. macOS only; opt
+# in with `--features coreml`.
+coreml = ["trusty-embedder/coreml"]

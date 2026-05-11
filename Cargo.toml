@@ -31,8 +31,8 @@ include_dir = "0.7"
 open = "5"
 libc = "0.2"
 trusty-mcp-core = { version = "0.1.0" }
-trusty-embedder = { version = "0.1.1" }
-trusty-common = { version = "0.2.0" }
+trusty-embedder = { version = "0.1.2" }
+trusty-common = { version = "0.3.0" }
 trusty-contracts = { version = "0.1.0" }
 
 # Local development override: use the in-tree `../trusty-common` workspace so
@@ -55,7 +55,7 @@ trusty-contracts = { path = "../trusty-common/crates/trusty-contracts" }
 
 [package]
 name = "trusty-search"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -69,9 +69,9 @@ name = "trusty-search"
 path = "src/main.rs"
 
 [dependencies]
-trusty-search-core = { version = "0.2.2", path = "crates/trusty-search-core" }
-trusty-search-service = { version = "0.2.2", path = "crates/trusty-search-service" }
-trusty-search-mcp = { version = "0.2.2", path = "crates/trusty-search-mcp" }
+trusty-search-core = { version = "0.2.3", path = "crates/trusty-search-core" }
+trusty-search-service = { version = "0.2.3", path = "crates/trusty-search-service" }
+trusty-search-mcp = { version = "0.2.3", path = "crates/trusty-search-mcp" }
 trusty-common = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -105,3 +105,7 @@ default = []
 # Requires CUDA toolkit + compatible NVIDIA GPU. Install with:
 #   cargo install trusty-search --features cuda
 cuda = ["trusty-search-core/cuda"]
+# Apple Silicon GPU/Neural Engine acceleration via ONNX Runtime's CoreML
+# execution provider. macOS only (M1/M2/M3/M4). Install with:
+#   cargo install trusty-search --features coreml
+coreml = ["trusty-search-core/coreml"]
