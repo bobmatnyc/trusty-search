@@ -315,15 +315,15 @@ fn read_lockfile_pid(lock_path: &Path) -> Option<u32> {
 /// non-Unix targets we conservatively assume the PID is alive.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    // SAFETY: `kill` is async-signal-safe and signal 0 performs no action,
-    // only error checking. We accept i32 narrowing — PIDs always fit on
-    // platforms we support.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+    // Use nix's safe wrapper over kill(pid, 0); signal None performs no
+    // action, only error checking. We accept i32 narrowing — PIDs always
+    // fit on platforms we support.
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        // EPERM means the process exists but we cannot signal it.
+        Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
     }
-    // errno == EPERM means the process exists but we cannot signal it.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]

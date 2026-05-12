@@ -68,7 +68,7 @@ impl RepoConfig {
     /// Why: callers (the `index` CLI handler) need to cleanly distinguish
     /// "no config, fall back to single-index" from "config present but
     /// malformed, fail loudly".
-    /// What: stat → read → `serde_yaml::from_str`. Surfaces parse errors via
+    /// What: stat → read → `serde_yml::from_str`. Surfaces parse errors via
     /// `anyhow::Error` with file path context.
     /// Test: `test_load_valid_yaml`, `test_load_missing_yaml_returns_none`,
     /// `test_load_malformed_yaml_errors`.
@@ -79,7 +79,7 @@ impl RepoConfig {
         }
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-        let cfg: Self = serde_yaml::from_str(&raw)
+        let cfg: Self = serde_yml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
         Ok(Some(cfg))
     }

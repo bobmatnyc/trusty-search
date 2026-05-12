@@ -222,20 +222,21 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
             "⚠".yellow(),
             orphans.len()
         );
+        #[cfg(unix)]
         for pid in &orphans {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(*pid as libc::pid_t, libc::SIGTERM);
-            }
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
         }
         // Give them 3 s to exit cleanly, then SIGKILL stragglers.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             #[cfg(unix)]
-            let any_alive = orphans
-                .iter()
-                .any(|p| unsafe { libc::kill(*p as libc::pid_t, 0) } == 0);
+            let any_alive = orphans.iter().any(|p| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(*p as i32), None).is_ok()
+            });
             #[cfg(not(unix))]
             let any_alive = false;
             if !any_alive || std::time::Instant::now() >= deadline {
@@ -244,11 +245,12 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
         }
         #[cfg(unix)]
         for pid in &orphans {
-            if unsafe { libc::kill(*pid as libc::pid_t, 0) } == 0 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid as i32), None).is_ok() {
                 tracing::warn!("orphan pid {pid} ignored SIGTERM — sending SIGKILL");
-                unsafe {
-                    libc::kill(*pid as libc::pid_t, libc::SIGKILL);
-                }
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(*pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
             }
         }
         // Clear stale lock/port files left behind by the killed orphans.

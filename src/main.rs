@@ -272,7 +272,7 @@ enum Commands {
     #[command(display_order = 20)]
     Start {
         /// Port to listen on (default: 7878, auto-selects next if busy)
-        #[arg(long, default_value = "7878")]
+        #[arg(long, default_value_t = trusty_search::service::DEFAULT_PORT)]
         port: u16,
 
         /// Run in the foreground instead of forking a background daemon.
@@ -519,7 +519,7 @@ fn daemon_base_url() -> String {
     let port = daemon_port_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(7878);
+        .unwrap_or(trusty_search::service::DEFAULT_PORT);
     format!("http://127.0.0.1:{port}")
 }
 
@@ -1885,12 +1885,12 @@ async fn port_reachable(host: &str, port: u16) -> bool {
     .is_some()
 }
 
-/// Read the daemon port from the port file (or return 7878).
+/// Read the daemon port from the port file (or return the default port).
 fn read_daemon_port() -> u16 {
     daemon_port_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(7878)
+        .unwrap_or(trusty_search::service::DEFAULT_PORT)
 }
 
 /// Outcome of a single doctor check.
@@ -2047,8 +2047,8 @@ fn check_lock_file(data_dir: &std::path::Path, daemon_running: bool) -> CheckRes
             lock_path.display()
         ));
     };
-    // POSIX: kill(pid, 0) — check existence without sending a signal.
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    // POSIX: kill(pid, None) — check existence without sending a signal.
+    let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
     if !alive {
         return CheckResult::Warn(format!(
             "Stale lock file: PID {} is not running ({})",
@@ -2216,7 +2216,9 @@ fn fix_stale_lock(data_dir: &std::path::Path) {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         let stale = pid_opt
-            .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) } != 0)
+            .map(|pid| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err()
+            })
             .unwrap_or(true);
         if stale {
             match std::fs::remove_file(&lock_path) {
@@ -2461,7 +2463,7 @@ fn service_install() -> Result<()> {
     // Bootstrap into the GUI domain of the current user. `bootout` first
     // (ignoring errors) so a re-install replaces a previously-loaded agent
     // cleanly.
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     let domain = format!("gui/{uid}");
     let _ = std::process::Command::new("launchctl")
         .args(["bootout", &domain])
@@ -2492,7 +2494,7 @@ fn service_install() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn service_uninstall() -> Result<()> {
     let plist_path = launchd_plist_path()?;
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     let domain = format!("gui/{uid}");
     if plist_path.exists() {
         let _ = std::process::Command::new("launchctl")
@@ -2518,7 +2520,7 @@ fn service_uninstall() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_status() -> Result<()> {
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
     let output = std::process::Command::new("launchctl")
         .args(["print", &target])

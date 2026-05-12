@@ -1,3 +1,5 @@
+// TODO(#105): implement SCIP binary decode — see https://github.com/bobmatnyc/trusty-search/issues/105
+#![allow(dead_code)]
 //! SCIP protobuf ingest for LSP-quality entity data.
 //!
 //! Why: tree-sitter extraction is fast and dependency-free, but it cannot
@@ -88,11 +90,9 @@ impl ScipIndex {
         let _bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("failed to read SCIP file {}: {e}", path.display()))?;
 
-        // TODO: decode `_bytes` with the `scip` crate (or prost-generated
+        // TODO(#105): decode `_bytes` with the `scip` crate (or prost-generated
         // types) and populate `entities` / `edges`. See module docs.
-        anyhow::bail!(
-            "SCIP protobuf decoding is not yet implemented; use ScipIndex::from_refs for now"
-        )
+        todo!("SCIP binary decode not yet implemented (#105)")
     }
 
     /// Build a `ScipIndex` from a pre-resolved list of references and edges.

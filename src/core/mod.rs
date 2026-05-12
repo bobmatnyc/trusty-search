@@ -1,6 +1,7 @@
 pub mod bm25;
 pub mod chunker;
 pub mod classifier;
+#[cfg(feature = "clustering")]
 pub mod concept_cluster;
 pub mod embed;
 pub mod entity;

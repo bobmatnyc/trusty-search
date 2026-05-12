@@ -178,11 +178,12 @@ fn send_signal(_pid: u32, _sig: &str) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        // EPERM means the process exists but we cannot signal it.
+        Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]

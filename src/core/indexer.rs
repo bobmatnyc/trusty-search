@@ -928,6 +928,7 @@ impl CodeIndexer {
         &self,
         file_path: &str,
         content: &str,
+        #[cfg_attr(not(feature = "clustering"), allow(unused_variables))]
         chunk_contents: &[String],
         base_entities: Vec<RawEntity>,
     ) -> Vec<RawEntity> {
@@ -948,6 +949,9 @@ impl CodeIndexer {
 
         // Phase C: ConceptCluster entities (issue #22). Only runs when an
         // embedder is wired and the file has enough doc comments to cluster.
+        // Feature-gated behind `clustering` (issue #108) to keep linfa/ndarray
+        // out of default builds.
+        #[cfg(feature = "clustering")]
         if let Some(embedder) = &self.embedder {
             let refs: Vec<&str> = chunk_contents.iter().map(|s| s.as_str()).collect();
             let cluster_entities = crate::core::concept_cluster::cluster_concepts_from_contents(

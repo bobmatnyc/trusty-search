@@ -67,7 +67,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
-serde_yaml = "0.9"
+serde_yml = "0.0"
 glob = "0.3"
 
 # ── CLI / UX ───────────────────────────────────────────────────────────────
@@ -84,10 +84,15 @@ redb = "2.6"
 dashmap = "5"
 petgraph = "0.6"
 lru = "0.12"
-linfa = "0.7"
-linfa-clustering = "0.7"
-ndarray = "0.15"
-ndarray-rand = "0.14"
+# Clustering deps are only compiled when the `clustering` feature is enabled.
+# Why: linfa + ndarray pull in a deep BLAS/numerical stack that significantly
+# slows cold compile time even though only `core::concept_cluster` consumes
+# them. Off by default; turn on with `--features clustering` to enable
+# ConceptCluster entities derived from doc-comment k-means clustering.
+linfa = { version = "0.7", optional = true }
+linfa-clustering = { version = "0.7", optional = true }
+ndarray = { version = "0.15", optional = true }
+ndarray-rand = { version = "0.14", optional = true }
 rand = "0.8"
 rayon = "1"
 sha2 = "0.10"
@@ -130,7 +135,7 @@ ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+nix = { version = "0.29", features = ["signal", "user"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -152,3 +157,9 @@ cuda = ["trusty-embedder/cuda"]
 # no-op alias for backward compatibility so `cargo install --features coreml`
 # still works.
 coreml = ["trusty-embedder/coreml"]
+# ConceptCluster entities via k-means over doc-comment embeddings (issue #108).
+# Off by default — pulls in linfa, linfa-clustering, ndarray, and
+# ndarray-rand, which materially extend cold compile time. Enable with
+# `cargo build --features clustering` when ConceptCluster entities are
+# desired in the KG / BM25 enrichment passes.
+clustering = ["dep:linfa", "dep:linfa-clustering", "dep:ndarray", "dep:ndarray-rand"]

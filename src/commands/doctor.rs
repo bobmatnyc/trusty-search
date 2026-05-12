@@ -61,7 +61,9 @@ async fn apply_fixes(checks: &[CheckResult], empty_indexes: &[EmptyIndex]) {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         let stale = pid_opt
-            .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) } != 0)
+            .map(|pid| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err()
+            })
             .unwrap_or(true);
         if stale {
             println!("\nFixing issues...");
