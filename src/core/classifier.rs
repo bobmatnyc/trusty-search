@@ -161,6 +161,41 @@ impl QueryClassifier {
 
         QueryIntent::Unknown
     }
+
+    /// Classify with per-repo domain vocabulary.
+    ///
+    /// Why: repos define jargon (e.g. "PMS", "rate strategy", "RoomType") that
+    /// the generic regex chain can't recognise. When `classify` returns
+    /// `Unknown` and the query mentions a domain term, we nudge the result to
+    /// `Definition` (the safe default — pulls the entity's defining chunk in
+    /// via BM25 weight and lets the user iterate). All other intents survive
+    /// untouched so explicit signals (`fn`, `callers of`, `TODO`) keep their
+    /// routing.
+    /// What: runs `classify`, then upgrades `Unknown` to `Definition` if any
+    /// non-empty `domain_terms` entry appears case-insensitively as a substring
+    /// of the query.
+    /// Test: `test_domain_term_upgrades_unknown_to_definition`,
+    /// `test_domain_term_does_not_override_explicit_intent`.
+    pub fn classify_with_domain(query: &str, domain_terms: &[String]) -> QueryIntent {
+        let base = Self::classify(query);
+        if base != QueryIntent::Unknown {
+            return base;
+        }
+        if domain_terms.is_empty() {
+            return base;
+        }
+        let q = query.to_lowercase();
+        for term in domain_terms {
+            let t = term.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if q.contains(&t.to_lowercase()) {
+                return QueryIntent::Definition;
+            }
+        }
+        base
+    }
 }
 
 #[cfg(test)]
@@ -415,6 +450,69 @@ mod tests {
             QueryClassifier::classify("the payment_processor retries failed attempts five times");
         // Contains `_` → long-NL rule is suppressed; no other keyword match → Unknown
         assert_eq!(result, QueryIntent::Unknown);
+    }
+
+    // ── Domain-term routing tests (trusty-search.yaml config) ──────────────
+
+    #[test]
+    fn test_domain_term_upgrades_unknown_to_definition() {
+        // Bare "PMS integration" — no generic pattern matches → Unknown.
+        // With domain_terms containing "PMS", we upgrade to Definition.
+        let terms = vec!["PMS".to_string()];
+        assert_eq!(
+            QueryClassifier::classify("PMS integration"),
+            QueryIntent::Unknown
+        );
+        assert_eq!(
+            QueryClassifier::classify_with_domain("PMS integration", &terms),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_domain_term_case_insensitive() {
+        let terms = vec!["RateStrategy".to_string()];
+        // Conceptual keyword "what is" wins regardless of domain match.
+        assert_eq!(
+            QueryClassifier::classify_with_domain("what is the ratestrategy applies", &terms),
+            QueryIntent::Conceptual
+        );
+        // No conceptual keyword → falls through Unknown → upgraded.
+        // Lowercase usage of a PascalCase domain term still matches.
+        assert_eq!(
+            QueryClassifier::classify_with_domain("ratestrategy fields", &terms),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_domain_term_does_not_override_explicit_intent() {
+        let terms = vec!["PMS".to_string()];
+        // Explicit "callers of" → Usage; domain term must not overwrite.
+        assert_eq!(
+            QueryClassifier::classify_with_domain("callers of PMS handler", &terms),
+            QueryIntent::Usage
+        );
+        // Explicit `fn` → Definition (already correct).
+        assert_eq!(
+            QueryClassifier::classify_with_domain("fn handle_pms", &terms),
+            QueryIntent::Definition
+        );
+        // Explicit TODO → BugDebt.
+        assert_eq!(
+            QueryClassifier::classify_with_domain("TODO refactor PMS adapter", &terms),
+            QueryIntent::BugDebt
+        );
+    }
+
+    #[test]
+    fn test_domain_term_empty_list_passthrough() {
+        // With no domain terms, behaviour matches plain `classify`.
+        let terms: Vec<String> = vec![];
+        assert_eq!(
+            QueryClassifier::classify_with_domain("PMS integration", &terms),
+            QueryIntent::Unknown
+        );
     }
 
     #[test]

@@ -487,6 +487,8 @@ Additional internal caps (not env-tunable):
 trusty-search start                                  # start HTTP daemon (background)
 trusty-search stop                                   # stop daemon (SIGTERM via PID lockfile)
 trusty-search index [path] [--name <id>] [--force]  # register + index (primary command)
+                                                     # auto-detects ./trusty-search.yaml for multi-index repos
+                                                     # (see docs/examples/trusty-search.yaml)
 trusty-search query <text> [--index <id>] [--top-k N] [--json]
 trusty-search status                                 # daemon + index overview (alias: health)
 trusty-search doctor [--fix]                         # 6-check diagnostic + auto-repair

@@ -1,0 +1,58 @@
+# Repo-level trusty-search configuration.
+#
+# Place this file at the root of a repository as `trusty-search.yaml`.
+# When `trusty-search index` runs in a repo containing this file, it will
+# register and reindex every declared index slice in one pass — the CLI's
+# `--name` flag is ignored.
+#
+# Schema:
+#   version       (int, default 1)  — config format version
+#   indexes       (list)            — one entry per named index slice
+#     name         (string)         — index id (used in MCP / HTTP API)
+#     paths        (list, optional) — subtrees relative to repo root.
+#                                     Default = whole repo (`["."]`).
+#     exclude      (list, optional) — glob patterns to skip on top of the
+#                                     built-in SKIP_DIRS list.
+#     languages    (list, optional) — restrict to these language identifiers
+#                                     (rust, python, typescript, javascript,
+#                                      go, java, c, cpp). Default = all.
+#     domain_terms (list, optional) — per-repo vocabulary nudged into the
+#                                     intent classifier. Queries that mention
+#                                     these terms are routed toward
+#                                     Definition intent when no other pattern
+#                                     matches, so domain jargon like "PMS" or
+#                                     "rate strategy" finds the declaring
+#                                     chunk instead of falling back to a
+#                                     generic vector search.
+
+version: 1
+
+indexes:
+  - name: duetto-api
+    paths:
+      - api/src/
+      - services/
+    exclude:
+      - selenium/
+      - "**/__tests__/**"
+      - "**/fixtures/**"
+    languages:
+      - java
+      - python
+    domain_terms:
+      - "revenue management"
+      - "rate strategy"
+      - "PMS"
+      - "hotel pricing"
+
+  - name: duetto-ui
+    paths:
+      - ui/src/
+      - analytics-ui/src/
+    languages:
+      - typescript
+      - javascript
+    domain_terms:
+      - "dashboard"
+      - "rate display"
+      - "booking"
