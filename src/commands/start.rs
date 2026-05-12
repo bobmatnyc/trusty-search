@@ -49,6 +49,16 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
 /// Test: run twice in a row — the second invocation must exit 1 with the
 /// "another daemon is already running" message.
 pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
+    // Persist any memory-limit env vars set in the current shell so that
+    // launchd restarts (which run without the user's shell environment) pick
+    // them up via `daemon.env`. This runs before the fast-path check so the
+    // file is always refreshed when `start` is explicitly invoked.
+    crate::service::save_daemon_env();
+
+    // Source daemon.env into the current environment (env var > file > default).
+    // This is primarily for the first `start` after upgrading, when the file
+    // may already exist from a previous run.
+    crate::service::load_daemon_env();
     // `foreground` is currently a no-op: `run_daemon` already runs inline
     // and never forks. The flag is accepted so launchd/systemd plists can
     // declare the supervised contract explicitly in ProgramArguments

@@ -65,6 +65,112 @@ pub fn daemon_port_path() -> Result<PathBuf, DaemonError> {
     Ok(daemon_dir()?.join("daemon.port"))
 }
 
+/// Path to `daemon.env` — persisted memory-limit env vars written by
+/// `trusty-search start` so launchd restarts inherit them.
+///
+/// Why: launchd re-spawns the daemon without the operator's shell environment,
+/// causing `TRUSTY_MEMORY_LIMIT_MB` and friends to be lost after a restart.
+/// Writing them to a file at `start`-time lets the daemon re-apply them on
+/// every boot, regardless of how it was launched.
+/// What: returns `<data_local_dir>/trusty-search/daemon.env`.
+/// Test: path ends in `daemon.env`; the parent directory is the same as the
+/// lockfile directory so both are writable under the same permission set.
+pub fn daemon_env_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("trusty-search").join("daemon.env"))
+}
+
+/// The env-var keys that `trusty-search start` persists and the daemon sources
+/// on startup. Ordered from most critical to least so log output is predictable.
+pub const PERSISTED_ENV_VARS: &[&str] = &[
+    "TRUSTY_MEMORY_LIMIT_MB",
+    "TRUSTY_MAX_CHUNKS",
+    "TRUSTY_EMBEDDING_CACHE",
+    "TRUSTY_MAX_BATCH_SIZE",
+    "TRUSTY_BM25_CORPUS_CAP",
+];
+
+/// Write memory-limit env vars from the current process environment to
+/// `daemon.env` so launchd restarts inherit them.
+///
+/// Why: called by `trusty-search start` to snapshot whatever the operator set
+/// in their shell; the file is sourced by `load_daemon_env` at daemon startup.
+/// What: iterates `PERSISTED_ENV_VARS`; writes only vars that are currently
+/// set so the file stays minimal and the daemon's compiled-in defaults win for
+/// anything absent. Uses `key=value\n` lines (POSIX dotenv subset).
+/// Test: call `save_daemon_env()` after setting `TRUSTY_MEMORY_LIMIT_MB=1024`
+/// in the process env; then read the file and assert it contains that line.
+pub fn save_daemon_env() {
+    let Some(path) = daemon_env_path() else {
+        tracing::warn!("could not resolve daemon.env path — memory limits will not persist");
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut lines = Vec::new();
+    for key in PERSISTED_ENV_VARS {
+        if let Ok(val) = std::env::var(key) {
+            lines.push(format!("{key}={val}\n"));
+        }
+    }
+    // Only write the file when at least one memory-limit var is present.
+    // This prevents a launchd restart (which inherits no shell vars) from
+    // overwriting a previously-saved daemon.env with an empty file, which
+    // would lose the operator's configured limits on the next restart.
+    if lines.is_empty() {
+        tracing::debug!("no memory-limit env vars set — daemon.env unchanged");
+        return;
+    }
+    let content = lines.concat();
+    match std::fs::write(&path, &content) {
+        Ok(()) => tracing::debug!("wrote memory limits to {}", path.display()),
+        Err(e) => tracing::warn!("could not write daemon.env: {e}"),
+    }
+}
+
+/// Source `daemon.env` into the current process environment, skipping vars
+/// that are already set (env > file > compiled-in default precedence).
+///
+/// Why: launchd restarts the daemon without the operator's shell env; this
+/// function restores memory-limit knobs from the file written by `save_daemon_env`.
+/// What: reads `daemon.env` (silently ignores missing file), parses `key=value`
+/// lines, calls `std::env::set_var` only when the var is not already present.
+/// Test: write `daemon.env` with `TRUSTY_MEMORY_LIMIT_MB=512`; unset the var;
+/// call `load_daemon_env()`; assert `std::env::var("TRUSTY_MEMORY_LIMIT_MB") == "512"`.
+pub fn load_daemon_env() {
+    let Some(path) = daemon_env_path() else {
+        return;
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return, // file absent is expected on first run
+    };
+    let mut loaded = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim();
+            let val = val.trim();
+            // env var takes priority: only apply file value when var is unset
+            if std::env::var(key).is_err() {
+                // SAFETY: only called at startup before any threads read these vars;
+                // `set_var` is not async-signal-safe but we are on the main thread here.
+                unsafe { std::env::set_var(key, val) };
+                loaded.push(key.to_owned());
+            }
+        }
+    }
+    if !loaded.is_empty() {
+        tracing::info!(
+            "sourced memory limits from daemon.env: {}",
+            loaded.join(", ")
+        );
+    }
+}
+
 /// Path to `~/.trusty-search/http_addr` — the canonical address-discovery
 /// file used by `trusty-search dashboard` and other client tools to locate
 /// the running daemon. Distinct from the legacy `daemon.port` file (which
@@ -346,6 +452,29 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     let router = build_router(state);
 
     tracing::info!("daemon listening on {addr} (lock {})", lock_path.display());
+
+    // Log active memory limits so operators can confirm the correct values
+    // are in effect (especially important for launchd-managed restarts where
+    // env vars come from daemon.env rather than the user's shell).
+    {
+        use crate::core::memguard::memory_limit_mb;
+        let max_chunks = std::env::var("TRUSTY_MAX_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(200_000);
+        let emb_cache = std::env::var("TRUSTY_EMBEDDING_CACHE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1_000);
+        match memory_limit_mb() {
+            Some(mb) => tracing::info!(
+                "memory limits: max_chunks={max_chunks} embedding_cache={emb_cache} memory_limit_mb={mb}"
+            ),
+            None => tracing::info!(
+                "memory limits: max_chunks={max_chunks} embedding_cache={emb_cache} memory_limit_mb=unlimited"
+            ),
+        }
+    }
 
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

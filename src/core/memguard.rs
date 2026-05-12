@@ -19,20 +19,52 @@ use std::sync::OnceLock;
 
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
 
+/// Hard-coded safety-net ceiling (8 GiB). Applied when neither the env var
+/// nor `daemon.env` sets an explicit limit. This prevents an unattended
+/// launchd restart from consuming all available RAM on a developer machine.
+///
+/// Operators who need more RAM (e.g. indexing >1M-chunk monorepos) should
+/// set `TRUSTY_MEMORY_LIMIT_MB` before running `trusty-search start` — the
+/// value is persisted to `daemon.env` and survives launchd restarts.
+const DEFAULT_MEMORY_LIMIT_MB: u64 = 8_192;
+
 /// Cached snapshot of `TRUSTY_MEMORY_LIMIT_MB` parsed at first read.
 ///
 /// `None` => limit disabled (env unset or unparseable / zero).
 /// `Some(mb)` => soft RSS ceiling in megabytes.
 static MEMORY_LIMIT_MB: OnceLock<Option<u64>> = OnceLock::new();
 
-/// Read `TRUSTY_MEMORY_LIMIT_MB`, caching the result. Zero or non-numeric
-/// values disable the limit.
+/// Read `TRUSTY_MEMORY_LIMIT_MB`, caching the result.
+///
+/// Priority: env var > `daemon.env` (already sourced into env by
+/// `load_daemon_env`) > compiled-in default of `DEFAULT_MEMORY_LIMIT_MB`
+/// (8 192 MB / 8 GiB). A value of `0` in the env var explicitly disables
+/// the limit and returns `None`; any other non-numeric value falls through
+/// to the default.
+///
+/// Why default 8 GiB: on a launchd restart without any env vars the daemon
+/// previously ran with no cap at all, which allowed ONNX arena growth to
+/// consume 80+ GB before macOS Jetsam killed it. 8 GiB is a safe ceiling
+/// for typical developer machines that still allows large-repo indexing.
 pub fn memory_limit_mb() -> Option<u64> {
     *MEMORY_LIMIT_MB.get_or_init(|| {
-        std::env::var("TRUSTY_MEMORY_LIMIT_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
+        match std::env::var("TRUSTY_MEMORY_LIMIT_MB") {
+            Ok(v) => {
+                // Explicit "0" means "no limit" — respect it.
+                match v.parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        tracing::warn!(
+                            "TRUSTY_MEMORY_LIMIT_MB={v:?} is not a valid u64; \
+                             using compiled-in default ({DEFAULT_MEMORY_LIMIT_MB} MB)"
+                        );
+                        Some(DEFAULT_MEMORY_LIMIT_MB)
+                    }
+                }
+            }
+            Err(_) => Some(DEFAULT_MEMORY_LIMIT_MB),
+        }
     })
 }
 

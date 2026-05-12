@@ -2293,12 +2293,52 @@ fn launchd_log_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// Render the `<key>EnvironmentVariables</key>` plist fragment for all
+/// memory-limit env vars that are currently set in the process environment.
+///
+/// Why: launchd re-spawns the daemon without the user's shell environment.
+/// Embedding env vars directly in the plist (rather than relying solely on
+/// `daemon.env`) provides a belt-and-suspenders guarantee: even if
+/// `load_daemon_env` is not called early enough, launchd itself passes the
+/// vars. If no vars are set the section is omitted — the daemon falls back
+/// to `daemon.env` and compiled-in defaults.
+/// What: iterates `PERSISTED_ENV_VARS`, emits plist key/string pairs only
+/// for vars that are set; returns an empty string if none are set.
+/// Test: set `TRUSTY_MEMORY_LIMIT_MB=4096`, call `launchd_env_vars_plist()`,
+/// assert the output contains the corresponding `<key>` / `<string>` block.
+#[cfg(target_os = "macos")]
+fn launchd_env_vars_plist() -> String {
+    use crate::service::PERSISTED_ENV_VARS;
+    let pairs: Vec<String> = PERSISTED_ENV_VARS
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key).ok().map(|val| {
+                // XML-escape the value to handle characters that would break plist.
+                let escaped = val
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                format!("        <key>{key}</key>\n        <string>{escaped}</string>")
+            })
+        })
+        .collect();
+    if pairs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "    <key>EnvironmentVariables</key>\n    <dict>\n{}\n    </dict>\n",
+            pairs.join("\n")
+        )
+    }
+}
+
 /// Render the LaunchAgent plist body. Foreground mode (launchd owns lifecycle).
 #[cfg(target_os = "macos")]
 fn launchd_plist_body(exe: &std::path::Path, log_dir: &std::path::Path) -> String {
     let exe = exe.display();
     let stdout = log_dir.join("stdout.log");
     let stderr = log_dir.join("stderr.log");
+    let env_vars_section = launchd_env_vars_plist();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2312,7 +2352,7 @@ fn launchd_plist_body(exe: &std::path::Path, log_dir: &std::path::Path) -> Strin
         <string>start</string>
         <string>--foreground</string>
     </array>
-    <key>RunAtLoad</key>
+{env_vars_section}    <key>RunAtLoad</key>
     <true/>
     <!-- KeepAlive=SuccessfulExit:false means launchd only restarts the daemon
          on a non-zero exit. The `start` command exits 0 when a live daemon is
