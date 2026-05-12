@@ -2,6 +2,8 @@ pub mod client;
 pub mod config;
 pub mod daemon;
 pub mod indexed_files;
+pub mod persistence;
+pub mod persistence_loader;
 pub mod reindex;
 pub mod server;
 pub mod ui;

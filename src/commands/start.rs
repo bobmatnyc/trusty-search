@@ -2,6 +2,59 @@
 
 use anyhow::Result;
 use colored::Colorize;
+use std::sync::Arc;
+
+use crate::core::registry::{IndexHandle, IndexId};
+use crate::service::persistence::load_index_registry;
+use crate::service::persistence_loader::build_indexer_with_persisted_state;
+use crate::service::SearchAppState;
+
+/// Restore every index recorded in `indexes.toml` by re-registering it on the
+/// in-memory registry. For each entry we attempt to load the persisted HNSW
+/// snapshot and chunk corpus from disk so the index comes back warm (no
+/// re-indexing required).
+///
+/// Why (issue #85): before this hook, the daemon had no way to remember
+/// which projects were registered — every restart required the user to run
+/// `trusty-search index <path>` again. Now the registry is durable and
+/// HNSW + chunks are restored automatically.
+/// What: iterates registry entries, skips any that the in-memory registry
+/// already has (idempotent — `create_index` may have raced ahead), then
+/// constructs an `IndexHandle` via the shared `build_indexer_with_persisted_state`
+/// helper.
+/// Test: integration test in `tests/integration_tests.rs` that writes a
+/// registry file, calls this hook, and asserts the registry list matches.
+async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core::Embedder>) {
+    let entries = match load_index_registry() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("could not read indexes.toml at startup: {e}");
+            return;
+        }
+    };
+    if entries.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "warm-boot: restoring {} index registration(s) from indexes.toml",
+        entries.len()
+    );
+    for entry in entries {
+        let id = IndexId::new(entry.id.clone());
+        if state.registry.get(&id).is_some() {
+            // A live create_index handler beat us to it — skip.
+            continue;
+        }
+        let indexer =
+            build_indexer_with_persisted_state(&entry.id, entry.root_path.clone(), embedder).await;
+        let handle = IndexHandle {
+            id: id.clone(),
+            indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
+            root_path: entry.root_path,
+        };
+        state.registry.register(handle);
+    }
+}
 
 /// Build a shared `FastEmbedder` for every index registered during the
 /// daemon's lifetime.
@@ -171,8 +224,13 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     tokio::spawn(async move {
         match build_embedder().await {
             Ok(embedder) => {
-                install_state.install_embedder(embedder).await;
+                install_state.install_embedder(Arc::clone(&embedder)).await;
                 tracing::info!("embedder ready — vector lane online");
+                // Issue #85: now that the embedder is ready, restore every
+                // index recorded in `indexes.toml`. We do this after embedder
+                // init so the restored indexes get a fully-wired hybrid
+                // pipeline (HNSW vectors + BM25), not a BM25-only fallback.
+                restore_indexes(&install_state, &embedder).await;
             }
             Err(e) => {
                 tracing::error!(

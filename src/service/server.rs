@@ -21,9 +21,8 @@
 use crate::core::{
     classifier::QueryClassifier,
     embed::Embedder,
-    indexer::{CodeIndexer, SearchQuery},
+    indexer::SearchQuery,
     registry::{IndexHandle, IndexId, IndexRegistry},
-    store::{UsearchStore, VectorStore},
 };
 use axum::{
     body::Body,
@@ -576,24 +575,28 @@ async fn create_index_handler(
     // the HNSW lane actually contributes results. Previously every index
     // was BM25-only because `with_components` was never called, which is
     // why the benchmark observed `match_reason: "bm25"` for 100% of hits.
-    let mut indexer = CodeIndexer::new(req.id.clone(), req.root_path.clone());
-    {
-        let embedder = &embedder;
-        let dim = embedder.dimension();
-        match UsearchStore::new(dim) {
-            Ok(store) => {
-                let store: Arc<dyn VectorStore> = Arc::new(store);
-                indexer = indexer.with_components(Arc::clone(embedder), store);
-            }
-            Err(e) => {
-                tracing::error!(
-                    "failed to allocate UsearchStore for index {}: {e} \
-                     — index will run in BM25-only mode",
-                    req.id
-                );
-            }
-        }
+    //
+    // Issue #85: if a previously-saved HNSW snapshot + chunks file exist for
+    // this id, restore them so the daemon warm-boots without re-indexing.
+    let indexer = crate::service::persistence_loader::build_indexer_with_persisted_state(
+        &req.id,
+        req.root_path.clone(),
+        &embedder,
+    )
+    .await;
+
+    // Persist the registration so a daemon restart can re-register
+    // automatically. Best-effort: a write failure is logged but doesn't fail
+    // the request — the in-memory registry still has the index.
+    if let Err(e) = crate::service::persistence::upsert_index_registry_entry(
+        crate::service::persistence::PersistedIndex {
+            id: req.id.clone(),
+            root_path: req.root_path.clone(),
+        },
+    ) {
+        tracing::warn!("could not persist index registry for {}: {e}", req.id);
     }
+
     let handle = IndexHandle {
         id: id.clone(),
         indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
@@ -641,6 +644,14 @@ async fn delete_index_handler(
     let removed = state.registry.unregister(&index_id);
     state.reindex_progress.remove(&index_id);
     if removed {
+        // Issue #85: drop the on-disk footprint so the index doesn't come
+        // back on the next daemon restart. Best-effort — log on failure.
+        if let Err(e) = crate::service::persistence::remove_index_registry_entry(&id) {
+            tracing::warn!("could not remove '{id}' from indexes.toml: {e}");
+        }
+        if let Err(e) = crate::service::persistence::remove_index_data_dir(&id) {
+            tracing::warn!("could not remove on-disk data for '{id}': {e}");
+        }
         // Push event so connected dashboards drop the row without refresh.
         state.emit(DaemonEvent::IndexRemoved { id: id.clone() });
     }

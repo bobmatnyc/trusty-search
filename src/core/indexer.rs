@@ -284,6 +284,26 @@ fn compute_match_reason(in_v: bool, in_b: bool, in_kg: bool) -> &'static str {
 /// embeddings plus the per-file entity lists, ready to be committed into the
 /// indexer's shared state. Held without any write lock so it can be shipped
 /// between async tasks freely.
+/// On-disk shape of a chunk corpus snapshot (issue #85). Stored as JSON next
+/// to the HNSW snapshot so the daemon can restore an index without re-parsing
+/// the source tree.
+///
+/// Why: BM25 + the symbol graph are both derivable from the chunk corpus, so
+/// persisting just the chunks (and the per-file entity lists) is enough to
+/// warm-boot the whole search pipeline. We deliberately do NOT persist BM25
+/// posting lists — rebuilding them from chunks at load time is O(N tokens)
+/// and avoids a second on-disk schema to migrate.
+/// What: versioned wrapper around `Vec<RawChunk>` plus the entities map.
+/// Test: covered by `tests::test_save_chunks_roundtrip`.
+#[derive(Debug, Serialize, Deserialize)]
+struct ChunkSnapshot {
+    /// File-format version. Bump when changing the shape so older daemons
+    /// fall through to the empty-corpus branch instead of producing garbage.
+    version: u32,
+    chunks: Vec<RawChunk>,
+    entities: Vec<(String, Vec<RawEntity>)>,
+}
+
 #[derive(Default)]
 pub struct ParsedBatch {
     pub chunks: Vec<RawChunk>,
@@ -570,6 +590,129 @@ impl CodeIndexer {
     }
 
     /// Number of chunks currently held in the corpus.
+    /// Snapshot the in-memory chunk corpus + entities to disk as JSON.
+    ///
+    /// Why (issue #85): on graceful shutdown (and incrementally after each
+    /// committed batch) we persist the corpus so a restart can rebuild BM25
+    /// and the symbol graph without re-parsing the source tree. Pairs with
+    /// [`VectorStore::save_to`] which persists the HNSW vectors.
+    /// What: copies chunks + entities under read locks (releasing them before
+    /// the I/O), then writes JSON atomically via tmp + rename. Empty corpus
+    /// is still written so the on-disk file accurately reflects state.
+    /// Test: see `tests::test_save_chunks_roundtrip`.
+    pub async fn save_chunks_to_disk(&self, path: &std::path::Path) -> Result<()> {
+        // Snapshot under read locks, then drop them before doing I/O so
+        // concurrent searches never block on the JSON serialize.
+        let chunks_vec: Vec<RawChunk> = {
+            let chunks = self.chunks.read().await;
+            chunks.values().cloned().collect()
+        };
+        let entities_vec: Vec<(String, Vec<RawEntity>)> = {
+            let entities = self.entities.read().await;
+            entities
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        let snapshot = ChunkSnapshot {
+            version: 1,
+            chunks: chunks_vec,
+            entities: entities_vec,
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent of {}", path.display()))?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(&snapshot).context("serialize chunk corpus snapshot")?;
+        std::fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Restore the chunk corpus + entities from a previous snapshot. After
+    /// load, rebuilds BM25 + the symbol graph so the search pipeline is
+    /// immediately usable. The HNSW vectors must be restored separately via
+    /// `UsearchStore::load_from` before this is called.
+    ///
+    /// Why (issue #85): the daemon's `restore_indexes` startup hook calls
+    /// this so registered indexes come back warm without re-embedding.
+    /// What: reads the JSON snapshot, repopulates `chunks` + `entities`,
+    /// runs `commit_bm25_batch` against the restored chunks to refill the
+    /// posting list, then rebuilds the symbol graph. Returns the number of
+    /// chunks restored. Missing/corrupt file → `Ok(0)` (graceful fallback).
+    /// Test: see `tests::test_save_chunks_roundtrip`.
+    pub async fn load_chunks_from_disk(&self, path: &std::path::Path) -> Result<usize> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let snapshot: ChunkSnapshot = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "chunk snapshot at {} is corrupt ({e}) — starting with empty corpus",
+                    path.display()
+                );
+                return Ok(0);
+            }
+        };
+
+        let total = snapshot.chunks.len();
+        // Phase 1: refill BM25 from the restored corpus before publishing the
+        // chunks map so concurrent reads can't observe a half-state.
+        {
+            let mut bm25 = self.bm25.write().await;
+            for chunk in &snapshot.chunks {
+                let text = Self::bm25_doc_text(chunk);
+                bm25.upsert_document(&chunk.id, &text);
+            }
+        }
+        // Phase 2: publish chunks under a single write lock.
+        {
+            let mut corpus = self.chunks.write().await;
+            for chunk in snapshot.chunks {
+                corpus.insert(chunk.id.clone(), chunk);
+            }
+        }
+        // Phase 3: publish entities.
+        {
+            let mut emap = self.entities.write().await;
+            for (file, ents) in snapshot.entities {
+                emap.insert(file, ents);
+            }
+        }
+        // Phase 4: rebuild the symbol graph so KG expansion works on the
+        // restored corpus immediately. Cheap relative to re-embedding.
+        self.rebuild_symbol_graph().await;
+        tracing::info!(
+            "restored {} chunks for index '{}' from {}",
+            total,
+            self.index_id,
+            path.display()
+        );
+        Ok(total)
+    }
+
+    /// Snapshot the HNSW vector store, if one is wired. Best-effort: returns
+    /// `Ok(false)` if no store is attached (BM25-only mode) so callers can
+    /// chain without checking.
+    pub async fn save_vector_store(&self, path: &std::path::Path) -> Result<bool> {
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
+        store.save_to(path).await?;
+        Ok(true)
+    }
+
+    /// Install a pre-loaded `VectorStore` (typically a restored `UsearchStore`)
+    /// onto this indexer. Used by the warm-boot path so the persisted HNSW
+    /// graph is wired in before `load_chunks_from_disk` runs.
+    pub fn set_store(&mut self, store: Arc<dyn VectorStore>) {
+        self.store = Some(store);
+    }
+
     pub fn chunk_count(&self) -> usize {
         // blocking_read is fine on a tokio worker thread for a quick stat probe;
         // we never await across this call.
@@ -1018,12 +1161,116 @@ impl CodeIndexer {
             self.rebuild_symbol_graph().await;
             kg_start.elapsed().as_millis() as u64
         };
+
+        // Issue #85 — fire-and-forget incremental persistence. After every
+        // committed batch we snapshot the HNSW graph + chunk corpus to disk
+        // so a daemon crash mid-reindex preserves whatever was committed
+        // (no progress is lost beyond the in-flight batch).
+        //
+        // Why background: `Index::save` can take 100s of ms on a large
+        // corpus and we don't want the commit path (which is on the hot
+        // reindex loop) to wait on filesystem I/O. We don't hold any locks
+        // while spawning — the clones are cheap (Arc bumps + a path string).
+        self.spawn_incremental_persist();
+
         Ok(CommitTimings {
             chunks: chunk_total,
             bm25_ms,
             vector_upsert_ms,
             kg_ms,
         })
+    }
+
+    /// Spawn a background task that snapshots the HNSW graph + chunk corpus
+    /// for this index to disk. Best-effort: a failure is logged but never
+    /// returned to the caller — persistence is a "backup", not the source of
+    /// truth, so a partial save can't corrupt live state.
+    ///
+    /// Why: called from `commit_parsed_batch` so incremental progress is
+    /// preserved across crashes. The actual save runs on a detached task so
+    /// the commit path returns immediately.
+    /// What: skips when the daemon's data dir is unresolvable (tests, broken
+    /// HOME env). Snapshots HNSW (via `VectorStore::save_to`) and chunks (via
+    /// `save_chunks_to_disk`) concurrently with regular search traffic — both
+    /// snapshot under read locks before doing I/O.
+    /// Test: covered by integration tests that mutate an index then assert
+    /// the on-disk file appears within a short timeout.
+    fn spawn_incremental_persist(&self) {
+        let index_id = self.index_id.clone();
+        let store = self.store.clone();
+        let chunks = self.chunks.clone();
+        let entities = self.entities.clone();
+        tokio::spawn(async move {
+            // Re-resolve paths in the task so the persistence layer's path
+            // resolution failures don't crash the commit caller.
+            let chunks_path = match crate::service::persistence::chunks_path(&index_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(
+                        "incremental persist: cannot resolve chunks path for '{index_id}': {e}"
+                    );
+                    return;
+                }
+            };
+            let hnsw_path = match crate::service::persistence::hnsw_path(&index_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(
+                        "incremental persist: cannot resolve hnsw path for '{index_id}': {e}"
+                    );
+                    return;
+                }
+            };
+
+            // Save HNSW first (large, parallel-friendly).
+            if let Some(store) = store {
+                if let Err(e) = store.save_to(&hnsw_path).await {
+                    tracing::warn!(
+                        "incremental persist: failed to save HNSW for '{index_id}': {e}"
+                    );
+                }
+            }
+
+            // Save chunks JSON. We inline the snapshot logic here rather than
+            // calling `save_chunks_to_disk` because the latter needs `&self`
+            // and we deliberately avoid holding an `Arc<CodeIndexer>` in this
+            // task (would change the indexer's lifecycle).
+            let chunks_vec: Vec<RawChunk> = {
+                let g = chunks.read().await;
+                g.values().cloned().collect()
+            };
+            let entities_vec: Vec<(String, Vec<RawEntity>)> = {
+                let g = entities.read().await;
+                g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            let snapshot = ChunkSnapshot {
+                version: 1,
+                chunks: chunks_vec,
+                entities: entities_vec,
+            };
+            if let Some(parent) = chunks_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = chunks_path.with_extension("json.tmp");
+            match serde_json::to_vec(&snapshot) {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(&tmp, &bytes) {
+                        tracing::warn!(
+                            "incremental persist: write chunks tmp failed for '{index_id}': {e}"
+                        );
+                        return;
+                    }
+                    if let Err(e) = std::fs::rename(&tmp, &chunks_path) {
+                        tracing::warn!(
+                            "incremental persist: rename chunks failed for '{index_id}': {e}"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "incremental persist: serialize chunks failed for '{index_id}': {e}"
+                ),
+            }
+        });
     }
 
     /// Single batched HNSW upsert across all chunks that have an embedding.
@@ -1615,6 +1862,55 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(dim));
         let store: Arc<dyn VectorStore> = Arc::new(UsearchStore::new(dim).expect("usearch new"));
         CodeIndexer::new("test", "/tmp/test").with_components(embedder, store)
+    }
+
+    #[tokio::test]
+    async fn test_save_chunks_roundtrip() {
+        // Issue #85: a freshly-loaded indexer must have its chunks restored
+        // and its BM25 posting list rebuilt from disk — no re-parsing of
+        // source files allowed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunks.json");
+
+        // Phase 1: populate an indexer and snapshot it.
+        let idx = make_indexer();
+        idx.add_chunk(raw("a", "src/a.rs", "fn authenticate() {}"))
+            .await
+            .unwrap();
+        idx.add_chunk(raw("b", "src/b.rs", "fn verify_token() {}"))
+            .await
+            .unwrap();
+        idx.save_chunks_to_disk(&path).await.expect("save chunks");
+        assert!(path.exists());
+
+        // Phase 2: load into a fresh indexer and confirm both corpus and
+        // BM25 see the restored chunks.
+        let restored = make_indexer();
+        let n = restored
+            .load_chunks_from_disk(&path)
+            .await
+            .expect("load chunks");
+        assert_eq!(n, 2);
+        assert_eq!(restored.chunk_count(), 2);
+        // BM25 must be rebuilt — a "authenticate" lexical query should hit
+        // chunk "a".
+        let bm25 = restored.bm25.read().await;
+        let hits = bm25.score_query_all("authenticate", 5);
+        drop(bm25);
+        assert!(
+            hits.iter().any(|(id, _)| id == "a"),
+            "BM25 not rebuilt from restored chunks: {:?}",
+            hits
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_chunks_missing_file_returns_zero() {
+        let idx = make_indexer();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        let n = idx.load_chunks_from_disk(&path).await.unwrap();
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]

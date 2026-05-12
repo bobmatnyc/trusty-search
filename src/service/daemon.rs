@@ -449,6 +449,10 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     // can call back to the daemon (window.__DAEMON_PORT__). Stamp it onto
     // the state right before building the router.
     let state = state.with_daemon_port(port);
+    // Issue #85: capture a clone *before* moving `state` into `build_router`
+    // so the post-shutdown flush can walk the registry. SearchAppState is
+    // cheap to clone (all internal fields are Arc/handle-like).
+    let flush_state = state.clone();
     let router = build_router(state);
 
     tracing::info!("daemon listening on {addr} (lock {})", lock_path.display());
@@ -480,6 +484,11 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
         .with_graceful_shutdown(shutdown_signal())
         .await;
 
+    // Issue #85 — flush HNSW + chunk corpus for every registered index so
+    // the next daemon boot warm-starts instead of paying a full re-index.
+    // Best-effort: log on failure, don't abort cleanup.
+    flush_all_indexes_on_shutdown(&flush_state).await;
+
     // Best-effort cleanup; ignore errors so the lockfile drop is what frees
     // the next daemon, not our cleanup.
     let _ = std::fs::remove_file(&port_path);
@@ -490,6 +499,57 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     serve_result.map_err(|e| DaemonError::Server(e.to_string()))?;
     drop(lock_file);
     Ok(())
+}
+
+/// Walk every registered index and persist its HNSW snapshot + chunk corpus
+/// to disk so the next daemon boot warm-starts (issue #85).
+///
+/// Why: called from `run_daemon` after the axum graceful-shutdown future
+/// resolves. By this point no new requests can come in, but any in-flight
+/// search handlers may still be holding read locks — we use the same
+/// `save_to` / `save_chunks_to_disk` paths the incremental persister uses,
+/// so they snapshot under read locks and never block writers indefinitely.
+/// What: iterates `state.registry.list()`, persisting each index sequentially
+/// (the daemon is exiting; we have no concurrency budget to protect).
+/// Test: covered by the integration test that boots the daemon, indexes a
+/// file, sends SIGTERM, then restarts and asserts the corpus survived.
+pub async fn flush_all_indexes_on_shutdown(state: &SearchAppState) {
+    let ids = state.registry.list();
+    if ids.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "shutdown: flushing {} index snapshot(s) before exit",
+        ids.len()
+    );
+    for id in ids {
+        let Some(handle) = state.registry.get(&id) else {
+            continue;
+        };
+        let chunks_path = match crate::service::persistence::chunks_path(&id.0) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("shutdown: chunks path unresolvable for '{}': {e}", id.0);
+                continue;
+            }
+        };
+        let hnsw_path = match crate::service::persistence::hnsw_path(&id.0) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("shutdown: hnsw path unresolvable for '{}': {e}", id.0);
+                continue;
+            }
+        };
+        let indexer = handle.indexer.read().await;
+        if let Err(e) = indexer.save_chunks_to_disk(&chunks_path).await {
+            tracing::warn!("shutdown: failed to save chunks for '{}': {e}", id.0);
+        }
+        match indexer.save_vector_store(&hnsw_path).await {
+            Ok(true) => tracing::debug!("shutdown: saved HNSW for '{}'", id.0),
+            Ok(false) => {} // no store wired (BM25-only mode)
+            Err(e) => tracing::warn!("shutdown: failed to save HNSW for '{}': {e}", id.0),
+        }
+    }
 }
 
 /// Write the canonical `host:port` discovery line to `~/.trusty-search/http_addr`.

@@ -1,11 +1,31 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+
+/// Sidecar JSON written alongside the usearch binary snapshot, capturing the
+/// `chunk_id → u64 key` mapping (and the `next_key` counter) so a restored
+/// index can translate HNSW matches back into chunk ids.
+///
+/// Why: usearch persists vectors + graph + keys, but only as `u64`s. We
+/// allocate string→u64 mappings ourselves in `UsearchStore::id_to_key`, so
+/// without this sidecar the loaded index would have orphaned keys.
+/// What: `id_to_key` is the authoritative mapping; `next_key` is the
+/// monotonic counter so post-restore inserts never collide with restored
+/// keys.
+/// Test: `tests::test_save_load_roundtrip` exercises this.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreKeyMap {
+    id_to_key: HashMap<String, u64>,
+    next_key: u64,
+    dim: usize,
+}
 
 /// Initial reserved capacity for a new HNSW index. Grows geometrically on demand.
 const INITIAL_CAPACITY: usize = 1_024;
@@ -66,6 +86,17 @@ pub trait VectorStore: Send + Sync {
         for (id, vec) in items {
             self.upsert(id, vec.clone()).await?;
         }
+        Ok(())
+    }
+
+    /// Persist this store to disk. Default = no-op (in-memory backends).
+    ///
+    /// Why: lets `CodeIndexer::save_to_disk` call through a `dyn VectorStore`
+    /// without downcasting. `UsearchStore` overrides; mock test stores keep
+    /// the no-op so they round-trip without filesystem access.
+    /// What: persist whatever state is needed to restore via `load_from`.
+    /// Test: covered by `UsearchStore::test_save_load_roundtrip`.
+    async fn save_to(&self, _path: &Path) -> Result<()> {
         Ok(())
     }
 }
@@ -147,6 +178,147 @@ impl UsearchStore {
     /// Vector dimensionality this store was built for.
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Persist the HNSW graph and the `chunk_id → u64 key` sidecar to disk.
+    ///
+    /// Why (issue #85): on graceful shutdown (and incrementally after each
+    /// `commit_parsed_batch`) we save the in-memory HNSW so the daemon can
+    /// warm-boot without re-embedding the entire corpus. Without this every
+    /// restart costs minutes of re-indexing.
+    /// What: snapshots `id_to_key` + `next_key` under read locks, releases the
+    /// locks, then calls usearch's `Index::save(&str)` and writes the sidecar
+    /// JSON. Both writes are atomic (tmp + rename) so a crash mid-save never
+    /// leaves a partial file. The caller passes the HNSW path; the sidecar is
+    /// written next to it with extension `.keys.json`.
+    /// Test: `tests::test_save_load_roundtrip` saves then loads into a fresh
+    /// store and asserts a search still returns the original chunk_ids.
+    pub async fn save(&self, hnsw_path: &Path) -> Result<()> {
+        // Snapshot the key map under read locks so we can release them before
+        // the (possibly slow) usearch save. The HNSW write lock is required
+        // because usearch's save is `&self` but mutates internal serializer
+        // buffers; treating it as a write-side operation matches the rest of
+        // this store.
+        let key_map = {
+            let id_to_key = self.id_to_key.read().await;
+            StoreKeyMap {
+                id_to_key: id_to_key.clone(),
+                next_key: self.next_key.load(Ordering::Relaxed),
+                dim: self.dim,
+            }
+        };
+
+        if let Some(parent) = hnsw_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("create parent of {}: {e}", hnsw_path.display()))?;
+        }
+
+        // usearch's `save` takes a `&str` path. We write to a tmp file and
+        // rename so callers never observe a half-written snapshot.
+        let tmp_hnsw = hnsw_path.with_extension("usearch.tmp");
+        let tmp_hnsw_str = tmp_hnsw
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 path: {}", tmp_hnsw.display()))?;
+        {
+            let index = self.index.write().await;
+            index
+                .save(tmp_hnsw_str)
+                .map_err(|e| anyhow!("usearch save failed: {e}"))?;
+        }
+        std::fs::rename(&tmp_hnsw, hnsw_path).map_err(|e| anyhow!("rename hnsw snapshot: {e}"))?;
+
+        let sidecar = hnsw_path.with_extension("keys.json");
+        let sidecar_tmp = sidecar.with_extension("json.tmp");
+        let json =
+            serde_json::to_vec(&key_map).map_err(|e| anyhow!("serialize hnsw key map: {e}"))?;
+        std::fs::write(&sidecar_tmp, &json)
+            .map_err(|e| anyhow!("write hnsw key sidecar tmp: {e}"))?;
+        std::fs::rename(&sidecar_tmp, &sidecar)
+            .map_err(|e| anyhow!("rename hnsw key sidecar: {e}"))?;
+        Ok(())
+    }
+
+    /// Load a previously-saved HNSW snapshot and its key sidecar.
+    ///
+    /// Why: counterpart of [`Self::save`]. On daemon startup or `create_index`
+    /// the registered index can boot with its vectors restored — no re-embed
+    /// pass required.
+    /// What: builds a fresh `Index` with options matching `with_capacity_hint`,
+    /// calls usearch's `load(path)`, then reads the sidecar to restore the
+    /// string ↔ key mappings and `next_key`. If either file is missing or
+    /// corrupt, returns `Ok(None)` so callers fall back to a fresh empty
+    /// store instead of crashing the daemon.
+    /// Test: `tests::test_save_load_roundtrip` covers the happy path; a
+    /// `tests::test_load_missing_returns_none` covers the absent-file branch.
+    pub async fn load_from(hnsw_path: &Path) -> Result<Option<Self>> {
+        let sidecar = hnsw_path.with_extension("keys.json");
+        if !hnsw_path.exists() || !sidecar.exists() {
+            return Ok(None);
+        }
+
+        let json = match std::fs::read(&sidecar) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    "could not read hnsw key sidecar {}: {e} — discarding snapshot",
+                    sidecar.display()
+                );
+                return Ok(None);
+            }
+        };
+        let key_map: StoreKeyMap = match serde_json::from_slice(&json) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "hnsw key sidecar {} is corrupt ({e}) — discarding snapshot",
+                    sidecar.display()
+                );
+                return Ok(None);
+            }
+        };
+
+        let expected_chunks = key_map.id_to_key.len();
+        let store = Self::with_capacity_hint(key_map.dim, expected_chunks)?;
+        let hnsw_str = match hnsw_path.to_str() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "non-utf8 hnsw path {} — discarding snapshot",
+                    hnsw_path.display()
+                );
+                return Ok(None);
+            }
+        };
+        {
+            let index = store.index.write().await;
+            if let Err(e) = index.load(hnsw_str) {
+                tracing::warn!(
+                    "usearch failed to load {} ({e}) — discarding snapshot",
+                    hnsw_path.display()
+                );
+                return Ok(None);
+            }
+            // After load, reserve enough capacity for the restored size so
+            // the next insert doesn't immediately re-grow.
+            let size = index.size();
+            if index.capacity() < size {
+                let _ = index.reserve(size);
+            }
+        }
+
+        // Rehydrate the mappings.
+        {
+            let mut id_map = store.id_to_key.write().await;
+            let mut key_map_rev = store.key_to_id.write().await;
+            for (id, key) in &key_map.id_to_key {
+                id_map.insert(id.clone(), *key);
+                key_map_rev.insert(*key, id.clone());
+            }
+        }
+        store
+            .next_key
+            .store(key_map.next_key.max(1), Ordering::Relaxed);
+        Ok(Some(store))
     }
 
     /// Ensure the underlying HNSW has room for at least one more vector.
@@ -275,6 +447,10 @@ impl VectorStore for UsearchStore {
 
     async fn len(&self) -> Result<usize> {
         Ok(self.index.read().await.size())
+    }
+
+    async fn save_to(&self, path: &Path) -> Result<()> {
+        self.save(path).await
     }
 
     /// Single-lock-pass override. Two phases:
@@ -473,6 +649,62 @@ mod tests {
         let store = UsearchStore::new(4).expect("store init");
         let items = vec![("bad".to_string(), vec![1.0, 0.0])];
         assert!(store.upsert_batch(&items).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_save_load_roundtrip() {
+        // Why: validate the persistence path end-to-end so issue #85 actually
+        // survives a "restart" (simulated here by dropping the store and
+        // loading the snapshot into a fresh one).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hnsw.usearch");
+
+        let store = UsearchStore::new(4).unwrap();
+        store
+            .upsert("alpha", vec![1.0, 0.0, 0.0, 0.0])
+            .await
+            .unwrap();
+        store
+            .upsert("beta", vec![0.0, 1.0, 0.0, 0.0])
+            .await
+            .unwrap();
+        store.save(&path).await.expect("save");
+        assert!(path.exists(), "hnsw file must exist after save");
+        assert!(
+            path.with_extension("keys.json").exists(),
+            "key sidecar must exist after save"
+        );
+
+        drop(store);
+
+        let loaded = UsearchStore::load_from(&path)
+            .await
+            .expect("load ok")
+            .expect("load returned Some");
+        assert_eq!(loaded.len().await.unwrap(), 2);
+        let hits = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).await.unwrap();
+        assert_eq!(hits[0].chunk_id, "alpha", "restored ids must round-trip");
+    }
+
+    #[tokio::test]
+    async fn test_load_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.usearch");
+        let loaded = UsearchStore::load_from(&path).await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_corrupt_sidecar_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hnsw.usearch");
+        // Create both files but corrupt the sidecar.
+        let store = UsearchStore::new(4).unwrap();
+        store.upsert("a", vec![1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        store.save(&path).await.unwrap();
+        std::fs::write(path.with_extension("keys.json"), b"not valid json").unwrap();
+        let loaded = UsearchStore::load_from(&path).await.unwrap();
+        assert!(loaded.is_none(), "corrupt sidecar must fall back to None");
     }
 
     #[tokio::test]
