@@ -40,11 +40,13 @@ const QUERY_CACHE_CAPACITY: usize = 256;
 const HNSW_OVERSAMPLE: usize = 4;
 /// Default LRU capacity for the per-indexer chunk embedding cache.
 ///
-/// Each entry is `dim × 4` bytes (384-dim f32 ≈ 1 536 B). 10 000 entries ≈
-/// ~15 MB of RAM per index. Evicted entries are simply re-embedded on demand
-/// (MMR rerank gracefully falls back when an embedding is missing). Override
+/// Each entry is `dim × 4` bytes (384-dim f32 ≈ 1 536 B). 1 000 entries ≈
+/// ~1.5 MB of RAM per index. Evicted entries are simply re-embedded on demand
+/// (MMR rerank gracefully falls back when an embedding is missing). Lowered
+/// from 10 000 → 1 000 (issue #79) after a daemon was observed at 43.9 GB RSS;
+/// the cache was a meaningful contributor on multi-index hosts. Override
 /// at runtime via `TRUSTY_EMBEDDING_CACHE`.
-const DEFAULT_EMBEDDING_CACHE_CAP: usize = 10_000;
+const DEFAULT_EMBEDDING_CACHE_CAP: usize = 1_000;
 
 /// Read the embedding-cache LRU cap from the environment, with a sane default.
 fn embedding_cache_cap() -> usize {
@@ -56,10 +58,12 @@ fn embedding_cache_cap() -> usize {
 }
 
 /// Default hard cap on chunks per index. Also used as the HNSW
-/// `max_elements`-style sanity guard. 500 000 chunks × ~5 KB metadata ≈ 2.5 GB
-/// of RAM-resident chunk corpus on a single index, which is roughly the limit
-/// we want a single daemon to attempt. Override via `TRUSTY_MAX_CHUNKS`.
-const DEFAULT_MAX_CHUNKS_PER_INDEX: usize = 500_000;
+/// `max_elements`-style sanity guard. 200 000 chunks × ~5 KB metadata ≈ 1.0 GB
+/// of RAM-resident chunk corpus on a single index. Lowered from 500 000 →
+/// 200 000 (issue #79) — the previous default permitted >2.5 GB / index just
+/// for chunk metadata, on top of HNSW and BM25 structures. Operators with
+/// large monorepos can still raise this via `TRUSTY_MAX_CHUNKS`.
+const DEFAULT_MAX_CHUNKS_PER_INDEX: usize = 200_000;
 
 /// Read the per-index chunk cap from the environment, with a sane default.
 fn max_chunks_per_index() -> usize {
@@ -80,7 +84,12 @@ fn max_chunks_per_index() -> usize {
 /// overhead.
 ///
 /// Override at runtime via `TRUSTY_MAX_BATCH_SIZE` (clamped to `[32, 2048]`).
-const DEFAULT_EMBED_BATCH_SIZE: usize = 512;
+///
+/// Default lowered from 512 → 128 (issue #79) — the ONNX activation arena
+/// retains buffers sized to the largest batch it has seen, and on Apple
+/// Silicon this triggered Jetsam kills on large repos. 128 is the value the
+/// doc-comment above already recommended.
+const DEFAULT_EMBED_BATCH_SIZE: usize = 128;
 const EMBED_BATCH_MIN: usize = 32;
 const EMBED_BATCH_MAX: usize = 2048;
 

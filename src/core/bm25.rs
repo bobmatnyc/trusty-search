@@ -1,6 +1,31 @@
 //! BM25 index for lexical search.
 //! Ported from open-mpm src/context/bm25.rs (zero external crate deps).
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Default cap on the number of live documents BM25 will accept (issue #79).
+///
+/// Why: posting lists, `doc_terms`, and per-term frequency maps scale linearly
+/// with corpus size. On a 200 000-chunk index BM25 alone can consume several
+/// hundred MB of RAM; bounding the corpus keeps per-query latency low and
+/// memory predictable. Lexical recall above this cap typically falls off — the
+/// HNSW lane still covers the long tail. Override via `TRUSTY_BM25_CORPUS_CAP`.
+const DEFAULT_BM25_CORPUS_CAP: usize = 50_000;
+
+/// Read `TRUSTY_BM25_CORPUS_CAP` from the environment, falling back to the
+/// default. Zero is treated as "use default" so an unset / bogus value never
+/// disables the cap silently.
+fn bm25_corpus_cap() -> usize {
+    std::env::var("TRUSTY_BM25_CORPUS_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_BM25_CORPUS_CAP)
+}
+
+/// Latch so we only log "BM25 corpus cap reached" once per process — repeated
+/// indexing of a large repo would otherwise drown the daemon log in warnings.
+static BM25_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Three-pass tokenizer for code-aware BM25 (issue #27).
 ///
@@ -192,9 +217,29 @@ impl Bm25Index {
 
     /// Insert a chunk. If `chunk_id` already exists, the previous postings are
     /// removed first so updates are idempotent.
+    ///
+    /// Memory cap (issue #79): when the live-doc count is already at or above
+    /// `TRUSTY_BM25_CORPUS_CAP` (default 50 000) **and** this is a brand-new
+    /// chunk_id, the upsert is dropped. Updates to existing chunks are always
+    /// honoured — they don't grow the corpus. A single tracing warn is emitted
+    /// the first time the cap is hit; subsequent drops are silent to avoid
+    /// log spam during full reindexes of oversized repos.
     pub fn upsert_document(&mut self, chunk_id: &str, text: &str) {
         if self.id_to_slot.contains_key(chunk_id) {
             self.remove_document(chunk_id);
+        } else {
+            let cap = bm25_corpus_cap();
+            if self.live_docs >= cap {
+                if !BM25_CAP_LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        cap,
+                        live_docs = self.live_docs,
+                        "BM25 corpus cap reached — dropping further new documents \
+                         (override with TRUSTY_BM25_CORPUS_CAP)"
+                    );
+                }
+                return;
+            }
         }
         let slot = self.allocate_slot(chunk_id);
         self.id_to_slot.insert(chunk_id.to_string(), slot);
