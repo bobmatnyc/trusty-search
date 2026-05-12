@@ -42,6 +42,9 @@ static DOMAIN_DEF_RE: OnceLock<Regex> = OnceLock::new();
 static EXTENDED_BUG_RE: OnceLock<Regex> = OnceLock::new();
 // Long natural-language conceptual queries (issue #88): ≥6 words, no code tokens.
 static LONG_NL_RE: OnceLock<Regex> = OnceLock::new();
+// Short identifier-dominated queries (issue #91): PascalCase identifier with
+// no other intent verb → Definition.
+static PASCAL_IDENT_RE: OnceLock<Regex> = OnceLock::new();
 
 impl QueryClassifier {
     /// Classify a query string into a `QueryIntent` for routing weight selection.
@@ -88,7 +91,7 @@ impl QueryClassifier {
             Regex::new(
                 r"(?x)
                 # Pattern A — standalone structural vocabulary word
-                (?i)\b(definition|interface|schema|model)\b
+                (?i)\b(definition|interface|schema|model|enum)\b
                 |
                 # Pattern B — PascalCase identifier + structural keyword
                 \b[A-Z][a-zA-Z0-9]+\s+(?i)(definition|struct|class|interface|type|schema|enum|trait|model)\b
@@ -157,6 +160,24 @@ impl QueryClassifier {
         let trimmed = query.trim();
         if long_nl_re.is_match(trimmed) {
             return QueryIntent::Conceptual;
+        }
+
+        // Identifier-dominated queries (issue #91): when no explicit intent
+        // verb matched, a query containing a PascalCase identifier (e.g.
+        // "QueryClassifier intent classification") is most often a symbol
+        // lookup → Definition.
+        //
+        // The PascalCase regex requires a capital letter followed by at least
+        // one lower-case letter and one more capital (CamelCase) — guarding
+        // against single-cap acronyms like "API" or "TODO" matching here.
+        // Pure snake_case identifiers are intentionally NOT a trigger: many
+        // long natural-language queries embed a function name without
+        // intending a definition lookup (see
+        // `test_long_query_with_code_token_not_long_nl_conceptual`).
+        let pascal_ident_re = PASCAL_IDENT_RE
+            .get_or_init(|| Regex::new(r"\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b").unwrap());
+        if pascal_ident_re.is_match(trimmed) {
+            return QueryIntent::Definition;
         }
 
         QueryIntent::Unknown
@@ -512,6 +533,42 @@ mod tests {
         assert_eq!(
             QueryClassifier::classify_with_domain("PMS integration", &terms),
             QueryIntent::Unknown
+        );
+    }
+
+    // ── PascalCase identifier-dominated tests (issue #91) ──────────────────
+
+    #[test]
+    fn test_pascal_identifier_alone_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("QueryClassifier intent classification"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_camel_case_with_extra_words_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("CodeIndexer pipeline"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_pascal_identifier_loses_to_conceptual_verb() {
+        // "how does" wins — Conceptual must take precedence over the
+        // PascalCase fallback.
+        assert_eq!(
+            QueryClassifier::classify("how does QueryClassifier work"),
+            QueryIntent::Conceptual
+        );
+    }
+
+    #[test]
+    fn test_standalone_enum_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("enum for reservation status"),
+            QueryIntent::Definition
         );
     }
 

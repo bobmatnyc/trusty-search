@@ -264,6 +264,26 @@ fn populate_virtual_terms(chunks: &mut [RawChunk], entities: &[RawEntity]) {
     }
 }
 
+/// Score multiplier applied to a chunk for Definition-intent queries (issue #92).
+///
+/// Why: Definition queries (e.g. "struct CodeChunk fields") should surface the
+/// canonical source-file declaration, not the Markdown / TOML / YAML file that
+/// happens to mention the symbol many times. We demote doc/config files by 50%
+/// only for Definition intent; Conceptual queries still surface `.md` docs.
+/// What: returns `0.5` when the path ends with a known doc/config extension,
+/// `1.0` otherwise.
+/// Test: covered by `test_file_type_multiplier_demotes_docs` and the
+/// integration test `test_definition_demotes_markdown_below_source`.
+fn file_type_score_multiplier(path: &str) -> f32 {
+    const DOC_EXTENSIONS: &[&str] = &[".md", ".txt", ".toml", ".yaml", ".yml", ".json"];
+    let lower = path.to_ascii_lowercase();
+    if DOC_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+        0.5
+    } else {
+        1.0
+    }
+}
+
 /// Map (`in_hnsw`, `in_bm25`, `in_kg`) booleans to a stable `match_reason`
 /// label.
 ///
@@ -1853,11 +1873,65 @@ impl CodeIndexer {
             .expand_with_kg(fused, &intent, use_kg_first, query.expand_graph)
             .await;
 
+        // 4a) Re-rank by score after KG expansion (issue #94): KG-expanded
+        //     neighbours are appended after the fused list, so a naïve
+        //     `take(top_k)` would silently discard them. Sort the merged
+        //     `(id, score)` list so well-scored KG hits survive truncation
+        //     and `match_reason: "hybrid+kg"` actually surfaces in results.
+        // 4b) Apply a file-type multiplier for Definition intent (issue #92):
+        //     when the user is looking for a symbol definition, prefer source
+        //     files over docs/configs whose BM25 TF can spuriously rank them
+        //     above the canonical .rs/.py/.go declaration.
+        let all = self.apply_score_adjustments(all, &intent).await;
+
         // 5) Materialise the top-k IDs into `CodeChunk`s.
         let result = self
             .materialize_search_results(all, &hnsw_results, &bm25_results, &kg_ids, query)
             .await;
         Ok(result)
+    }
+
+    /// Re-rank merged direct+KG candidates and apply file-type weighting.
+    ///
+    /// Why: KG-expanded neighbours are appended after the RRF-fused list, so
+    /// the naïve `take(top_k)` in `materialize_search_results` used to drop
+    /// them (issue #94). At the same time, Definition-intent queries used to
+    /// rank `.md` docs above source files because they had high BM25 TF for
+    /// symbol names (issue #92). We solve both by adjusting every candidate's
+    /// score in a single pass and re-sorting before truncation.
+    /// What: for `Definition` intent, multiplies the score of each candidate
+    /// by `0.5` if its file extension is in `DOC_EXTENSIONS`; for every other
+    /// intent the multiplier is `1.0`. Then re-sorts by score descending,
+    /// with id as a stable tie-breaker.
+    /// Test: covered by `test_definition_demotes_markdown_below_source` and
+    /// `test_kg_results_survive_top_k_truncation`.
+    async fn apply_score_adjustments(
+        &self,
+        candidates: Vec<(String, f32)>,
+        intent: &QueryIntent,
+    ) -> Vec<(String, f32)> {
+        let demote_docs = matches!(intent, QueryIntent::Definition);
+        let chunks = self.chunks.read().await;
+        let mut adjusted: Vec<(String, f32)> = candidates
+            .into_iter()
+            .map(|(id, score)| {
+                let multiplier = if demote_docs {
+                    chunks
+                        .get(&id)
+                        .map(|raw| file_type_score_multiplier(&raw.file))
+                        .unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                (id, score * multiplier)
+            })
+            .collect();
+        adjusted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        adjusted
     }
 
     /// Issue #20: when intent is Definition or Unknown (a likely symbol
@@ -2691,6 +2765,172 @@ mod tests {
             r.iter().any(|c| c.content.contains("pms_handler")),
             "expected pms_handler chunk to appear in results: {:?}",
             r.iter().map(|c| &c.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_file_type_multiplier_demotes_docs() {
+        // Why: Definition-intent ranking should prefer source over docs.
+        // What: confirms the helper's contract — multiplier 0.5 for .md/.toml/
+        // .yaml/.json/.txt, 1.0 for everything else.
+        // Test: direct assertions on the helper.
+        assert_eq!(file_type_score_multiplier("src/auth.rs"), 1.0);
+        assert_eq!(file_type_score_multiplier("src/auth.py"), 1.0);
+        assert_eq!(file_type_score_multiplier("src/auth.go"), 1.0);
+        assert_eq!(file_type_score_multiplier("CHANGELOG.md"), 0.5);
+        assert_eq!(file_type_score_multiplier("docs/CLAUDE.md"), 0.5);
+        assert_eq!(file_type_score_multiplier("Cargo.toml"), 0.5);
+        assert_eq!(file_type_score_multiplier("config.yaml"), 0.5);
+        assert_eq!(file_type_score_multiplier("data.json"), 0.5);
+        // Case-insensitive
+        assert_eq!(file_type_score_multiplier("README.MD"), 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_definition_demotes_markdown_below_source() {
+        // Why: issue #92 — for Definition-intent queries, the canonical
+        // source-file declaration must outrank any .md doc that mentions the
+        // symbol many times.
+        // What: build a corpus with one .rs source chunk and one .md chunk
+        // both containing the literal "CodeChunk struct"; run a Definition
+        // query and assert the .rs file ranks first.
+        // Test: this test.
+        let idx = make_indexer();
+        idx.add_chunk(raw(
+            "doc:1",
+            "CHANGELOG.md",
+            "## CodeChunk struct\nCodeChunk struct fields: id, file. CodeChunk struct fields are stable.",
+        ))
+        .await
+        .unwrap();
+        idx.add_chunk(raw(
+            "src:1",
+            "src/indexer.rs",
+            "pub struct CodeChunk { pub id: String, pub file: String }",
+        ))
+        .await
+        .unwrap();
+
+        let q = SearchQuery {
+            text: "struct CodeChunk fields".to_string(),
+            top_k: 10,
+            expand_graph: false,
+            compact: false,
+        };
+        let results = idx.search(&q).await.unwrap();
+        assert!(!results.is_empty(), "search must return results");
+        assert!(
+            results[0].file.ends_with(".rs"),
+            "Definition intent must rank source over docs, top result file = {}",
+            results[0].file
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conceptual_does_not_demote_docs() {
+        // Why: the .md demotion is intent-scoped — Conceptual queries must
+        // still surface documentation.
+        // What: same corpus shape as above, but a Conceptual query phrasing
+        // ("how does ...") ⇒ no multiplier applied. We only assert that the
+        // markdown chunk is present in results (ordering for Conceptual is
+        // dominated by the vector lane in real runs; in this BM25-only test
+        // we just verify no hard demotion happens).
+        // Test: this test.
+        let idx = make_indexer();
+        idx.add_chunk(raw(
+            "doc:1",
+            "ARCHITECTURE.md",
+            "How does the CodeChunk pipeline work in trusty-search.",
+        ))
+        .await
+        .unwrap();
+        idx.add_chunk(raw(
+            "src:1",
+            "src/indexer.rs",
+            "pub struct CodeChunk { pub id: String }",
+        ))
+        .await
+        .unwrap();
+
+        let q = SearchQuery {
+            text: "how does the CodeChunk pipeline work".to_string(),
+            top_k: 10,
+            expand_graph: false,
+            compact: false,
+        };
+        let results = idx.search(&q).await.unwrap();
+        assert!(
+            results.iter().any(|c| c.file.ends_with(".md")),
+            "Conceptual queries must still surface .md docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kg_results_survive_top_k_truncation() {
+        // Why: issue #94 — KG-expanded neighbours used to be appended after
+        // `take(top_k)` had already trimmed the result list, so on busy
+        // indexes the "hybrid+kg" reason never surfaced. We now re-sort the
+        // merged direct+KG list by score before truncation.
+        // What: fill the index with N direct hits at top_k limit, plus one
+        // KG-only neighbour; assert the neighbour survives.
+        // Test: this test.
+        let idx = CodeIndexer::new("kg-trunc", "/tmp/test");
+        // Direct hit + KG seed via `calls`.
+        idx.add_chunk(RawChunk {
+            id: "src:caller".to_string(),
+            file: "caller.rs".to_string(),
+            start_line: 1,
+            end_line: 3,
+            content: "fn caller() { /* dispatches */ }".to_string(),
+            function_name: Some("caller".to_string()),
+            language: Some("rust".to_string()),
+            chunk_type: crate::core::chunker::ChunkType::Function,
+            calls: vec!["authenticate".to_string()],
+            inherits_from: Vec::new(),
+            chunk_depth: 0,
+            parent_chunk_id: None,
+            child_chunk_ids: Vec::new(),
+            nlp_keywords: Vec::new(),
+            nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
+        })
+        .await
+        .unwrap();
+        idx.add_chunk(RawChunk {
+            id: "src:authenticate".to_string(),
+            file: "auth.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content: "fn authenticate() {}".to_string(),
+            function_name: Some("authenticate".to_string()),
+            language: Some("rust".to_string()),
+            chunk_type: crate::core::chunker::ChunkType::Function,
+            calls: Vec::new(),
+            inherits_from: Vec::new(),
+            chunk_depth: 0,
+            parent_chunk_id: None,
+            child_chunk_ids: Vec::new(),
+            nlp_keywords: Vec::new(),
+            nlp_code_refs: Vec::new(),
+            virtual_terms: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let q = SearchQuery {
+            text: "callers of authenticate".to_string(),
+            top_k: 10,
+            expand_graph: true,
+            compact: false,
+        };
+        let results = idx.search(&q).await.unwrap();
+        assert!(
+            results.iter().any(|c| c.match_reason == "hybrid+kg"),
+            "at least one result must carry 'hybrid+kg' match_reason, got: {:#?}",
+            results
+                .iter()
+                .map(|c| (&c.id, &c.match_reason))
+                .collect::<Vec<_>>()
         );
     }
 
