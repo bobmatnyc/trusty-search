@@ -121,9 +121,15 @@ mod tests {
 
         match event {
             WatchEvent::Modified(p) => {
-                assert!(
-                    p.ends_with("hello.txt"),
-                    "expected path to end with hello.txt, got {p:?}"
+                // Use file_name() rather than ends_with() so the assertion is
+                // immune to macOS resolving /tmp → /private/var/folders/…
+                // (the watcher delivers the canonicalized path; ends_with does
+                // component matching which is correct, but file_name() is more
+                // explicit and also survives any future path-normalization changes).
+                assert_eq!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("hello.txt"),
+                    "expected path filename to be hello.txt, got {p:?}"
                 );
             }
             other => panic!("expected Modified, got {other:?}"),
@@ -155,7 +161,8 @@ mod tests {
                 .expect("event arrives before deadline")
                 .expect("channel still open");
             if let WatchEvent::Removed(p) = event {
-                if p.ends_with("doomed.txt") {
+                // file_name() comparison is canonical-path-safe (macOS /tmp symlink).
+                if p.file_name().and_then(|n| n.to_str()) == Some("doomed.txt") {
                     return;
                 }
             }
