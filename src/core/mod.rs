@@ -5,6 +5,7 @@ pub mod concept_cluster;
 pub mod embed;
 pub mod entity;
 pub mod indexer;
+pub mod memguard;
 pub mod mmr;
 pub mod ner;
 pub mod registry;

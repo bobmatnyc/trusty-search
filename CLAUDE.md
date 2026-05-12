@@ -442,6 +442,8 @@ via env when needed.
 |----------|---------|-------------|
 | `TRUSTY_MAX_CHUNKS` | `500000` | Hard cap on chunks per index. Also clamps HNSW reserve growth, so a single index never holds more than this many vectors. New chunks past the cap are dropped with a warning. |
 | `TRUSTY_EMBEDDING_CACHE` | `10000` | LRU capacity for the in-memory chunk-embedding cache (≈15 MB at 384-dim f32). Evicted entries are gracefully re-embedded or fall back to relevance-only MMR. |
+| `TRUSTY_MAX_BATCH_SIZE` | `512` | Hard cap on the embedding batch size used inside `parse_and_embed_files` (chunks per ONNX `embed_batch` call). Clamped to `[32, 2048]`. Larger batches amortise ONNX kernel-launch overhead but grow the per-session activation arena; lower this on memory-constrained hosts. |
+| `TRUSTY_MEMORY_LIMIT_MB` | _(unset = disabled)_ | Optional soft RSS ceiling for the indexing pipeline. When set, the reindex orchestrator polls process RSS every 10 batches and skips remaining batches with a `tracing::warn!` once the limit is hit. The partial index is preserved (already-committed chunks stay searchable); `memory_limit_hit: true` appears in the SSE `complete` event and in the daemon log. |
 
 Additional internal caps (not env-tunable):
 

@@ -14,6 +14,7 @@
 //! Test: see `crates/trusty-search-service/src/reindex.rs#tests`.
 
 use crate::core::indexer::CommitTimings;
+use crate::core::memguard::{current_rss_mb, memory_limit_mb};
 use crate::core::registry::{IndexHandle, IndexId};
 use crate::service::walker::{should_skip_content, walk_source_files};
 use crossbeam_utils::atomic::AtomicCell;
@@ -289,13 +290,51 @@ pub fn spawn_reindex_with_cleanup(
         let mut total_vector_upsert_ms: u64 = 0;
         let mut total_vector_count: usize = 0;
 
+        // Memory-protection state (issue #76). `mem_limit` is `Some` only
+        // when `TRUSTY_MEMORY_LIMIT_MB` is set. `peak_rss_mb` tracks the
+        // maximum RSS observed across the whole reindex so we can log it at
+        // completion. `mem_limit_hit` records whether we bailed out early.
+        // `batch_index` lets us cheap-poll RSS every N batches instead of
+        // every batch (sysinfo refresh costs ~ms).
+        let mem_limit = memory_limit_mb();
+        let mut peak_rss_mb: u64 = current_rss_mb().unwrap_or(0);
+        let mut mem_limit_hit: bool = false;
+        const MEM_CHECK_EVERY_N_BATCHES: usize = 10;
+
         // Process files in batches. Each batch:
         //  1. Reads files concurrently (tokio::fs::read_to_string).
         //  2. Skips files whose content hash matches the previous reindex.
         //  3. Calls `CodeIndexer::index_files_batch` — one ONNX call per
         //     EMBED_BATCH_SIZE chunks across the whole batch, one symbol-graph
         //     rebuild per batch.
-        for batch in walk.files.chunks(REINDEX_BATCH_SIZE) {
+        for (batch_index, batch) in walk.files.chunks(REINDEX_BATCH_SIZE).enumerate() {
+            // Memory-protection poll (issue #76). Every Nth batch (and on
+            // batch 0), refresh process RSS, update the peak, and bail out
+            // gracefully if a configured `TRUSTY_MEMORY_LIMIT_MB` has been
+            // breached. Skipping remaining batches preserves all chunks
+            // already committed — a partial reindex is safer than an
+            // OOM-kill that loses the daemon's in-memory state entirely.
+            if batch_index.is_multiple_of(MEM_CHECK_EVERY_N_BATCHES) {
+                if let Some(rss) = current_rss_mb() {
+                    if rss > peak_rss_mb {
+                        peak_rss_mb = rss;
+                    }
+                    if let Some(limit) = mem_limit {
+                        if rss >= limit {
+                            tracing::warn!(
+                                "reindex: memory limit hit (rss={}MB >= limit={}MB), \
+                                 skipping remaining batches for index {}",
+                                rss,
+                                limit,
+                                index_id.0
+                            );
+                            mem_limit_hit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
             // 1) Read all files in the batch concurrently.
             let read_futs = batch.iter().map(|path| {
                 let path = path.clone();
@@ -482,15 +521,37 @@ pub fn spawn_reindex_with_cleanup(
         let chunks_per_sec = (total_chunks as u64 * 1000)
             .checked_div(elapsed_ms)
             .unwrap_or(0);
+
+        // Final RSS poll so the peak reflects post-commit memory (the symbol
+        // graph rebuild may itself push RSS higher than any per-batch sample).
+        if let Some(rss) = current_rss_mb() {
+            if rss > peak_rss_mb {
+                peak_rss_mb = rss;
+            }
+        }
+        let indexed_final = progress.indexed.load(Ordering::Acquire);
+        tracing::info!(
+            "reindex complete: index={} files={} chunks={} elapsed_ms={} \
+             peak_rss_mb={} memory_limit_hit={}",
+            index_id.0,
+            indexed_final,
+            total_chunks,
+            elapsed_ms,
+            peak_rss_mb,
+            mem_limit_hit,
+        );
+
         progress
             .push(serde_json::json!({
                 "event": "complete",
-                "indexed": progress.indexed.load(Ordering::Acquire),
+                "indexed": indexed_final,
                 "total_chunks": total_chunks,
                 "skipped": progress.skipped.load(Ordering::Acquire),
                 "errors": progress.errors.load(Ordering::Acquire),
                 "elapsed_ms": elapsed_ms,
                 "chunks_per_sec": chunks_per_sec,
+                "peak_rss_mb": peak_rss_mb,
+                "memory_limit_hit": mem_limit_hit,
                 "timings": {
                     "parse_ms": total_parse_ms,
                     "embed_ms": total_embed_ms,

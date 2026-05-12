@@ -78,7 +78,30 @@ fn max_chunks_per_index() -> usize {
 /// GBs and trigger macOS Jetsam kills. 128 keeps the per-call tensor footprint
 /// bounded while still being large enough to amortise ONNX kernel launch
 /// overhead.
-const EMBED_BATCH_SIZE: usize = 128;
+///
+/// Override at runtime via `TRUSTY_MAX_BATCH_SIZE` (clamped to `[32, 2048]`).
+const DEFAULT_EMBED_BATCH_SIZE: usize = 512;
+const EMBED_BATCH_MIN: usize = 32;
+const EMBED_BATCH_MAX: usize = 2048;
+
+/// Read the embedding batch size from `TRUSTY_MAX_BATCH_SIZE`, clamped to
+/// `[EMBED_BATCH_MIN, EMBED_BATCH_MAX]`. Falls back to `DEFAULT_EMBED_BATCH_SIZE`
+/// when unset or unparseable.
+///
+/// Why: large repos can exhaust process memory if batches grow unbounded. This
+/// gives operators a runtime knob to dial batch size up (faster indexing on
+/// memory-rich hosts) or down (safer on constrained hosts) without rebuilding.
+/// What: parses env, clamps via `.clamp()`. Filter-then-clamp ensures both
+/// missing and zero values fall through to the default.
+/// Test: see `tests::test_embed_batch_size_env_clamp`.
+fn embed_batch_size() -> usize {
+    std::env::var("TRUSTY_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.clamp(EMBED_BATCH_MIN, EMBED_BATCH_MAX))
+        .unwrap_or(DEFAULT_EMBED_BATCH_SIZE)
+}
 /// Legacy default score multiplier applied to chunks brought in via KG
 /// expansion. Retained for backwards-compat documentation: the live pipeline
 /// now uses [`EdgeKind::score_multiplier`] (issue #18) so each edge type
@@ -822,8 +845,9 @@ impl CodeIndexer {
             return Ok(embeddings);
         };
         let chunk_total = chunks.len();
-        for batch_start in (0..chunk_total).step_by(EMBED_BATCH_SIZE) {
-            let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunk_total);
+        let batch_size = embed_batch_size();
+        for batch_start in (0..chunk_total).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(chunk_total);
             let batch_texts: Vec<&str> = chunks[batch_start..batch_end]
                 .iter()
                 .map(|c| c.content.as_str())

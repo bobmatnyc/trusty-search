@@ -117,6 +117,9 @@ walkdir = "2"
 crossbeam-utils = "0.8"
 dirs = "5"
 
+# ── Process memory introspection (TRUSTY_MEMORY_LIMIT_MB, peak RSS log) ────
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
 # ── Embedded UI ────────────────────────────────────────────────────────────
 include_dir = "0.7"
 
