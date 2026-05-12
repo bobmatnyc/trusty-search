@@ -2228,4 +2228,51 @@ class Foo {
             "callers={callers:?}"
         );
     }
+
+    /// Issue #90: end-to-end check that a small Rust snippet — parsed by
+    /// `chunk_ast`, fed into `SymbolGraph::build_from_chunks` — produces
+    /// non-zero symbols and a usable caller→callee edge. This is the
+    /// regression test for the silent KG-skip bug where reindexes that
+    /// breached the memory limit during embedding left the graph at 0/0.
+    ///
+    /// Why: prevents future skips/bugs along the chunker→graph integration
+    /// from re-introducing the same failure mode.
+    /// What: two free functions where `alpha` calls `beta`; the resulting
+    /// graph must contain both symbols and `callers_of("beta")` must include
+    /// `alpha`.
+    /// Test: this is the test.
+    #[test]
+    fn test_rust_symbol_graph_resolves_caller() {
+        use crate::core::symbol_graph::SymbolGraph;
+        let src = "fn alpha() { beta(); }\nfn beta() {}\n";
+        let (chunks, _) = chunk_ast("a.rs", src);
+        let tuples: Vec<_> = chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.file.clone(),
+                    c.function_name.clone(),
+                    c.calls.clone(),
+                    c.inherits_from.clone(),
+                    c.chunk_type.clone(),
+                )
+            })
+            .collect();
+        let g = SymbolGraph::build_from_chunks(&tuples);
+        assert!(
+            g.node_count() >= 2,
+            "expected >= 2 symbol nodes for alpha+beta, got {} (chunks={:#?})",
+            g.node_count(),
+            chunks
+                .iter()
+                .map(|c| (c.function_name.clone(), c.calls.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let callers = g.callers_of("beta", 1);
+        assert!(
+            callers.iter().any(|(s, _)| s == "alpha"),
+            "expected alpha among callers of beta, got {callers:?}"
+        );
+    }
 }

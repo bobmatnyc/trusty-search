@@ -598,27 +598,48 @@ pub fn spawn_reindex_with_cleanup(
         // entire corpus and would scale quadratically with file count if run
         // per batch. One rebuild at the end gives the same final state.
         //
-        // Issue #82: skip the KG rebuild if we already breached the memory
-        // limit during batch processing. The symbol graph is itself a
-        // significant allocator (petgraph adjacency lists scale with edge
-        // count) and pushing further into a busted memory budget risks
-        // OOM-kill of the whole daemon. A partial reindex with no fresh KG
-        // is recoverable; an OOM-killed daemon is not.
+        // Issue #90: previously this stage was skipped whenever
+        // `mem_limit_hit` had been tripped at any point during batch
+        // processing — even if memory pressure had since subsided. That left
+        // every reindex on memory-constrained hosts (or hosts with a
+        // transient embedding spike) with `symbol_count: 0, edge_count: 0`,
+        // which silently disabled KG-expansion (`hybrid+kg` never appears in
+        // search results) for the entire daemon lifetime until the next
+        // mutation-driven rebuild. The persisted chunks DO carry
+        // `function_name` and `calls`, so building the graph is cheap and
+        // bounded by `TRUSTY_MAX_KG_NODES` (default 100k). It is independent
+        // of the embedding pipeline that caused the spike, so we always run
+        // it now.
+        //
+        // Issue #82 (original concern): petgraph adjacency lists scale with
+        // edge count. For a 100k-node graph that's ~30 MB — negligible next
+        // to the GB-scale embedding spike. The hard cap remains the
+        // load-bearing safety net.
         let kg_start = Instant::now();
-        let (symbol_count, edge_count, kg_skipped) =
-            if mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire) {
-                tracing::warn!(
-                    "reindex: skipping KG rebuild for index {} — memory limit \
-                     already breached during batch processing",
-                    index_id.0
-                );
-                (0usize, 0usize, true)
-            } else {
-                let indexer = handle.indexer.read().await;
-                indexer.rebuild_symbol_graph_now().await;
-                let g = indexer.symbol_graph().await;
-                (g.node_count(), g.edge_count(), false)
-            };
+        let kg_skipped;
+        let symbol_count;
+        let edge_count;
+        {
+            let indexer = handle.indexer.read().await;
+            indexer.rebuild_symbol_graph_now().await;
+            let g = indexer.symbol_graph().await;
+            symbol_count = g.node_count();
+            edge_count = g.edge_count();
+            kg_skipped = false;
+        }
+        if mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire) {
+            tracing::warn!(
+                "reindex: memory limit was breached during batch processing for \
+                 index {} (peak_rss={}MB, limit={:?}MB) — KG was still rebuilt \
+                 (symbols={}, edges={}) because graph construction is bounded by \
+                 TRUSTY_MAX_KG_NODES and independent of the embedding spike",
+                index_id.0,
+                peak_rss_atomic.load(AtomicOrdering::Acquire),
+                mem_limit,
+                symbol_count,
+                edge_count,
+            );
+        }
         let kg_ms = kg_start.elapsed().as_millis() as u64;
 
         // Stop the background poller and collect the true peak it observed.
