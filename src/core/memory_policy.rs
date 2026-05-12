@@ -27,6 +27,45 @@ use std::fmt;
 /// as a warning when used.
 const FALLBACK_RAM_MB: u64 = 8 * 1024;
 
+/// Empirically measured ORT transient arena cost per `embed_batch` slot in MB.
+///
+/// Why: ORT allocates working memory proportional to `batch_size × emb_dim ×
+/// seq_len` during each `embed_batch` call. At `batch_size=512` on
+/// all-MiniLM-L6-v2 (seq_len=512, 384-dim) we observe a 28 GB transient RSS
+/// peak — 28 GB / 512 ≈ 55 MB per slot. The between-batch RSS poller in
+/// `memguard` cannot catch this intra-call spike, so we bound batch size
+/// up-front from the configured memory limit. See issue #95.
+const EMBED_MB_PER_BATCH_SLOT: u64 = 55;
+
+/// Reserve this fraction of `memory_limit_mb` for the ORT transient arena
+/// when computing `max_batch_size`. The remaining 25% accounts for the
+/// resident process working set (HNSW, BM25 corpus, chunk cache, redb, etc.).
+const EMBED_ARENA_BUDGET_NUM: u64 = 75;
+const EMBED_ARENA_BUDGET_DEN: u64 = 100;
+
+/// Floor for the computed batch size. Below this throughput collapses.
+const MIN_COMPUTED_BATCH_SIZE: usize = 32;
+
+/// Ceiling for the computed batch size. We never exceed the historical cap
+/// even on very-high-memory hosts (returns diminish past ~512).
+const MAX_COMPUTED_BATCH_SIZE: usize = 512;
+
+/// Compute the safe `max_batch_size` for a given memory limit so that the ORT
+/// transient arena (≈ `EMBED_MB_PER_BATCH_SLOT` per slot) stays within
+/// `memory_limit_mb × budget_fraction`. Clamped to
+/// `[MIN_COMPUTED_BATCH_SIZE, MAX_COMPUTED_BATCH_SIZE]`.
+///
+/// Why: see `EMBED_MB_PER_BATCH_SLOT` doc — intra-call spikes are invisible to
+/// the RSS poller, so batch size must be sized from the limit, not against it.
+/// What: `floor(memory_limit_mb * 0.75 / 55)`, clamped to `[32, 512]`.
+/// Test: `test_compute_max_batch_size_from_limit` covers the tier table and
+/// the clamp endpoints.
+fn compute_max_batch_size(memory_limit_mb: usize) -> usize {
+    let budget_mb = (memory_limit_mb as u64) * EMBED_ARENA_BUDGET_NUM / EMBED_ARENA_BUDGET_DEN;
+    let raw = (budget_mb / EMBED_MB_PER_BATCH_SLOT) as usize;
+    raw.clamp(MIN_COMPUTED_BATCH_SIZE, MAX_COMPUTED_BATCH_SIZE)
+}
+
 /// Memory tier selected based on total system RAM. The tier picks default
 /// caps; env vars override individual fields.
 ///
@@ -75,32 +114,24 @@ impl MemoryTier {
     }
 
     /// Default caps for this tier.
+    ///
+    /// `max_batch_size` is derived from `memory_limit_mb` via
+    /// [`compute_max_batch_size`] so the ORT transient arena (≈55 MB per
+    /// batch slot) cannot exceed 75% of the configured soft cap. See issue #95.
     fn defaults(self) -> TierDefaults {
-        match self {
-            MemoryTier::Medium => TierDefaults {
-                memory_limit_mb: 4_096,
-                max_chunks: 200_000,
-                embedding_cache: 5_000,
-                max_batch_size: 256,
-                bm25_corpus_cap: 100_000,
-                max_kg_nodes: 150_000,
-            },
-            MemoryTier::Large => TierDefaults {
-                memory_limit_mb: 8_192,
-                max_chunks: 400_000,
-                embedding_cache: 10_000,
-                max_batch_size: 512,
-                bm25_corpus_cap: 200_000,
-                max_kg_nodes: 300_000,
-            },
-            MemoryTier::XLarge => TierDefaults {
-                memory_limit_mb: 16_384,
-                max_chunks: 800_000,
-                embedding_cache: 20_000,
-                max_batch_size: 512,
-                bm25_corpus_cap: 400_000,
-                max_kg_nodes: 500_000,
-            },
+        let (memory_limit_mb, max_chunks, embedding_cache, bm25_corpus_cap, max_kg_nodes) =
+            match self {
+                MemoryTier::Medium => (4_096, 200_000, 5_000, 100_000, 150_000),
+                MemoryTier::Large => (8_192, 400_000, 10_000, 200_000, 300_000),
+                MemoryTier::XLarge => (16_384, 800_000, 20_000, 400_000, 500_000),
+            };
+        TierDefaults {
+            memory_limit_mb,
+            max_chunks,
+            embedding_cache,
+            max_batch_size: compute_max_batch_size(memory_limit_mb),
+            bm25_corpus_cap,
+            max_kg_nodes,
         }
     }
 }
@@ -158,13 +189,23 @@ impl MemoryPolicy {
         let tier = MemoryTier::from_total_ram_mb(total_ram_mb);
         let d = tier.defaults();
 
+        // Resolve memory limit first so the derived max_batch_size default
+        // tracks any TRUSTY_MEMORY_LIMIT_MB override. TRUSTY_MAX_BATCH_SIZE
+        // still wins when explicitly set. See issue #95.
+        let memory_limit_mb = env_override_usize("TRUSTY_MEMORY_LIMIT_MB", d.memory_limit_mb);
+        let derived_batch_size = if memory_limit_mb == d.memory_limit_mb {
+            d.max_batch_size
+        } else {
+            compute_max_batch_size(memory_limit_mb)
+        };
+
         let policy = MemoryPolicy {
             total_ram_mb,
             tier,
-            memory_limit_mb: env_override_usize("TRUSTY_MEMORY_LIMIT_MB", d.memory_limit_mb),
+            memory_limit_mb,
             max_chunks: env_override_usize("TRUSTY_MAX_CHUNKS", d.max_chunks),
             embedding_cache: env_override_usize("TRUSTY_EMBEDDING_CACHE", d.embedding_cache),
-            max_batch_size: env_override_usize("TRUSTY_MAX_BATCH_SIZE", d.max_batch_size),
+            max_batch_size: env_override_usize("TRUSTY_MAX_BATCH_SIZE", derived_batch_size),
             bm25_corpus_cap: env_override_usize("TRUSTY_BM25_CORPUS_CAP", d.bm25_corpus_cap),
             max_kg_nodes: env_override_usize("TRUSTY_MAX_KG_NODES", d.max_kg_nodes),
         };
@@ -323,12 +364,37 @@ mod tests {
         let medium = MemoryTier::Medium.defaults();
         assert_eq!(medium.memory_limit_mb, 4_096);
         assert_eq!(medium.max_chunks, 200_000);
+        // max_batch_size = floor(4096 * 0.75 / 55) = floor(55.85) = 55
+        assert_eq!(medium.max_batch_size, 55);
+
+        let large = MemoryTier::Large.defaults();
+        assert_eq!(large.memory_limit_mb, 8_192);
+        // max_batch_size = floor(8192 * 0.75 / 55) = floor(111.71) = 111
+        assert_eq!(large.max_batch_size, 111);
 
         let xl = MemoryTier::XLarge.defaults();
         assert_eq!(xl.memory_limit_mb, 16_384);
         assert_eq!(xl.max_chunks, 800_000);
         assert_eq!(xl.embedding_cache, 20_000);
         assert_eq!(xl.max_kg_nodes, 500_000);
+        // max_batch_size = floor(16384 * 0.75 / 55) = floor(223.42) = 223
+        assert_eq!(xl.max_batch_size, 223);
+    }
+
+    #[test]
+    fn test_compute_max_batch_size_from_limit() {
+        // Tier table per issue #95.
+        assert_eq!(compute_max_batch_size(4_096), 55);
+        assert_eq!(compute_max_batch_size(8_192), 111);
+        assert_eq!(compute_max_batch_size(16_384), 223);
+
+        // Floor clamp: tiny limits still produce a usable batch size.
+        assert_eq!(compute_max_batch_size(0), MIN_COMPUTED_BATCH_SIZE);
+        assert_eq!(compute_max_batch_size(1_024), MIN_COMPUTED_BATCH_SIZE);
+
+        // Ceiling clamp: enormous limits don't push past historical cap.
+        assert_eq!(compute_max_batch_size(64_000), MAX_COMPUTED_BATCH_SIZE);
+        assert_eq!(compute_max_batch_size(1_000_000), MAX_COMPUTED_BATCH_SIZE);
     }
 
     /// Verify that an env-var override beats the tier default.
