@@ -35,8 +35,24 @@ static BUG_DEBT_RE: OnceLock<Regex> = OnceLock::new();
 static ENTITY_DEF_RE: OnceLock<Regex> = OnceLock::new();
 static ENTITY_USAGE_RE: OnceLock<Regex> = OnceLock::new();
 static ENTITY_BUG_RE: OnceLock<Regex> = OnceLock::new();
+// Domain-term definition patterns (issue #88): PascalCase identifiers followed
+// by structural keywords, and standalone structural vocabulary words.
+static DOMAIN_DEF_RE: OnceLock<Regex> = OnceLock::new();
+// Extended bug/debt vocabulary (issue #88).
+static EXTENDED_BUG_RE: OnceLock<Regex> = OnceLock::new();
+// Long natural-language conceptual queries (issue #88): ≥6 words, no code tokens.
+static LONG_NL_RE: OnceLock<Regex> = OnceLock::new();
 
 impl QueryClassifier {
+    /// Classify a query string into a `QueryIntent` for routing weight selection.
+    ///
+    /// Why: different query shapes benefit from different BM25/vector balance;
+    /// classifying up-front lets the search pipeline pick optimal weights without
+    /// per-result heuristics.
+    /// What: applies a priority-ordered chain of regex patterns; the first match
+    /// wins. Entity-relationship keywords (issue #21) and domain-term definitions
+    /// (issue #88) are checked before the generic structural patterns.
+    /// Test: see the `#[cfg(test)]` module below for representative examples per intent.
     pub fn classify(query: &str) -> QueryIntent {
         let def_re = DEFINITION_RE.get_or_init(|| {
             Regex::new(
@@ -62,8 +78,45 @@ impl QueryClassifier {
         let entity_bug_re =
             ENTITY_BUG_RE.get_or_init(|| Regex::new(r"(?i)\b(raises|documented by)\b").unwrap());
 
-        // Entity-keyword hits take precedence over the generic patterns when
-        // the user explicitly asks an entity-relationship question.
+        // Domain-term definition patterns (issue #88).
+        //
+        // Pattern A: a standalone structural/schema keyword used as a noun
+        //   → "definition", "interface", "schema", "enum", "model" as a whole word.
+        // Pattern B: a PascalCase identifier immediately followed by a structural
+        //   keyword → "RoomType definition", "Hotel struct", "UserRole enum".
+        let domain_def_re = DOMAIN_DEF_RE.get_or_init(|| {
+            Regex::new(
+                r"(?x)
+                # Pattern A — standalone structural vocabulary word
+                (?i)\b(definition|interface|schema|model)\b
+                |
+                # Pattern B — PascalCase identifier + structural keyword
+                \b[A-Z][a-zA-Z0-9]+\s+(?i)(definition|struct|class|interface|type|schema|enum|trait|model)\b
+                ",
+            )
+            .unwrap()
+        });
+
+        // Extended bug/debt vocabulary (issue #88).
+        let extended_bug_re = EXTENDED_BUG_RE.get_or_init(|| {
+            Regex::new(
+                r"(?i)\b(error\s+handling|deprecated|legacy|missing\s+validation|hardcoded)\b",
+            )
+            .unwrap()
+        });
+
+        // Long natural-language conceptual query (issue #88): ≥6 whitespace-
+        // separated tokens with no code punctuation (`(`, `:`, `_`, `.`).
+        let long_nl_re = LONG_NL_RE.get_or_init(|| {
+            // A "code token" is any character in: ( ) : _ .
+            // We match queries that have ≥6 word characters separated by spaces and
+            // contain none of the above punctuation.
+            Regex::new(r"^[^():_.]+(?:\s+[^():_.]+){5,}$").unwrap()
+        });
+
+        // Priority chain — most-specific patterns first.
+
+        // Entity-keyword hits take precedence over generic patterns (issue #21).
         if entity_usage_re.is_match(query) {
             return QueryIntent::Usage;
         }
@@ -71,6 +124,17 @@ impl QueryClassifier {
             return QueryIntent::Definition;
         }
         if entity_bug_re.is_match(query) {
+            return QueryIntent::BugDebt;
+        }
+
+        // Domain-term definition patterns (issue #88) evaluated before the
+        // generic `def_re` so "enum" / "interface" etc. are not missed.
+        if domain_def_re.is_match(query) {
+            return QueryIntent::Definition;
+        }
+
+        // Extended bug/debt vocabulary (issue #88).
+        if extended_bug_re.is_match(query) {
             return QueryIntent::BugDebt;
         }
 
@@ -86,6 +150,15 @@ impl QueryClassifier {
         if bug_re.is_match(query) {
             return QueryIntent::BugDebt;
         }
+
+        // Long natural-language query with no code tokens → Conceptual (issue #88).
+        // Checked after all keyword patterns so that long queries containing
+        // code tokens still fall through to the generic patterns.
+        let trimmed = query.trim();
+        if long_nl_re.is_match(trimmed) {
+            return QueryIntent::Conceptual;
+        }
+
         QueryIntent::Unknown
     }
 }
@@ -204,5 +277,151 @@ mod tests {
             QueryClassifier::classify("ParseError documented by docs/errors.md"),
             QueryIntent::BugDebt
         );
+    }
+
+    // ── Domain-term definition tests (issue #88) ────────────────────────────
+
+    #[test]
+    fn test_domain_word_definition_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("RoomType definition"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_domain_pascal_struct_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("Hotel struct"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_domain_pascal_interface_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("BookingRepository interface"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_domain_pascal_enum_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("UserRole enum"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_standalone_schema_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("schema for reservations"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_standalone_interface_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("interface for payment processor"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_standalone_model_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("model for user accounts"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_domain_pascal_type_is_definition() {
+        assert_eq!(
+            QueryClassifier::classify("ReservationStatus type"),
+            QueryIntent::Definition
+        );
+    }
+
+    // ── Extended BugDebt tests (issue #88) ──────────────────────────────────
+
+    #[test]
+    fn test_error_handling_is_bug_debt() {
+        assert_eq!(
+            QueryClassifier::classify("error handling in payment flow"),
+            QueryIntent::BugDebt
+        );
+    }
+
+    #[test]
+    fn test_deprecated_is_bug_debt() {
+        assert_eq!(
+            QueryClassifier::classify("deprecated authentication methods"),
+            QueryIntent::BugDebt
+        );
+    }
+
+    #[test]
+    fn test_legacy_is_bug_debt() {
+        assert_eq!(
+            QueryClassifier::classify("legacy session management code"),
+            QueryIntent::BugDebt
+        );
+    }
+
+    #[test]
+    fn test_missing_validation_is_bug_debt() {
+        assert_eq!(
+            QueryClassifier::classify("missing validation in user input"),
+            QueryIntent::BugDebt
+        );
+    }
+
+    #[test]
+    fn test_hardcoded_is_bug_debt() {
+        assert_eq!(
+            QueryClassifier::classify("hardcoded connection strings"),
+            QueryIntent::BugDebt
+        );
+    }
+
+    // ── Long natural-language conceptual tests (issue #88) ──────────────────
+
+    #[test]
+    fn test_long_nl_query_is_conceptual() {
+        assert_eq!(
+            QueryClassifier::classify("how the reservation system handles overbooking scenarios"),
+            QueryIntent::Conceptual
+        );
+    }
+
+    #[test]
+    fn test_long_nl_query_without_code_tokens_is_conceptual() {
+        assert_eq!(
+            QueryClassifier::classify("what happens when a payment method expires"),
+            QueryIntent::Conceptual
+        );
+    }
+
+    #[test]
+    fn test_long_query_with_code_token_not_long_nl_conceptual() {
+        // Contains `_` so the long-NL path should NOT fire. The query may still
+        // be classified Conceptual via "how does" in the generic pattern — that
+        // is correct behaviour. This test verifies that the long-NL path requires
+        // no code tokens by using a query that has no other conceptual keywords.
+        let result =
+            QueryClassifier::classify("the payment_processor retries failed attempts five times");
+        // Contains `_` → long-NL rule is suppressed; no other keyword match → Unknown
+        assert_eq!(result, QueryIntent::Unknown);
+    }
+
+    #[test]
+    fn test_short_nl_query_not_forced_conceptual() {
+        // Only 3 words — should not match the ≥6-word pattern
+        let result = QueryClassifier::classify("reservation booking flow");
+        // May be Unknown, not forced to Conceptual
+        assert_ne!(result, QueryIntent::Conceptual);
     }
 }

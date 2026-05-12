@@ -2293,35 +2293,52 @@ fn launchd_log_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// Render the `<key>EnvironmentVariables</key>` plist fragment for all
-/// memory-limit env vars that are currently set in the process environment.
+/// Render the `<key>EnvironmentVariables</key>` plist fragment.
 ///
 /// Why: launchd re-spawns the daemon without the user's shell environment.
-/// Embedding env vars directly in the plist (rather than relying solely on
-/// `daemon.env`) provides a belt-and-suspenders guarantee: even if
-/// `load_daemon_env` is not called early enough, launchd itself passes the
-/// vars. If no vars are set the section is omitted — the daemon falls back
-/// to `daemon.env` and compiled-in defaults.
-/// What: iterates `PERSISTED_ENV_VARS`, emits plist key/string pairs only
-/// for vars that are set; returns an empty string if none are set.
-/// Test: set `TRUSTY_MEMORY_LIMIT_MB=4096`, call `launchd_env_vars_plist()`,
-/// assert the output contains the corresponding `<key>` / `<string>` block.
+/// Embedding env vars directly in the plist provides a belt-and-suspenders
+/// guarantee for operator tunables, and pins `HF_HOME` to the user's standard
+/// Hugging Face cache directory so fastembed-rs never inherits a non-standard
+/// or read-only `HF_HOME` that was set in an earlier shell session (fixes #86).
+/// What: always emits an `HF_HOME` entry resolved at install time, plus any
+/// `PERSISTED_ENV_VARS` that are currently set.
+/// Test: call `launchd_env_vars_plist()` with HOME set; assert output contains
+/// `<key>HF_HOME</key>` and the resolved path ends in `.cache/huggingface`.
 #[cfg(target_os = "macos")]
 fn launchd_env_vars_plist() -> String {
     use crate::service::PERSISTED_ENV_VARS;
-    let pairs: Vec<String> = PERSISTED_ENV_VARS
-        .iter()
-        .filter_map(|key| {
-            std::env::var(key).ok().map(|val| {
-                // XML-escape the value to handle characters that would break plist.
-                let escaped = val
-                    .replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;");
-                format!("        <key>{key}</key>\n        <string>{escaped}</string>")
-            })
-        })
-        .collect();
+
+    let xml_escape = |s: &str| -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+
+    let mut pairs: Vec<String> = Vec::new();
+
+    // Always pin HF_HOME to $HOME/.cache/huggingface resolved at install time.
+    // fastembed-rs follows HF_HOME when present; if it points at a read-only
+    // location (e.g. a previous admin install) the embedder silently falls
+    // back to BM25-only mode. Setting it here guarantees the correct writable
+    // path regardless of what the operator's shell had in HF_HOME.
+    if let Some(home) = dirs::home_dir() {
+        let hf_home = home.join(".cache").join("huggingface");
+        let escaped = xml_escape(&hf_home.display().to_string());
+        pairs.push(format!(
+            "        <key>HF_HOME</key>\n        <string>{escaped}</string>"
+        ));
+    }
+
+    // Append operator tunables (TRUSTY_* vars) that are currently set.
+    for key in PERSISTED_ENV_VARS {
+        if let Ok(val) = std::env::var(key) {
+            let escaped = xml_escape(&val);
+            pairs.push(format!(
+                "        <key>{key}</key>\n        <string>{escaped}</string>"
+            ));
+        }
+    }
+
     if pairs.is_empty() {
         String::new()
     } else {

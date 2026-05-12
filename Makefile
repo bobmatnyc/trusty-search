@@ -14,7 +14,7 @@ UI_DIR      := ui
 UI_DIST     := $(UI_DIR)/dist
 UI_EMBED    := ui-dist
 
-.PHONY: ui build-ui sync-ui release-prep check clippy test
+.PHONY: ui build-ui sync-ui release-prep reinstall check clippy test
 
 ## Build Svelte UI (pnpm preferred, npm fallback)
 build-ui:
@@ -39,6 +39,15 @@ release-prep: build-ui sync-ui
 
 ## Convenience alias
 ui: build-ui
+
+## Stop daemon, install new binary from source, restart (closes #87)
+## Why: replacing the binary while the daemon is running causes macOS to
+## SIGKILL the process; stopping first ensures a clean handoff.
+reinstall: ## Stop daemon, install new binary, restart with saved config
+	trusty-search stop 2>/dev/null || true
+	sleep 2
+	cargo install --path . --locked
+	trusty-search start
 
 ## Quick local quality gate
 check:
