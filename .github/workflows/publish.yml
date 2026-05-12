@@ -79,7 +79,7 @@ jobs:
       - name: Publish trusty-search
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run
+            cargo publish --dry-run --allow-dirty
           else
-            cargo publish --no-verify
+            cargo publish --no-verify --allow-dirty
           fi
