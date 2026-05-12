@@ -48,6 +48,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Remove local [patch.crates-io] overrides (CI uses published crates)
+        run: |
+          python3 - <<'EOF'
+          import re
+          content = open("Cargo.toml").read()
+          content = re.sub(
+              r"\[patch\.crates-io\].*?(?=\n\[|\Z)",
+              "",
+              content,
+              flags=re.DOTALL,
+          )
+          open("Cargo.toml", "w").write(content)
+          EOF
+
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
 
