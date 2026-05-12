@@ -231,6 +231,390 @@ pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, f
     spawn_reindex_with_cleanup(handle, progress, force, None);
 }
 
+/// Walk every configured subtree under `handle.root_path`, apply repo-config
+/// filters (`exclude_globs`, `extensions`), and de-duplicate.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// orchestrator body is dominated by control flow rather than walker plumbing.
+/// `include_paths` empty → walk the whole `root_path`; otherwise walk each
+/// configured subtree and concatenate (this is how `trusty-search.yaml` slices
+/// a polyrepo into independent indexes).
+/// What: returns the merged `WalkResult` whose `files` are sorted and unique.
+/// Test: covered by `reindex_honours_include_paths_filter` below.
+fn collect_files_to_index(handle: &IndexHandle) -> crate::service::walker::WalkResult {
+    let include_paths: Vec<PathBuf> = if handle.include_paths.is_empty() {
+        vec![handle.root_path.clone()]
+    } else {
+        handle.include_paths.clone()
+    };
+    let mut walked_files: Vec<PathBuf> = Vec::new();
+    let mut total_skipped_dirs: usize = 0;
+    for subtree in &include_paths {
+        let w = walk_source_files(subtree);
+        walked_files.extend(w.files);
+        total_skipped_dirs = total_skipped_dirs.saturating_add(w.skipped_dirs);
+    }
+
+    // Apply repo-config filters. These are AND-composed on top of the
+    // walker's built-in ignores (`SKIP_DIRS`, `should_skip_path`).
+    //
+    // 1. `exclude_globs`: drop any file whose path matches one of the
+    //    user-supplied glob patterns.
+    // 2. `extensions`: when non-empty, keep only files whose extension
+    //    appears in the allow-list (caller writes them without the leading
+    //    dot, e.g. `["rs", "py"]`).
+    if !handle.exclude_globs.is_empty() {
+        let excludes = handle.exclude_globs.clone();
+        walked_files.retain(|p| !crate::core::repo_config::path_matches_any_glob(p, &excludes));
+    }
+    if !handle.extensions.is_empty() {
+        let allowed = handle.extensions.clone();
+        walked_files.retain(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| allowed.iter().any(|x| x.eq_ignore_ascii_case(e)))
+                .unwrap_or(false)
+        });
+    }
+
+    // De-duplicate when multiple `include_paths` overlap (e.g. `["."]` plus
+    // `["src"]`). `walk_source_files` returns canonicalised paths inside each
+    // subtree but doesn't dedupe across subtrees.
+    walked_files.sort();
+    walked_files.dedup();
+
+    crate::service::walker::WalkResult {
+        files: walked_files,
+        skipped_dirs: total_skipped_dirs,
+    }
+}
+
+/// Spawn the background RSS poller that watches for `TRUSTY_MEMORY_LIMIT_MB`
+/// breaches. Returns the join handle plus a stop-flag the caller flips when
+/// the reindex finishes.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// memory-protection plumbing is isolated from the batch loop. Always run
+/// even when no `mem_limit` is configured so `peak_rss_mb` is accurate for
+/// the final log line — the overhead is one sysinfo refresh per second.
+/// What: ticks every `MEM_POLL_INTERVAL`, updates `peak_rss` monotonically,
+/// and trips `mem_abort` the first time RSS crosses `mem_limit`.
+fn spawn_memory_poller(
+    mem_limit: Option<u64>,
+    mem_abort: Arc<AtomicBool>,
+    peak_rss: Arc<AtomicU64>,
+    index_id: String,
+) -> (tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+    /// How often the background poller samples RSS. 1 s strikes a balance
+    /// between catching mid-batch spikes and the cost of
+    /// `sysinfo::refresh_processes_specifics` (~1–3 ms on macOS).
+    const MEM_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MEM_POLL_INTERVAL);
+        // Drop the immediate first tick so we don't double-sample with the
+        // synchronous `current_rss_mb()` already done before spawning.
+        ticker.tick().await;
+        loop {
+            if stop_clone.load(AtomicOrdering::Acquire) {
+                break;
+            }
+            if let Some(rss) = current_rss_mb() {
+                // Update peak monotonically (CAS loop: the post-commit RSS
+                // check on the main task can race this poller).
+                let mut prev = peak_rss.load(AtomicOrdering::Acquire);
+                while rss > prev {
+                    match peak_rss.compare_exchange_weak(
+                        prev,
+                        rss,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(cur) => prev = cur,
+                    }
+                }
+                if let Some(limit) = mem_limit {
+                    if rss >= limit && !mem_abort.load(AtomicOrdering::Acquire) {
+                        tracing::warn!(
+                            "reindex memory poller: rss={}MB >= limit={}MB \
+                             — tripping abort flag for index {}",
+                            rss,
+                            limit,
+                            index_id,
+                        );
+                        mem_abort.store(true, AtomicOrdering::Release);
+                        // Keep polling so peak_rss continues to track until
+                        // the main loop notices the flag.
+                    }
+                }
+            }
+            ticker.tick().await;
+        }
+    });
+    (handle, stop)
+}
+
+/// Schedule deferred GC of the `reindex_progress` map entry for this index.
+///
+/// Why: issue #75 — bounds long-running daemon memory by GC'ing stale progress
+/// entries while still letting late SSE subscribers read the final
+/// `complete` / `error` event for `REINDEX_PROGRESS_TTL_SECS`.
+fn schedule_progress_cleanup(
+    cleanup_map: Option<Arc<DashMap<IndexId, Arc<ReindexProgress>>>>,
+    cleanup_id: IndexId,
+) {
+    let Some(map) = cleanup_map else {
+        return;
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(REINDEX_PROGRESS_TTL_SECS)).await;
+        map.remove(&cleanup_id);
+    });
+}
+
+/// Shared context threaded into `process_one_batch` so the per-batch helper
+/// doesn't take a dozen arguments. Cheap to clone (everything is `Arc` /
+/// `PathBuf` / scalar).
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// orchestrator's per-batch body is testable and bounded in size.
+struct BatchCtx {
+    handle: Arc<IndexHandle>,
+    progress: Arc<ReindexProgress>,
+    root: PathBuf,
+    index_id: IndexId,
+    hashes: Arc<DashMap<PathBuf, String>>,
+    mem_limit: Option<u64>,
+    mem_abort: Arc<AtomicBool>,
+    peak_rss_atomic: Arc<AtomicU64>,
+    started: Instant,
+    total: usize,
+}
+
+/// What a single batch contributed to the run-level totals. The orchestrator
+/// folds each `BatchOutcome` into its accumulators and breaks the batch loop
+/// when `mem_limit_hit` is set.
+#[derive(Default)]
+struct BatchOutcome {
+    parse_ms: u64,
+    embed_ms: u64,
+    bm25_ms: u64,
+    vector_upsert_ms: u64,
+    vector_count: usize,
+    /// True when the post-commit RSS check tripped the abort flag — caller
+    /// must break out of the batch loop.
+    mem_limit_hit: bool,
+}
+
+/// Process a single batch end-to-end: read files, filter (hash-skip,
+/// minified), parse+embed, commit, emit SSE events, and run the post-commit
+/// memory check.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) to bring the
+/// orchestrator's cyclomatic complexity below the threshold. Combines the
+/// stages that share read/filter state into one function whose responsibility
+/// is "advance the index by one batch".
+async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
+    use std::sync::atomic::Ordering;
+
+    // 1) Read every file in the batch concurrently.
+    let read_futs = batch.iter().map(|path| {
+        let path = path.clone();
+        async move {
+            let content = tokio::fs::read_to_string(&path).await;
+            (path, content)
+        }
+    });
+    let read_results = futures::future::join_all(read_futs).await;
+
+    // 2) Build the batch payload, applying read-error, minified, and
+    //    hash-skip filters. Each drop emits the right SSE event so the UI
+    //    progress bar advances even for skipped/error files.
+    let mut to_index: Vec<(String, String)> = Vec::with_capacity(batch.len());
+    let mut to_index_paths: Vec<PathBuf> = Vec::with_capacity(batch.len());
+    let mut new_hashes: Vec<(PathBuf, String)> = Vec::with_capacity(batch.len());
+    for (path, content_res) in read_results {
+        let rel = path
+            .strip_prefix(&ctx.root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let content = match content_res {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.progress.errors.fetch_add(1, Ordering::Release);
+                ctx.progress
+                    .push(serde_json::json!({
+                        "event": "error",
+                        "file": rel,
+                        "message": format!("read: {e}"),
+                        "indexed": ctx.progress.indexed.load(Ordering::Acquire),
+                        "total_files": ctx.total,
+                    }))
+                    .await;
+                continue;
+            }
+        };
+        if should_skip_content(&path, &content) {
+            tracing::debug!("reindex: skipping minified content in {}", path.display());
+            ctx.progress.skipped.fetch_add(1, Ordering::Release);
+            let indexed = ctx.progress.indexed.fetch_add(1, Ordering::Release) + 1;
+            ctx.progress
+                .push(serde_json::json!({
+                    "event": "skip",
+                    "file": rel,
+                    "reason": "minified",
+                    "indexed": indexed,
+                    "total_files": ctx.total,
+                }))
+                .await;
+            continue;
+        }
+        let h = hash_content(&content);
+        if ctx
+            .hashes
+            .get(&path)
+            .map(|prev| *prev == h)
+            .unwrap_or(false)
+        {
+            ctx.progress.skipped.fetch_add(1, Ordering::Release);
+            let indexed = ctx.progress.indexed.fetch_add(1, Ordering::Release) + 1;
+            ctx.progress
+                .push(serde_json::json!({
+                    "event": "skip",
+                    "file": rel,
+                    "indexed": indexed,
+                    "total_files": ctx.total,
+                }))
+                .await;
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        to_index.push((path_str, content));
+        to_index_paths.push(path.clone());
+        new_hashes.push((path, h));
+    }
+
+    if to_index.is_empty() {
+        return BatchOutcome::default();
+    }
+
+    // 3) Bulk-index: parse+embed under a read lock (pure CPU/ONNX, no write
+    //    lock held), then commit under a write lock. Search and the next
+    //    batch's I/O proceed unblocked during parse+embed.
+    let result: anyhow::Result<(u64, u64, usize, CommitTimings)> = async {
+        let parsed = {
+            let indexer = ctx.handle.indexer.read().await;
+            indexer.parse_and_embed_files(to_index.clone()).await?
+        };
+        let parse_ms = parsed.parse_ms;
+        let embed_ms = parsed.embed_ms;
+        let vector_count = parsed.vector_count;
+        let indexer = ctx.handle.indexer.write().await;
+        let commit = indexer.commit_parsed_batch(parsed, true).await?;
+        Ok((parse_ms, embed_ms, vector_count, commit))
+    }
+    .await;
+
+    let (parse_ms, embed_ms, vector_count, commit) = match result {
+        Ok(t) => t,
+        Err(e) => {
+            // Whole batch failed — surface one error event listing the
+            // affected files. Caller can retry individually via `index_file`.
+            let files_in_batch: Vec<String> = to_index_paths
+                .iter()
+                .map(|p| p.strip_prefix(&ctx.root).unwrap_or(p).display().to_string())
+                .collect();
+            ctx.progress
+                .errors
+                .fetch_add(to_index_paths.len(), Ordering::Release);
+            ctx.progress
+                .push(serde_json::json!({
+                    "event": "error",
+                    "files": files_in_batch,
+                    "message": format!("batch index: {e}"),
+                    "indexed": ctx.progress.indexed.load(Ordering::Acquire),
+                    "total_files": ctx.total,
+                }))
+                .await;
+            return BatchOutcome::default();
+        }
+    };
+
+    // 4) Apply success: update totals via the returned `BatchOutcome`,
+    //    persist new hashes, emit the `batch` SSE event.
+    let new_chunks = commit.chunks;
+    ctx.progress
+        .total_chunks
+        .fetch_add(new_chunks, Ordering::Release);
+    let batch_files = to_index.len();
+    let indexed = ctx
+        .progress
+        .indexed
+        .fetch_add(batch_files, Ordering::Release)
+        + batch_files;
+    let elapsed_ms = ctx.started.elapsed().as_millis() as u64;
+    let chunks_per_sec = (ctx.progress.total_chunks.load(Ordering::Acquire) as u64 * 1000)
+        .checked_div(elapsed_ms)
+        .unwrap_or(0);
+    for (path, h) in new_hashes {
+        ctx.hashes.insert(path, h);
+    }
+    // Issue #75: cap per-index hash-cache size. Pure speed cache, so arbitrary
+    // eviction is always safe.
+    shrink_hashes_if_needed(&ctx.hashes);
+    ctx.progress
+        .push(serde_json::json!({
+            "event": "batch",
+            "batch_files": batch_files,
+            "batch_chunks": new_chunks,
+            "indexed": indexed,
+            "total_files": ctx.total,
+            "elapsed_ms": elapsed_ms,
+            "chunks_per_sec": chunks_per_sec,
+        }))
+        .await;
+
+    // 5) Post-commit memory check (issue #82): the commit phase (HNSW insert +
+    //    redb write + BM25 update) is the single largest in-batch allocator.
+    //    Sampling RSS here, in addition to the pre-batch abort-flag check,
+    //    means a runaway batch can only push RSS one batch over the limit
+    //    before being noticed.
+    let mut mem_limit_hit = false;
+    if let Some(limit) = ctx.mem_limit {
+        if let Some(rss) = current_rss_mb() {
+            let prev_peak = ctx.peak_rss_atomic.load(AtomicOrdering::Acquire);
+            if rss > prev_peak {
+                ctx.peak_rss_atomic.store(rss, AtomicOrdering::Release);
+            }
+            if rss >= limit {
+                tracing::warn!(
+                    "reindex: memory limit hit after commit \
+                     (rss={}MB >= limit={}MB) — skipping \
+                     remaining batches for index {}",
+                    rss,
+                    limit,
+                    ctx.index_id.0
+                );
+                ctx.mem_abort.store(true, AtomicOrdering::Release);
+                mem_limit_hit = true;
+            }
+        }
+    }
+
+    BatchOutcome {
+        parse_ms,
+        embed_ms,
+        bm25_ms: commit.bm25_ms,
+        vector_upsert_ms: commit.vector_upsert_ms,
+        vector_count,
+        mem_limit_hit,
+    }
+}
+
 /// Variant of `spawn_reindex` that GC's the progress map after completion.
 /// See `spawn_reindex` for the rationale.
 pub fn spawn_reindex_with_cleanup(
@@ -256,56 +640,8 @@ pub fn spawn_reindex_with_cleanup(
         let root = handle.root_path.clone();
         let index_id: IndexId = handle.id.clone();
 
-        // Determine which subtrees to walk. With no `include_paths` on the
-        // handle (the common single-index case) we walk the entire root.
-        // Otherwise we run one walk per configured subtree and concatenate —
-        // this is how `trusty-search.yaml` slices a polyrepo into independent
-        // indexes.
-        let include_paths: Vec<PathBuf> = if handle.include_paths.is_empty() {
-            vec![root.clone()]
-        } else {
-            handle.include_paths.clone()
-        };
-        let mut walked_files: Vec<PathBuf> = Vec::new();
-        let mut total_skipped_dirs: usize = 0;
-        for subtree in &include_paths {
-            let w = walk_source_files(subtree);
-            walked_files.extend(w.files);
-            total_skipped_dirs = total_skipped_dirs.saturating_add(w.skipped_dirs);
-        }
-
-        // Apply repo-config filters. These are AND-composed on top of the
-        // walker's built-in ignores (`SKIP_DIRS`, `should_skip_path`).
-        //
-        // 1. `exclude_globs`: drop any file whose path matches one of the
-        //    user-supplied glob patterns.
-        // 2. `extensions`: when non-empty, keep only files whose extension
-        //    appears in the allow-list (caller writes them without the
-        //    leading dot, e.g. `["rs", "py"]`).
-        if !handle.exclude_globs.is_empty() {
-            let excludes = handle.exclude_globs.clone();
-            walked_files.retain(|p| !crate::core::repo_config::path_matches_any_glob(p, &excludes));
-        }
-        if !handle.extensions.is_empty() {
-            let allowed = handle.extensions.clone();
-            walked_files.retain(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| allowed.iter().any(|x| x.eq_ignore_ascii_case(e)))
-                    .unwrap_or(false)
-            });
-        }
-
-        // De-duplicate when multiple `include_paths` overlap (e.g. `["."]` plus
-        // `["src"]`). `walk_source_files` returns canonicalised paths inside
-        // each subtree but doesn't dedupe across subtrees.
-        walked_files.sort();
-        walked_files.dedup();
-
-        let walk = crate::service::walker::WalkResult {
-            files: walked_files,
-            skipped_dirs: total_skipped_dirs,
-        };
+        // Phase 1: walk + filter the source tree (helper-extracted: issue #98).
+        let walk = collect_files_to_index(&handle);
         let total = walk.files.len();
         progress.total_files.store(total, Ordering::Release);
         progress
@@ -364,77 +700,35 @@ pub fn spawn_reindex_with_cleanup(
         let peak_rss_atomic = Arc::new(AtomicU64::new(current_rss_mb().unwrap_or(0)));
         let mut mem_limit_hit: bool = false;
 
-        /// How often the background poller samples RSS. 1 s strikes a
-        /// balance between catching mid-batch spikes and the cost of
-        /// `sysinfo::refresh_processes_specifics` (~1–3 ms on macOS).
-        const MEM_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        // Spawn the background poller (helper-extracted: issue #98). Runs
+        // until `poller_stop` flips, updating `peak_rss_atomic` and tripping
+        // `mem_abort` whenever RSS crosses `mem_limit`.
+        let (poller_handle, poller_stop) = spawn_memory_poller(
+            mem_limit,
+            mem_abort.clone(),
+            peak_rss_atomic.clone(),
+            index_id.0.clone(),
+        );
 
-        // Spawn the background poller. It runs until `poller_stop` flips,
-        // updating `peak_rss_atomic` and tripping `mem_abort` whenever RSS
-        // crosses `mem_limit`. When no limit is configured we still run the
-        // poller so `peak_rss_mb` is accurate for the final log line — the
-        // overhead is one sysinfo refresh per second.
-        let poller_stop = Arc::new(AtomicBool::new(false));
-        let poller_handle = {
-            let mem_abort = mem_abort.clone();
-            let peak_rss = peak_rss_atomic.clone();
-            let stop = poller_stop.clone();
-            let index_id_for_log = index_id.0.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(MEM_POLL_INTERVAL);
-                // Drop the immediate first tick so we don't double-sample
-                // with the synchronous `current_rss_mb()` already done above.
-                ticker.tick().await;
-                loop {
-                    if stop.load(AtomicOrdering::Acquire) {
-                        break;
-                    }
-                    if let Some(rss) = current_rss_mb() {
-                        // Update peak monotonically.
-                        let mut prev = peak_rss.load(AtomicOrdering::Acquire);
-                        while rss > prev {
-                            match peak_rss.compare_exchange_weak(
-                                prev,
-                                rss,
-                                AtomicOrdering::AcqRel,
-                                AtomicOrdering::Acquire,
-                            ) {
-                                Ok(_) => break,
-                                Err(cur) => prev = cur,
-                            }
-                        }
-                        if let Some(limit) = mem_limit {
-                            if rss >= limit && !mem_abort.load(AtomicOrdering::Acquire) {
-                                tracing::warn!(
-                                    "reindex memory poller: rss={}MB >= limit={}MB \
-                                     — tripping abort flag for index {}",
-                                    rss,
-                                    limit,
-                                    index_id_for_log,
-                                );
-                                mem_abort.store(true, AtomicOrdering::Release);
-                                // Keep polling so peak_rss continues to track
-                                // until the main loop notices the flag.
-                            }
-                        }
-                    }
-                    ticker.tick().await;
-                }
-            })
+        // Phase 2: batch-driven parse/embed/commit. The per-batch body lives
+        // in `process_one_batch`; the orchestrator here only observes the
+        // aggregate `BatchOutcome` and the mem-limit signal.
+        let ctx = BatchCtx {
+            handle: handle.clone(),
+            progress: progress.clone(),
+            root: root.clone(),
+            index_id: index_id.clone(),
+            hashes: hashes.clone(),
+            mem_limit,
+            mem_abort: mem_abort.clone(),
+            peak_rss_atomic: peak_rss_atomic.clone(),
+            started,
+            total,
         };
-
-        // Process files in batches. Each batch:
-        //  1. Reads files concurrently (tokio::fs::read_to_string).
-        //  2. Skips files whose content hash matches the previous reindex.
-        //  3. Calls `CodeIndexer::index_files_batch` — one ONNX call per
-        //     EMBED_BATCH_SIZE chunks across the whole batch, one symbol-graph
-        //     rebuild per batch.
         for batch in walk.files.chunks(REINDEX_BATCH_SIZE) {
-            // Memory-protection check (issues #76, #82). Honour the abort
-            // flag set by the background poller — checked on EVERY batch.
-            // Skipping remaining batches preserves all chunks already
-            // committed; a partial reindex is safer than an OOM-kill that
-            // loses the daemon's in-memory state entirely.
+            // Memory-protection pre-check (issues #76, #82): if the background
+            // poller has tripped the abort flag, bail out before doing more
+            // work. Skipping remaining batches preserves all committed chunks.
             if mem_abort.load(AtomicOrdering::Acquire) {
                 let rss = current_rss_mb().unwrap_or(0);
                 tracing::warn!(
@@ -447,199 +741,16 @@ pub fn spawn_reindex_with_cleanup(
                 mem_limit_hit = true;
                 break;
             }
-
-            // 1) Read all files in the batch concurrently.
-            let read_futs = batch.iter().map(|path| {
-                let path = path.clone();
-                async move {
-                    let content = tokio::fs::read_to_string(&path).await;
-                    (path, content)
-                }
-            });
-            let read_results = futures::future::join_all(read_futs).await;
-
-            // 2) Build the batch payload, applying hash-skip.
-            let mut to_index: Vec<(String, String)> = Vec::with_capacity(batch.len());
-            let mut to_index_paths: Vec<PathBuf> = Vec::with_capacity(batch.len());
-            let mut new_hashes: Vec<(PathBuf, String)> = Vec::with_capacity(batch.len());
-            for (path, content_res) in read_results {
-                let rel = path
-                    .strip_prefix(&root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string();
-                let content = match content_res {
-                    Ok(c) => c,
-                    Err(e) => {
-                        progress.errors.fetch_add(1, Ordering::Release);
-                        progress
-                            .push(serde_json::json!({
-                                "event": "error",
-                                "file": rel,
-                                "message": format!("read: {e}"),
-                                "indexed": progress.indexed.load(Ordering::Acquire),
-                                "total_files": total,
-                            }))
-                            .await;
-                        continue;
-                    }
-                };
-                // Content-level minification check. Catches minified bundles
-                // that don't carry a `.min.js` suffix — detected after read so
-                // we can inspect the actual line structure.
-                if should_skip_content(&path, &content) {
-                    tracing::debug!("reindex: skipping minified content in {}", path.display());
-                    progress.skipped.fetch_add(1, Ordering::Release);
-                    let indexed = progress.indexed.fetch_add(1, Ordering::Release) + 1;
-                    progress
-                        .push(serde_json::json!({
-                            "event": "skip",
-                            "file": rel,
-                            "reason": "minified",
-                            "indexed": indexed,
-                            "total_files": total,
-                        }))
-                        .await;
-                    continue;
-                }
-                let h = hash_content(&content);
-                if hashes.get(&path).map(|prev| *prev == h).unwrap_or(false) {
-                    progress.skipped.fetch_add(1, Ordering::Release);
-                    let indexed = progress.indexed.fetch_add(1, Ordering::Release) + 1;
-                    progress
-                        .push(serde_json::json!({
-                            "event": "skip",
-                            "file": rel,
-                            "indexed": indexed,
-                            "total_files": total,
-                        }))
-                        .await;
-                    continue;
-                }
-                let path_str = path.to_string_lossy().to_string();
-                to_index.push((path_str, content));
-                to_index_paths.push(path.clone());
-                new_hashes.push((path, h));
-            }
-
-            if to_index.is_empty() {
-                continue;
-            }
-
-            // 3) Bulk-index. We split the work into:
-            //    (a) parse + embed — pure CPU/ONNX, NO write lock required.
-            //        Concurrent searches and the next batch's I/O proceed
-            //        unblocked while this runs.
-            //    (b) commit — acquires the corpus/BM25/HNSW write locks for
-            //        the minimum window needed to install the new chunks.
-            //    The graph rebuild is deferred to the very end of the reindex
-            //    (one rebuild instead of one per batch).
-            // Each batch returns both the `ParsedBatch` timings (parse_ms,
-            // embed_ms, vector_count) and the `CommitTimings` (bm25_ms,
-            // vector_upsert_ms). We capture both so the orchestrator can
-            // accumulate per-subsystem totals across the whole reindex.
-            let result: anyhow::Result<(u64, u64, usize, CommitTimings)> = async {
-                let parsed = {
-                    let indexer = handle.indexer.read().await;
-                    indexer.parse_and_embed_files(to_index.clone()).await?
-                };
-                let parse_ms = parsed.parse_ms;
-                let embed_ms = parsed.embed_ms;
-                let vector_count = parsed.vector_count;
-                let indexer = handle.indexer.write().await;
-                let commit = indexer.commit_parsed_batch(parsed, true).await?;
-                Ok((parse_ms, embed_ms, vector_count, commit))
-            }
-            .await;
-            match result {
-                Ok((parse_ms, embed_ms, vector_count, commit)) => {
-                    let new_chunks = commit.chunks;
-                    total_parse_ms = total_parse_ms.saturating_add(parse_ms);
-                    total_embed_ms = total_embed_ms.saturating_add(embed_ms);
-                    total_bm25_ms = total_bm25_ms.saturating_add(commit.bm25_ms);
-                    total_vector_upsert_ms =
-                        total_vector_upsert_ms.saturating_add(commit.vector_upsert_ms);
-                    total_vector_count = total_vector_count.saturating_add(vector_count);
-                    progress
-                        .total_chunks
-                        .fetch_add(new_chunks, Ordering::Release);
-                    let batch_files = to_index.len();
-                    let indexed =
-                        progress.indexed.fetch_add(batch_files, Ordering::Release) + batch_files;
-                    let elapsed_ms = started.elapsed().as_millis() as u64;
-                    let chunks_per_sec = (progress.total_chunks.load(Ordering::Acquire) as u64
-                        * 1000)
-                        .checked_div(elapsed_ms)
-                        .unwrap_or(0);
-                    // Persist new content hashes for next reindex.
-                    for (path, h) in new_hashes {
-                        hashes.insert(path, h);
-                    }
-                    // Issue #75: cap per-index hash-cache size. This is a
-                    // pure speed cache (skip-unchanged) so arbitrary
-                    // eviction is always safe.
-                    shrink_hashes_if_needed(&hashes);
-                    progress
-                        .push(serde_json::json!({
-                            "event": "batch",
-                            "batch_files": batch_files,
-                            "batch_chunks": new_chunks,
-                            "indexed": indexed,
-                            "total_files": total,
-                            "elapsed_ms": elapsed_ms,
-                            "chunks_per_sec": chunks_per_sec,
-                        }))
-                        .await;
-                    // Post-commit memory check (issue #82). The commit phase
-                    // (HNSW insert + redb write + BM25 update) is the single
-                    // largest in-batch allocator. Sampling RSS *after* commit
-                    // — in addition to the pre-batch abort-flag check — means
-                    // a runaway batch can only push RSS one batch over the
-                    // limit before being noticed, instead of accumulating
-                    // across the previous `MEM_CHECK_EVERY_N_BATCHES` cadence.
-                    if let Some(limit) = mem_limit {
-                        if let Some(rss) = current_rss_mb() {
-                            let prev_peak = peak_rss_atomic.load(AtomicOrdering::Acquire);
-                            if rss > prev_peak {
-                                peak_rss_atomic.store(rss, AtomicOrdering::Release);
-                            }
-                            if rss >= limit {
-                                tracing::warn!(
-                                    "reindex: memory limit hit after commit \
-                                     (rss={}MB >= limit={}MB) — skipping \
-                                     remaining batches for index {}",
-                                    rss,
-                                    limit,
-                                    index_id.0
-                                );
-                                mem_abort.store(true, AtomicOrdering::Release);
-                                mem_limit_hit = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Whole batch failed — surface a single error event listing
-                    // the affected files. Caller can retry the failing files
-                    // individually via `index_file`.
-                    let files_in_batch: Vec<String> = to_index_paths
-                        .iter()
-                        .map(|p| p.strip_prefix(&root).unwrap_or(p).display().to_string())
-                        .collect();
-                    progress
-                        .errors
-                        .fetch_add(to_index_paths.len(), Ordering::Release);
-                    progress
-                        .push(serde_json::json!({
-                            "event": "error",
-                            "files": files_in_batch,
-                            "message": format!("batch index: {e}"),
-                            "indexed": progress.indexed.load(Ordering::Acquire),
-                            "total_files": total,
-                        }))
-                        .await;
-                }
+            let outcome = process_one_batch(&ctx, batch).await;
+            total_parse_ms = total_parse_ms.saturating_add(outcome.parse_ms);
+            total_embed_ms = total_embed_ms.saturating_add(outcome.embed_ms);
+            total_bm25_ms = total_bm25_ms.saturating_add(outcome.bm25_ms);
+            total_vector_upsert_ms =
+                total_vector_upsert_ms.saturating_add(outcome.vector_upsert_ms);
+            total_vector_count = total_vector_count.saturating_add(outcome.vector_count);
+            if outcome.mem_limit_hit {
+                mem_limit_hit = true;
+                break;
             }
         }
 
@@ -751,16 +862,9 @@ pub fn spawn_reindex_with_cleanup(
             }))
             .await;
 
-        // Issue #75: GC the progress entry after a short delay so the
-        // `reindex_progress` map doesn't grow unboundedly on long-running
-        // daemons. The delay lets late SSE subscribers read the final
-        // `complete`/`error` event before the map drops its reference.
-        if let Some(map) = cleanup_map {
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(REINDEX_PROGRESS_TTL_SECS)).await;
-                map.remove(&cleanup_id);
-            });
-        }
+        // Issue #75: GC the progress entry after a short delay
+        // (helper-extracted: issue #98).
+        schedule_progress_cleanup(cleanup_map, cleanup_id);
     });
 }
 
