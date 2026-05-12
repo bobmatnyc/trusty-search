@@ -254,7 +254,7 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
         if let Ok(lock) = crate::service::daemon_lock_path() {
             let _ = std::fs::remove_file(&lock);
         }
-        if let Some(port) = crate::daemon_port_path() {
+        if let Some(port) = super::daemon_utils::daemon_port_path() {
             let _ = std::fs::remove_file(&port);
         }
     }

@@ -1,6 +1,7 @@
 //! Handler for `trusty-search remove <file>`.
 
-use crate::{daemon_base_url, print_index_header, resolve_index};
+use super::daemon_utils::daemon_base_url;
+use super::index_resolve::{print_index_header, resolve_index};
 use anyhow::{bail, Result};
 use colored::Colorize;
 

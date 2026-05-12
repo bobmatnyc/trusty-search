@@ -1,19 +1,31 @@
 //! CLI subcommand handlers.
 //!
-//! Why: `main()` was a 945-line function with cyclomatic complexity ~113 because
-//! every subcommand was inlined into one giant `match`. This module splits each
-//! `Commands::*` variant into its own handler function so `main()` becomes a
-//! thin dispatcher and each handler stays under ~150 lines with cyclo < 20.
+//! Why: `main()` was a 2.7k-line file mixing clap argument definitions with
+//! subcommand implementations and ~50 helper functions. This module splits
+//! each `Commands::*` variant into its own handler plus a set of shared
+//! support modules (`daemon_utils`, `format`, `index_resolve`,
+//! `reindex_engine`, `doctor_checks`, `doctor_pipeline`) so `main.rs` becomes
+//! a thin clap-to-handler dispatcher.
 //!
-//! What: one module per subcommand. Handlers take the parsed argument fields
-//! plus any global flags they need (`index`, `json`). They return `Result<()>`
-//! and bubble user-facing errors via `anyhow::bail!` / `Err(...)` — the
-//! central `main()` dispatcher prints the friendly red-✗ line and chooses the
-//! exit code (issue #104, so handlers are testable without forking a process).
+//! What: one module per subcommand, plus a set of shared helper modules.
+//! Handlers take the parsed argument fields plus any global flags they need
+//! (`index`, `json`). They return `Result<()>` and bubble user-facing errors
+//! via `anyhow::bail!` / `Err(...)` — the central `main()` dispatcher prints
+//! the friendly red-✗ line and chooses the exit code (issue #104, so
+//! handlers are testable without forking a process).
 //!
 //! Test: `cargo build && cargo test --workspace` — no behaviour change; the
 //! refactor is purely structural.
 
+// Shared support modules
+pub mod daemon_utils;
+pub mod doctor_checks;
+pub(crate) mod doctor_pipeline;
+pub mod format;
+pub mod index_resolve;
+pub mod reindex_engine;
+
+// Per-subcommand handlers
 pub mod add;
 pub mod convert;
 pub mod daemon_guard;

@@ -1,6 +1,6 @@
 //! Handler for `trusty-search stop`.
 
-use crate::daemon_port_path;
+use super::daemon_utils::daemon_port_path;
 use anyhow::{bail, Result};
 use colored::Colorize;
 use std::time::{Duration, Instant};

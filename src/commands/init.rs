@@ -1,6 +1,6 @@
 //! Handler for `trusty-search init` (register an index without indexing).
 
-use crate::register_index_with_daemon;
+use super::reindex_engine::register_index_with_daemon;
 use anyhow::Result;
 use colored::Colorize;
 

@@ -1,6 +1,6 @@
 //! Handler for `trusty-search serve` — MCP server (stdio + optional HTTP/SSE).
 
-use crate::{daemon_base_url, http_addr_path};
+use super::daemon_utils::{daemon_base_url, http_addr_path};
 use anyhow::Result;
 use colored::Colorize;
 

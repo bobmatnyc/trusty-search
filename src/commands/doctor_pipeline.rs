@@ -7,71 +7,39 @@
 //! drops the orchestrator's CC to ~3, makes each check unit-testable, and
 //! lets new checks be added by implementing one trait method.
 //! What: defines the [`DoctorCheck`] trait, a shared [`DoctorState`] passed
-//! to every check, and the concrete check structs that wrap the existing
-//! pure helper functions in `main.rs`. The orchestrator [`run_doctor_checks`]
-//! walks the trait-object list and aggregates results.
+//! to every check, and the concrete check structs that wrap the pure helpers
+//! in `doctor_checks`. The orchestrator [`run_doctor_checks`] walks the
+//! trait-object list and aggregates results.
 //! Test: `cargo test --workspace` exercises the existing doctor integration
 //! tests; `cargo run -- doctor` produces byte-identical output to the
 //! pre-refactor implementation.
 
-use crate::{
+use super::daemon_utils::daemon_base_url;
+use super::doctor_checks::{
     check_daemon_running, check_data_dir, check_lock_file, check_model_cache, check_port_reachable,
-    daemon_base_url, doctor_data_dir, fetch_index_names, fetch_index_statuses,
-    print_index_breakdown, probe_daemon_health, read_daemon_port, summarize_indexes, CheckResult,
-    EmptyIndex,
+    doctor_data_dir, fetch_index_names, fetch_index_statuses, print_index_breakdown,
+    probe_daemon_health, read_daemon_port, summarize_indexes, CheckResult, EmptyIndex,
 };
 use async_trait::async_trait;
 use std::sync::Mutex;
 
 // ── Trait + shared state ──────────────────────────────────────────────────
 
-/// One diagnostic in the doctor pipeline.
-///
-/// Why: gives each check a stable, narrow interface (`name` for diagnostics,
-/// `run` for execution) so the orchestrator can iterate uniformly without
-/// caring about each check's internal dependencies.
-/// What: async trait returning zero or more [`CheckResult`]s. Most checks
-/// return exactly one result; the indexes check returns one summary plus
-/// any "no indexes registered" warning and performs its per-index printing
-/// as a side effect via [`DoctorState`].
-/// Test: see the concrete impls below; each is independently exercised by
-/// `cargo run -- doctor` against a known daemon state.
 #[async_trait]
 pub(crate) trait DoctorCheck: Send + Sync {
-    /// Human-readable name of the check (used in debug logs / future
-    /// `--verbose` output). Not currently rendered to the user because the
-    /// existing output format embeds the name in the result message.
     #[allow(dead_code)]
     fn name(&self) -> &str;
 
-    /// Run the check, returning every `CheckResult` it produced (zero or
-    /// more). Side effects (e.g. per-index breakdown prints, recording
-    /// empty indexes) flow through [`DoctorState`].
     async fn run(&self, state: &DoctorState) -> Vec<CheckResult>;
 }
 
-/// Shared state threaded through every [`DoctorCheck`].
-///
-/// Why: checks have heterogeneous dependencies (HTTP client, daemon base URL,
-/// data directory, daemon liveness). Bundling them into one struct keeps the
-/// trait signature stable as new checks are added.
-/// What: holds immutable runtime configuration plus interior-mutable slots
-/// for state that later checks depend on (`daemon_running`, `daemon_version`)
-/// and side-channel outputs (`empty_indexes` consumed by `--fix`).
-/// Test: constructed once in [`run_doctor_checks`]; verified by the doctor
-/// integration tests via end-to-end output.
 pub(crate) struct DoctorState {
     pub client: reqwest::Client,
     pub base: String,
     pub port: u16,
     pub data_dir: std::path::PathBuf,
-    /// Set by [`DaemonHealthCheck`]; read by [`LockFileCheck`] and
-    /// [`IndexesCheck`]. Mutex (not RwLock) because the critical section is
-    /// a single bool/string assignment.
     daemon_running: Mutex<bool>,
     daemon_version: Mutex<String>,
-    /// Populated by [`IndexesCheck`]; consumed by `--fix` after the doctor
-    /// run completes.
     empty_indexes: Mutex<Vec<EmptyIndex>>,
 }
 
@@ -119,8 +87,6 @@ impl DoctorState {
 
 // ── Concrete checks ───────────────────────────────────────────────────────
 
-/// Probe `/health` and record the daemon's liveness + version for later
-/// checks to read.
 pub(crate) struct DaemonHealthCheck;
 
 #[async_trait]
@@ -136,8 +102,6 @@ impl DoctorCheck for DaemonHealthCheck {
     }
 }
 
-/// Verify the fastembed ONNX model cache is present (or warn that it will
-/// be downloaded on first start).
 pub(crate) struct ModelCacheCheck;
 
 #[async_trait]
@@ -151,7 +115,6 @@ impl DoctorCheck for ModelCacheCheck {
     }
 }
 
-/// Check that the per-user data directory exists and is writable.
 pub(crate) struct DataDirCheck;
 
 #[async_trait]
@@ -165,7 +128,6 @@ impl DoctorCheck for DataDirCheck {
     }
 }
 
-/// Look for a stale `daemon.lock` (PID present but process dead).
 pub(crate) struct LockFileCheck;
 
 #[async_trait]
@@ -179,8 +141,6 @@ impl DoctorCheck for LockFileCheck {
     }
 }
 
-/// List registered indexes, fan-out status calls, print the breakdown, and
-/// record any zero-chunk indexes for `--fix`.
 pub(crate) struct IndexesCheck;
 
 #[async_trait]
@@ -218,7 +178,6 @@ impl DoctorCheck for IndexesCheck {
     }
 }
 
-/// TCP-reachability check for the daemon's listen port.
 pub(crate) struct PortReachableCheck;
 
 #[async_trait]
@@ -234,8 +193,6 @@ impl DoctorCheck for PortReachableCheck {
 
 // ── Orchestrator ──────────────────────────────────────────────────────────
 
-/// Construct the default pipeline. Order matters: the health check must run
-/// first so [`LockFileCheck`] and [`IndexesCheck`] can read its result.
 fn default_checks() -> Vec<Box<dyn DoctorCheck>> {
     vec![
         Box::new(DaemonHealthCheck),
@@ -249,16 +206,6 @@ fn default_checks() -> Vec<Box<dyn DoctorCheck>> {
 
 /// Drive the doctor pipeline and return `(checks, empty_indexes)` for the
 /// caller (and `--fix`) to consume.
-///
-/// Why: this is the cyclomatic-complexity-48 function that issue #60 asked
-/// us to decompose. After the trait refactor the orchestrator is a 3-line
-/// loop over `default_checks()`; new checks plug in by adding one Box.
-/// What: builds the HTTP client (returning an early error if that fails),
-/// constructs shared [`DoctorState`], iterates the pipeline in order, and
-/// flattens each check's result vector into a single output vector.
-/// Test: `cargo run -- doctor` produces the same six headings (daemon,
-/// model, data dir, lock, indexes, port) in the same order as before; the
-/// existing CLI integration tests cover the exit-code branch.
 pub(crate) async fn run_doctor_checks() -> (Vec<CheckResult>, Vec<EmptyIndex>) {
     let client = match trusty_common::server::daemon_http_client() {
         Ok(c) => c,

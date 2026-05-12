@@ -1,7 +1,8 @@
 //! Handler for `trusty-search watch`.
 
+use super::daemon_utils::daemon_base_url;
+use super::index_resolve::{print_index_header, resolve_index};
 use crate::detect::detect_project;
-use crate::{daemon_base_url, print_index_header, resolve_index};
 use anyhow::Result;
 use colored::Colorize;
 

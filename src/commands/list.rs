@@ -1,6 +1,6 @@
 //! Handler for `trusty-search list`.
 
-use crate::daemon_base_url;
+use super::daemon_utils::daemon_base_url;
 use anyhow::{bail, Result};
 use colored::Colorize;
 

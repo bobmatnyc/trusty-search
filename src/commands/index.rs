@@ -6,11 +6,12 @@
 //! so a single `trusty-search index` command can populate multiple named
 //! slices (e.g. `duetto-api` and `duetto-ui`).
 
-use crate::core::repo_config::{language_to_exts, IndexConfig, RepoConfig, CONFIG_FILENAME};
-use crate::{
-    daemon_base_url, register_index_with_daemon, register_index_with_daemon_filtered, run_reindex,
+use super::daemon_utils::daemon_base_url;
+use super::reindex_engine::{
+    register_index_with_daemon, register_index_with_daemon_filtered, run_reindex,
     run_reindex_force, RegisterFilters,
 };
+use crate::core::repo_config::{language_to_exts, IndexConfig, RepoConfig, CONFIG_FILENAME};
 use anyhow::Result;
 use colored::Colorize;
 

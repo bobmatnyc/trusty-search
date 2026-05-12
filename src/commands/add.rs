@@ -1,6 +1,8 @@
 //! Handler for `trusty-search add <file>`.
 
-use crate::{add_path, daemon_base_url, print_index_header, resolve_index};
+use super::daemon_utils::daemon_base_url;
+use super::index_resolve::{print_index_header, resolve_index};
+use super::reindex_engine::add_path;
 use anyhow::Result;
 
 /// Why: thin wrapper so `main()` doesn't need to know about `add_path` (which

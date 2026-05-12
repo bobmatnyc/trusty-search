@@ -1,7 +1,9 @@
 //! Handler for `trusty-search reindex` (bare reindex, no force/verify).
 
+use super::daemon_utils::daemon_base_url;
+use super::index_resolve::{print_index_header, resolve_index};
+use super::reindex_engine::run_reindex;
 use crate::detect::detect_project;
-use crate::{daemon_base_url, print_index_header, resolve_index, run_reindex};
 use anyhow::Result;
 
 /// Why: extracted from `main()`; behaviour unchanged.
