@@ -13,6 +13,21 @@ _(no unreleased changes)_
 
 ---
 
+## [0.3.27] - 2026-05-12
+
+### Fixed
+- **#87** macOS SIGKILL on binary replace: `trusty-search start` now exits with an error if a daemon is already running; `make install` and `make patch` stop the daemon before reinstalling the binary
+- **#82** Memory limit enforcement during reindex: tier-based hard caps on `TRUSTY_MAX_BATCH_SIZE` env-var overrides (Medium=64, Large=128, XLarge=256) prevent RSS spikes from misconfigured batch sizes; existing background RSS poller confirmed active
+- **#89** ORT ONNX arena pre-allocation: confirmed mitigated by `with_arena_allocator(false)`; tier hard caps add defense-in-depth
+
+### Improved
+- **#88** Intent classifier now recognises domain-term Definition queries: PascalCase/CamelCase identifiers, and standalone "definition"/"interface"/"schema"/"type"/"enum"/"model" trigger Definition intent
+- **#91** Compound noun classifier: CamelCase compound noun queries (e.g. "QueryClassifier intent classification") now route to Definition intent instead of Unknown
+- **#92** Definition-intent ranking: `.md`/`.toml`/`.json`/`.yaml` files scored at 0.5× in RRF fusion for Definition intent only; source files rank first for symbol lookups
+- **#94** KG expansion: results merged by score before `take(top_k)`; `hybrid+kg` match_reason now surfaces on large indexes
+
+---
+
 ## [0.1.46] — 4 indexing speed optimizations
 
 ### Performance
@@ -419,7 +434,8 @@ _(no unreleased changes)_
 - `IndexRegistry` with `DashMap` + `Arc<RwLock<CodeIndexer>>`
 - axum router skeleton
 
-[Unreleased]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.46...HEAD
+[Unreleased]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.27...HEAD
+[0.3.27]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.26...v0.3.27
 [0.1.46]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.45...v0.1.46
 [0.1.45]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.44...v0.1.45
 [0.1.44]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.43...v0.1.44
