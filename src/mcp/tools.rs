@@ -184,7 +184,7 @@ impl McpServer {
                 // also a pre-built `{query: object}` body for callers that
                 // need to pass advanced search parameters directly.
                 let body = match args.get("query") {
-                    Some(Value::Object(_)) => args.get("query").cloned().unwrap(),
+                    Some(v @ Value::Object(_)) => v.clone(),
                     Some(Value::String(text)) => {
                         let mut b = serde_json::json!({ "text": text });
                         if let Some(k) = args.get("top_k").and_then(Value::as_u64) {

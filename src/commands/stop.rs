@@ -1,7 +1,7 @@
 //! Handler for `trusty-search stop`.
 
 use crate::daemon_port_path;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use colored::Colorize;
 use std::time::{Duration, Instant};
 
@@ -45,8 +45,7 @@ pub async fn handle_stop() -> Result<()> {
     targets.retain(|&pid| pid != me);
 
     if targets.is_empty() {
-        eprintln!("{} No daemon running", "✗".red());
-        std::process::exit(1);
+        bail!("No daemon running");
     }
 
     if let Some(p) = primary_pid {

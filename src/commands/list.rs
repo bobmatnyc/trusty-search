@@ -1,16 +1,17 @@
 //! Handler for `trusty-search list`.
 
 use crate::daemon_base_url;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use colored::Colorize;
 
 /// Why: extracted so `main()` doesn't inline the GET `/indexes` plumbing.
 /// What: fetches the index list, prints it as plain text or JSON depending on
-/// the global `--json` flag. Exits 1 when the daemon is unreachable.
+/// the global `--json` flag. Returns `Err` when the daemon is unreachable;
+/// `main()` prints the friendly red-✗ line and exits 1 (issue #104).
 /// Test: `cargo run -- list` against a running daemon prints registered ids.
 pub async fn handle_list(json: bool) -> Result<()> {
     let base = daemon_base_url();
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await?;
     let url = format!("{}/indexes", base);
     let list_client = trusty_common::server::daemon_http_client()?;
     match list_client.get(&url).send().await {
@@ -37,14 +38,8 @@ pub async fn handle_list(json: bool) -> Result<()> {
                 }
             }
         }
-        Ok(resp) => {
-            eprintln!("{} daemon returned {}", "✗".red(), resp.status());
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
-            std::process::exit(1);
-        }
+        Ok(resp) => bail!("daemon returned {}", resp.status()),
+        Err(e) => bail!("could not reach daemon at {}: {e}", base),
     }
     Ok(())
 }

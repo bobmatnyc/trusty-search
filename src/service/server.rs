@@ -579,11 +579,9 @@ async fn create_index_handler(
     // with `503 Service Unavailable` so the caller (`trusty-search index`)
     // retries instead of producing a BM25-only index that will quietly miss
     // the vector lane forever.
-    let embedder = state.current_embedder().await;
-    if embedder.is_none() {
+    let Some(embedder) = state.current_embedder().await else {
         return embedder_initializing_response();
-    }
-    let embedder = embedder.unwrap();
+    };
     // Bug A fix: when an embedder is attached to the shared state, wire the
     // newly created indexer with both an `Embedder` and a `VectorStore` so
     // the HNSW lane actually contributes results. Previously every index

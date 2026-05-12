@@ -20,7 +20,7 @@ pub async fn handle_doctor(fix: bool) -> Result<()> {
     println!("\ntrusty-search doctor\n");
     println!("Checking configuration...\n");
 
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await?;
 
     let (checks, empty_indexes) = run_doctor_checks().await;
 
@@ -41,7 +41,10 @@ pub async fn handle_doctor(fix: bool) -> Result<()> {
     print_summary(errors, warnings, fix);
 
     if errors > 0 {
-        std::process::exit(1);
+        // Non-zero exit code without printing another line (summary already
+        // showed the error count). Empty-message bail keeps `main()`'s
+        // central ✗ printer silent for this exit path.
+        return Err(anyhow::anyhow!(""));
     }
     Ok(())
 }

@@ -17,7 +17,7 @@ pub async fn handle_search(
 ) -> Result<()> {
     let (index_id, warned) = resolve_index(explicit_index);
     print_index_header(&index_id, warned);
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await?;
     println!(
         "{} {} {} {}",
         "→".cyan(),

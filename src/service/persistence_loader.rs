@@ -116,19 +116,20 @@ async fn build_store(index_id: &str, dim: usize) -> Arc<dyn VectorStore> {
 }
 
 fn fresh_store(dim: usize) -> Arc<dyn VectorStore> {
-    match UsearchStore::new(dim) {
-        Ok(s) => Arc::new(s) as Arc<dyn VectorStore>,
-        Err(e) => {
-            tracing::error!(
-                "failed to allocate UsearchStore (dim={dim}): {e} — index will run BM25-only"
-            );
-            // Return a no-op store that satisfies the trait via the
-            // VectorStore default implementations is not possible (the trait
-            // requires concrete impls). Construct an empty UsearchStore one
-            // more time with the bare minimum and propagate the error path
-            // via a panic — usearch::Index::new only fails on OOM here, which
-            // would have already torn the daemon down.
-            panic!("usearch alloc failure: {e}");
-        }
-    }
+    // SAFETY (issue #101): `UsearchStore::new` only fails on OOM during the
+    // initial HNSW index allocation. There is no meaningful recovery path —
+    // the daemon needs an HNSW lane to function, and an OOM at startup would
+    // have already torn the process down. We use `.expect` (not `panic!`) so
+    // the failure message is uniform and the intent (infallible-modulo-OOM)
+    // is documented for the reader.
+    let s = UsearchStore::new(dim).unwrap_or_else(|e| {
+        tracing::error!(
+            "failed to allocate UsearchStore (dim={dim}): {e} — daemon cannot continue"
+        );
+        // Re-raise as a panic carrying the underlying error: there is no
+        // sensible fallback (BM25-only stores are constructed via a different
+        // path, not by replacing this Arc<dyn VectorStore>).
+        panic!("usearch alloc failure (OOM during HNSW init, dim={dim}): {e}");
+    });
+    Arc::new(s) as Arc<dyn VectorStore>
 }

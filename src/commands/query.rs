@@ -1,7 +1,7 @@
 //! Handler for `trusty-search query`.
 
 use crate::daemon_base_url;
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use colored::Colorize;
 
 /// Resolve which index to search against the daemon. Precedence:
@@ -15,12 +15,12 @@ async fn resolve_target_id(
     indexes: &str,
     client: &reqwest::Client,
     base: &str,
-) -> String {
+) -> Result<String> {
     if let Some(id) = explicit_index {
-        return id.clone();
+        return Ok(id.clone());
     }
     if indexes != "*" && !indexes.contains(',') {
-        return indexes.to_string();
+        return Ok(indexes.to_string());
     }
     // Try to resolve by listing.
     let resp = client.get(format!("{}/indexes", base)).send().await;
@@ -36,20 +36,21 @@ async fn resolve_target_id(
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
             if names.len() == 1 {
-                names.into_iter().next().unwrap()
+                // SAFETY: `names.len() == 1` was just checked, so `next()` is
+                // guaranteed to return `Some` — `unreachable!()` is for the
+                // theoretical case if that invariant ever breaks.
+                names
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("indexes array changed under us"))
             } else {
-                eprintln!(
-                    "{} Multiple indexes registered — please pass --index <id>: {}",
-                    "✗".red(),
+                Err(anyhow!(
+                    "Multiple indexes registered — please pass --index <id>: {}",
                     names.join(", ")
-                );
-                std::process::exit(1);
+                ))
             }
         }
-        _ => {
-            eprintln!("{} could not reach daemon at {}", "✗".red(), base);
-            std::process::exit(1);
-        }
+        _ => Err(anyhow!("could not reach daemon at {}", base)),
     }
 }
 
@@ -132,10 +133,10 @@ pub async fn handle_query(
     full: bool,
 ) -> Result<()> {
     let base = daemon_base_url();
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await?;
     let client = trusty_common::server::daemon_http_client()?;
 
-    let target_id = resolve_target_id(explicit_index, &indexes, &client, &base).await;
+    let target_id = resolve_target_id(explicit_index, &indexes, &client, &base).await?;
 
     let url = format!("{}/indexes/{}/search", base, target_id);
     let body = serde_json::json!({"text": query, "top_k": top_k});
@@ -145,17 +146,10 @@ pub async fn handle_query(
             r.json().await.unwrap_or_else(|_| serde_json::json!({}))
         }
         Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-            eprintln!("{} index '{}' not found on daemon", "✗".red(), target_id);
-            std::process::exit(1);
+            bail!("index '{}' not found on daemon", target_id);
         }
-        Ok(r) => {
-            eprintln!("{} daemon returned {}", "✗".red(), r.status());
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("{} could not reach daemon at {}: {e}", "✗".red(), base);
-            std::process::exit(1);
-        }
+        Ok(r) => bail!("daemon returned {}", r.status()),
+        Err(e) => bail!("could not reach daemon at {}: {e}", base),
     };
 
     if global_json {

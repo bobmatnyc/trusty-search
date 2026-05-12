@@ -24,7 +24,7 @@ pub async fn handle_convert(
     concurrency: usize,
 ) -> Result<()> {
     let base = daemon_base_url();
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await?;
 
     match target {
         ConvertTarget::Project => handle_convert_project(dry_run, &base).await,
@@ -71,8 +71,7 @@ async fn handle_convert_project(dry_run: bool, base: &str) -> Result<()> {
             println!("{} Already registered — reindex queued", "↻".cyan());
         }
         ConvertStatus::Failed(msg) => {
-            eprintln!("{} Conversion failed: {}", "✗".red(), msg);
-            std::process::exit(1);
+            anyhow::bail!("Conversion failed: {}", msg);
         }
         ConvertStatus::DryRun => unreachable!(),
     }

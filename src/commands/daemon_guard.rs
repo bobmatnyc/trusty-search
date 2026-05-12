@@ -165,14 +165,13 @@ pub async fn ensure_daemon_running(base: &str) -> Result<()> {
     }
 }
 
-/// Convenience wrapper used by command handlers: prints a friendly error and
-/// exits 1 on failure. Returns on success.
+/// Convenience wrapper used by command handlers: returns a contextualized
+/// error on failure. Returns `Ok(())` on success.
 ///
 /// Why: every caller of `ensure_daemon_running` would otherwise duplicate the
-/// "print red error / exit 1" boilerplate.
-pub async fn ensure_daemon_running_or_exit(base: &str) {
-    if let Err(e) = ensure_daemon_running(base).await {
-        eprintln!("{} {}", "✗".red(), e);
-        std::process::exit(1);
-    }
+/// error-handling boilerplate. Returns `Result` (not `process::exit`) so command
+/// handlers stay testable — the central `main()` dispatcher prints the friendly
+/// error and chooses the exit code.
+pub async fn ensure_daemon_running_or_exit(base: &str) -> Result<()> {
+    ensure_daemon_running(base).await
 }

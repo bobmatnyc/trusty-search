@@ -204,7 +204,11 @@ pub(super) fn nlp_from_doc(doc: &str) -> (Vec<String>, Vec<String>) {
         if word.len() < 3 {
             continue;
         }
-        let first = word.chars().next().unwrap();
+        // SAFETY: `word.len() >= 3` was just checked, so the word is non-empty
+        // and `chars().next()` cannot be None.
+        let Some(first) = word.chars().next() else {
+            continue;
+        };
         let all_upper = word
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());

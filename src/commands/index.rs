@@ -42,7 +42,7 @@ pub async fn handle_index(
     // 0. Auto-start the daemon if needed. `index` is useless without it,
     //    so we proactively boot it rather than dump a confusing connection
     //    error on the user.
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await?;
 
     // 1. Repo-level config detection. `trusty-search.yaml` at the project root
     //    declares one or more named indexes; when present it overrides the
@@ -74,12 +74,7 @@ pub async fn handle_index(
             // No config; fall through to single-index path.
         }
         Err(e) => {
-            eprintln!(
-                "{} could not parse {}: {e}",
-                "✗".red(),
-                CONFIG_FILENAME.bold()
-            );
-            std::process::exit(1);
+            anyhow::bail!("could not parse {}: {e}", CONFIG_FILENAME);
         }
     }
 
@@ -160,21 +155,12 @@ async fn index_one_with_filters(
     } else {
         register_index_with_daemon_filtered(index_name, project_path, filters).await
     };
-    let (created, daemon_reachable) = match result {
-        Ok(tuple) => tuple,
-        Err(e) => {
-            eprintln!("{} {}", "✗".red(), e);
-            std::process::exit(1);
-        }
-    };
+    let (created, daemon_reachable) = result?;
     if !daemon_reachable {
-        eprintln!(
-            "{} Daemon not reachable at {}. Start it with {}.",
-            "✗".red(),
-            daemon_base_url().cyan(),
-            "trusty-search start".cyan(),
+        anyhow::bail!(
+            "Daemon not reachable at {}. Start it with `trusty-search start`.",
+            daemon_base_url(),
         );
-        std::process::exit(1);
     }
 
     if created {

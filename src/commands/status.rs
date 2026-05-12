@@ -11,6 +11,6 @@ use anyhow::Result;
 /// Test: `cargo run -- status` against a running daemon prints the table; with
 /// no daemon, it auto-starts and then prints the table.
 pub async fn handle_status(json: bool) -> Result<()> {
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await?;
     run_status(json).await
 }

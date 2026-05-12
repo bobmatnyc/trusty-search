@@ -11,6 +11,6 @@ use anyhow::Result;
 /// Test: `cargo run -- dashboard` with no daemon auto-starts it then opens
 /// the browser.
 pub async fn handle_dashboard() -> Result<()> {
-    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await;
+    crate::commands::daemon_guard::ensure_daemon_running_or_exit(&daemon_base_url()).await?;
     run_dashboard()
 }

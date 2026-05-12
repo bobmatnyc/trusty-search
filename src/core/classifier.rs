@@ -61,25 +61,32 @@ impl QueryClassifier {
             Regex::new(
                 r"(?i)\b(fn |struct |impl |trait |enum |type |def |class |function |define)\b",
             )
-            .unwrap()
+            .expect("static regex pattern must compile")
         });
         let usage_re = USAGE_RE.get_or_init(|| {
-            Regex::new(r"(?i)\b(where is|callers of|who calls|uses of|usages|called by)\b").unwrap()
+            Regex::new(r"(?i)\b(where is|callers of|who calls|uses of|usages|called by)\b")
+                .expect("static regex pattern must compile")
         });
         let conceptual_re = CONCEPTUAL_RE.get_or_init(|| {
             Regex::new(r"(?i)\b(how does|what is|explain|overview|architecture|design|why)\b")
-                .unwrap()
+                .expect("static regex pattern must compile")
         });
         let bug_re = BUG_DEBT_RE.get_or_init(|| {
-            Regex::new(r"(?i)\b(TODO|FIXME|HACK|panic!|unwrap\(\)|bug|error|crash|fail)\b").unwrap()
+            Regex::new(r"(?i)\b(TODO|FIXME|HACK|panic!|unwrap\(\)|bug|error|crash|fail)\b")
+                .expect("static regex pattern must compile")
         });
         // Entity-relationship keyword regexes (issue #21).
-        let entity_def_re = ENTITY_DEF_RE
-            .get_or_init(|| Regex::new(r"(?i)\b(implements|derives from|aliased as)\b").unwrap());
-        let entity_usage_re =
-            ENTITY_USAGE_RE.get_or_init(|| Regex::new(r"(?i)\b(tested by|co-occurs)\b").unwrap());
-        let entity_bug_re =
-            ENTITY_BUG_RE.get_or_init(|| Regex::new(r"(?i)\b(raises|documented by)\b").unwrap());
+        let entity_def_re = ENTITY_DEF_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(implements|derives from|aliased as)\b")
+                .expect("static regex pattern must compile")
+        });
+        let entity_usage_re = ENTITY_USAGE_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(tested by|co-occurs)\b").expect("static regex pattern must compile")
+        });
+        let entity_bug_re = ENTITY_BUG_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(raises|documented by)\b")
+                .expect("static regex pattern must compile")
+        });
 
         // Domain-term definition patterns (issue #88).
         //
@@ -97,7 +104,7 @@ impl QueryClassifier {
                 \b[A-Z][a-zA-Z0-9]+\s+(?i)(definition|struct|class|interface|type|schema|enum|trait|model)\b
                 ",
             )
-            .unwrap()
+            .expect("static regex pattern must compile")
         });
 
         // Extended bug/debt vocabulary (issue #88).
@@ -105,7 +112,7 @@ impl QueryClassifier {
             Regex::new(
                 r"(?i)\b(error\s+handling|deprecated|legacy|missing\s+validation|hardcoded)\b",
             )
-            .unwrap()
+            .expect("static regex pattern must compile")
         });
 
         // Long natural-language conceptual query (issue #88): ≥6 whitespace-
@@ -114,7 +121,8 @@ impl QueryClassifier {
             // A "code token" is any character in: ( ) : _ .
             // We match queries that have ≥6 word characters separated by spaces and
             // contain none of the above punctuation.
-            Regex::new(r"^[^():_.]+(?:\s+[^():_.]+){5,}$").unwrap()
+            Regex::new(r"^[^():_.]+(?:\s+[^():_.]+){5,}$")
+                .expect("static regex pattern must compile")
         });
 
         // Priority chain — most-specific patterns first.
@@ -174,8 +182,10 @@ impl QueryClassifier {
         // long natural-language queries embed a function name without
         // intending a definition lookup (see
         // `test_long_query_with_code_token_not_long_nl_conceptual`).
-        let pascal_ident_re = PASCAL_IDENT_RE
-            .get_or_init(|| Regex::new(r"\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b").unwrap());
+        let pascal_ident_re = PASCAL_IDENT_RE.get_or_init(|| {
+            Regex::new(r"\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b")
+                .expect("static regex pattern must compile")
+        });
         if pascal_ident_re.is_match(trimmed) {
             return QueryIntent::Definition;
         }

@@ -91,7 +91,7 @@ pub async fn ui_asset_handler(
             .header(header::CONTENT_TYPE, mime)
             .header(header::CACHE_CONTROL, cache_control_for(trimmed))
             .body(Body::from(file.contents()))
-            .unwrap();
+            .expect("response builder fields are all valid");
     }
     // SPA fallback.
     serve_index(&state).await
@@ -114,7 +114,7 @@ async fn serve_index(state: &SearchAppState) -> Response {
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
-        .unwrap()
+        .expect("response builder fields are all valid")
 }
 
 fn mime_for(path: &str) -> &'static str {

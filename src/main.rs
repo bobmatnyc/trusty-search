@@ -903,12 +903,10 @@ async fn run_reindex_with(
         .map_err(|e| anyhow::anyhow!("could not reach daemon at {base}: {e}"))?;
 
     if kickoff.status() == reqwest::StatusCode::NOT_FOUND {
-        eprintln!(
-            "{} index '{}' is not registered on the daemon — run `trusty-search index` first",
-            "✗".red(),
+        anyhow::bail!(
+            "index '{}' is not registered on the daemon — run `trusty-search index` first",
             index_id
         );
-        std::process::exit(1);
     }
     if !kickoff.status().is_success() {
         anyhow::bail!("daemon returned {} for reindex kickoff", kickoff.status());
@@ -945,12 +943,10 @@ async fn run_reindex_with(
         .await
         .map_err(|e| anyhow::anyhow!("could not connect to SSE stream {stream_url}: {e}"))?;
     if !resp.status().is_success() {
-        eprintln!(
-            "{} reindex stream returned {} — daemon may be an older version that doesn't support /reindex/stream",
-            "✗".red(),
+        anyhow::bail!(
+            "reindex stream returned {} — daemon may be an older version that doesn't support /reindex/stream",
             resp.status()
         );
-        std::process::exit(1);
     }
     // MultiProgress UI: header + files bar + stats line. Built eagerly so
     // the user sees something during the 1–2 second daemon warmup before the
@@ -1299,14 +1295,12 @@ async fn verify_reindex_health(
         );
         Ok(())
     } else {
-        eprintln!(
-            "{} Reindex produced unhealthy index: {} chunks{}, sanity query {} — old index NOT preserved (daemon reindex is in-place; see crates/trusty-search-service/src/reindex.rs)",
-            "✗".red(),
+        anyhow::bail!(
+            "Reindex produced unhealthy index: {} chunks{}, sanity query {} — old index NOT preserved (daemon reindex is in-place; see crates/trusty-search-service/src/reindex.rs)",
             format_with_commas(new_chunks),
             was,
             if got_hit { "ok" } else { "returned 0 results" }
         );
-        std::process::exit(1);
     }
 }
 
@@ -1707,13 +1701,10 @@ async fn run_status(json: bool) -> Result<()> {
         _ => {
             if json {
                 println!(r#"{{"daemon":"not_running"}}"#);
-            } else {
-                eprintln!(
-                    "{} Daemon not running  (start with `trusty-search start`)",
-                    "✗".red()
-                );
+                // JSON consumers parse the body; suppress the central ✗ line.
+                return Err(anyhow::anyhow!(""));
             }
-            std::process::exit(1);
+            anyhow::bail!("Daemon not running  (start with `trusty-search start`)");
         }
     };
 
@@ -2260,13 +2251,10 @@ fn run_dashboard() -> Result<()> {
     let addr = match std::fs::read_to_string(&path) {
         Ok(s) => s.trim().to_string(),
         Err(_) => {
-            eprintln!(
-                "{} No daemon running ({} not found). Start one with {}.",
-                "✗".red(),
+            anyhow::bail!(
+                "No daemon running ({} not found). Start one with `trusty-search start`.",
                 path.display(),
-                "trusty-search start".cyan()
             );
-            std::process::exit(1);
         }
     };
     if addr.is_empty() {
@@ -2313,12 +2301,10 @@ fn run_service_action(action: &ServiceAction) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = action;
-        eprintln!(
-            "{} `trusty-search service` is not supported on this platform — \
-             use your distro's service manager (systemd, OpenRC, etc.) directly.",
-            "✗".red()
+        anyhow::bail!(
+            "`trusty-search service` is not supported on this platform — \
+             use your distro's service manager (systemd, OpenRC, etc.) directly."
         );
-        std::process::exit(1);
     }
 }
 
@@ -2530,14 +2516,13 @@ fn service_status() -> Result<()> {
         println!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
         // `launchctl print` exits non-zero when the service isn't loaded.
-        eprintln!(
-            "{} {} is not loaded ({})",
-            "✗".red(),
+        // Print the install hint before bailing so the user sees both lines.
+        eprintln!("  Install with: trusty-search service install");
+        anyhow::bail!(
+            "{} is not loaded ({})",
             target,
             String::from_utf8_lossy(&output.stderr).trim()
         );
-        eprintln!("  Install with: {}", "trusty-search service install".cyan());
-        std::process::exit(1);
     }
     Ok(())
 }
@@ -2572,7 +2557,21 @@ fn service_logs() -> Result<()> {
 // ── Main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    // Central error-printer + exit-code chooser. Why: command handlers are now
+    // testable units that return `Result<()>` instead of calling `process::exit`
+    // directly (issue #104). Print the chain compactly with the red ✗ prefix
+    // operators already recognize, then exit 1.
+    if let Err(e) = run().await {
+        let msg = format!("{:#}", e);
+        if !msg.is_empty() {
+            eprintln!("{} {}", "✗".red(), msg);
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     dotenvy::from_filename(".env.local").ok();
 
     let cli = Cli::parse();

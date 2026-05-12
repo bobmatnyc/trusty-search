@@ -7,8 +7,9 @@
 //!
 //! What: one module per subcommand. Handlers take the parsed argument fields
 //! plus any global flags they need (`index`, `json`). They return `Result<()>`
-//! and may call `std::process::exit(1)` on user-facing errors that should
-//! short-circuit (same behaviour as before the refactor).
+//! and bubble user-facing errors via `anyhow::bail!` / `Err(...)` — the
+//! central `main()` dispatcher prints the friendly red-✗ line and chooses the
+//! exit code (issue #104, so handlers are testable without forking a process).
 //!
 //! Test: `cargo build && cargo test --workspace` — no behaviour change; the
 //! refactor is purely structural.

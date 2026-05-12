@@ -152,14 +152,13 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // the embedder so the operator gets a clear, actionable error.
     const MIN_RAM_MB: u64 = 16 * 1024;
     if policy.total_ram_mb < MIN_RAM_MB {
-        eprintln!(
-            "error: trusty-search requires at least 16 GB of RAM.\n\
+        anyhow::bail!(
+            "trusty-search requires at least 16 GB of RAM.\n\
              Detected: {} MB ({:.1} GB)\n\
              Indexing large codebases on machines with less memory is not supported.",
             policy.total_ram_mb,
             policy.total_ram_mb as f64 / 1024.0
         );
-        std::process::exit(1);
     }
 
     policy.log_summary();
@@ -190,14 +189,12 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // `acquire_lock` removes the stale file and retries on our behalf.
     if let Some(pid) = crate::service::running_daemon_pid() {
         tracing::warn!("daemon already running (pid {pid}); refusing to start a second instance");
-        eprintln!(
-            "{} Daemon already running (pid {pid}).\n\
+        anyhow::bail!(
+            "Daemon already running (pid {pid}).\n\
              Stop it first with `trusty-search stop`, then re-run `trusty-search start`.\n\
              Replacing the binary while the daemon is running causes macOS to SIGKILL \
-             the process (Code Signature Invalid).",
-            "✗".red()
+             the process (Code Signature Invalid)."
         );
-        std::process::exit(1);
     }
     // Rare race: the lock is held but the PID-aliveness check returned None
     // (lockfile may contain garbage or be mid-write by a sibling launch).
@@ -327,10 +324,7 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
             );
             return Ok(());
         }
-        Err(e) => {
-            eprintln!("{} daemon failed: {e}", "✗".red());
-            std::process::exit(1);
-        }
+        Err(e) => anyhow::bail!("daemon failed: {e}"),
     }
     Ok(())
 }
