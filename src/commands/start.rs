@@ -173,19 +173,31 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // another daemon is already running.  The lock check is ~1 ms;
     // FastEmbedder::new() can take several seconds on first run.
     //
-    // Bug fix (launchd crash-loop): if the lockfile exists and the recorded
-    // PID is *alive*, exit 0 — launchd treats any non-zero exit as a crash
-    // and re-spawns after ThrottleInterval, producing an infinite loop when
-    // the daemon is already running. If the PID is dead (stale lock), fall
-    // through to `run_daemon`, whose `acquire_lock` removes the stale file
-    // and retries on our behalf.
+    // Issue #87 (Option A): if the lockfile exists and the recorded PID is
+    // *alive*, print an actionable warning and exit 1 so the caller knows
+    // they must stop the daemon first before installing a new binary.
+    // Replacing the binary on-disk while the daemon is running causes macOS
+    // 26.3+ to SIGKILL the process with "Code Signature Invalid".
+    //
+    // NOTE: this is intentionally exit(1), NOT exit(0).  The previous exit(0)
+    // was kept for launchd's crash-loop guard; that guard is now handled by
+    // the `DaemonError::AlreadyRunning` branch below (which still exits 0)
+    // because launchd only calls `start` without a prior `stop`.  A direct
+    // user invocation of `trusty-search start` when the daemon is already up
+    // should be a visible, actionable error.
+    //
+    // If the PID is dead (stale lock), fall through to `run_daemon`, whose
+    // `acquire_lock` removes the stale file and retries on our behalf.
     if let Some(pid) = crate::service::running_daemon_pid() {
-        tracing::info!("daemon already running (pid {pid}), exiting cleanly");
+        tracing::warn!("daemon already running (pid {pid}); refusing to start a second instance");
         eprintln!(
-            "{} trusty-search daemon already running (pid {pid}); nothing to do",
-            "✓".green()
+            "{} Daemon already running (pid {pid}).\n\
+             Stop it first with `trusty-search stop`, then re-run `trusty-search start`.\n\
+             Replacing the binary while the daemon is running causes macOS to SIGKILL \
+             the process (Code Signature Invalid).",
+            "✗".red()
         );
-        return Ok(());
+        std::process::exit(1);
     }
     // Rare race: the lock is held but the PID-aliveness check returned None
     // (lockfile may contain garbage or be mid-write by a sibling launch).

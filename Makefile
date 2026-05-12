@@ -14,7 +14,7 @@ UI_DIR      := ui
 UI_DIST     := $(UI_DIR)/dist
 UI_EMBED    := ui-dist
 
-.PHONY: ui build-ui sync-ui release-prep reinstall check clippy test
+.PHONY: ui build-ui sync-ui release-prep install patch reinstall check clippy test
 
 ## Build Svelte UI (pnpm preferred, npm fallback)
 build-ui:
@@ -40,10 +40,28 @@ release-prep: build-ui sync-ui
 ## Convenience alias
 ui: build-ui
 
+## Install binary from source, stopping any running daemon first (closes #87).
+## Why: replacing the binary while the daemon is running causes macOS 26.3+ to
+## SIGKILL the process with "Code Signature Invalid"; stopping first ensures a
+## clean handoff.  `|| true` makes the stop a no-op when no daemon is running.
+install:
+	trusty-search stop 2>/dev/null || true
+	sleep 1
+	cargo install --path . --locked
+
+## Bump the patch version, stop the daemon, install, and start it again.
+## Why: same macOS binary-replacement hazard as `install`; version bump and
+## daemon restart are always paired during development patch cycles.
+patch:
+	trusty-search stop 2>/dev/null || true
+	cargo set-version --bump patch
+	cargo install --path . --locked
+	trusty-search start
+
 ## Stop daemon, install new binary from source, restart (closes #87)
 ## Why: replacing the binary while the daemon is running causes macOS to
 ## SIGKILL the process; stopping first ensures a clean handoff.
-reinstall: ## Stop daemon, install new binary, restart with saved config
+reinstall:
 	trusty-search stop 2>/dev/null || true
 	sleep 2
 	cargo install --path . --locked
