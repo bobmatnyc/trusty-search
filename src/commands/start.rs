@@ -78,6 +78,62 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // Fall through to `run_daemon` — its `acquire_lock` will either succeed
     // (lock now free) or return AlreadyRunning, handled below.
 
+    // Issue #81: detect orphan daemons whose PIDs are NOT recorded in the
+    // lockfile (e.g. a previous `start` whose lockfile was deleted or
+    // overwritten by a launchd respawn). These orphans keep their HNSW
+    // indexes resident — we observed a 73 GB RSS orphan daemon left running
+    // when `stop` only knew about the lockfile PID. Reap them now so we
+    // don't end up with two daemons fighting over `bind_with_auto_port`.
+    let orphans = crate::commands::stop::find_daemon_pids();
+    if !orphans.is_empty() {
+        tracing::warn!(
+            "found {} existing trusty-search daemon process(es) not tracked by lockfile: {:?} — terminating before start",
+            orphans.len(),
+            orphans
+        );
+        eprintln!(
+            "{} found {} existing trusty-search daemon process(es) not tracked by lockfile — stopping them first",
+            "⚠".yellow(),
+            orphans.len()
+        );
+        for pid in &orphans {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        // Give them 3 s to exit cleanly, then SIGKILL stragglers.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            #[cfg(unix)]
+            let any_alive = orphans
+                .iter()
+                .any(|p| unsafe { libc::kill(*p as libc::pid_t, 0) } == 0);
+            #[cfg(not(unix))]
+            let any_alive = false;
+            if !any_alive || std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        #[cfg(unix)]
+        for pid in &orphans {
+            if unsafe { libc::kill(*pid as libc::pid_t, 0) } == 0 {
+                tracing::warn!("orphan pid {pid} ignored SIGTERM — sending SIGKILL");
+                unsafe {
+                    libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+        // Clear stale lock/port files left behind by the killed orphans.
+        if let Ok(lock) = crate::service::daemon_lock_path() {
+            let _ = std::fs::remove_file(&lock);
+        }
+        if let Some(port) = crate::daemon_port_path() {
+            let _ = std::fs::remove_file(&port);
+        }
+    }
+
     // Why (v0.3.12 fix — deferred embedder init): previously `build_embedder()`
     // was awaited before the HTTP listener bound, so the daemon's port stayed
     // closed for 15–30 s on first run while ONNX/CoreML loaded the model.
