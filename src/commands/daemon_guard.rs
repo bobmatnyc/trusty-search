@@ -175,3 +175,46 @@ pub async fn ensure_daemon_running(base: &str) -> Result<()> {
 pub async fn ensure_daemon_running_or_exit(base: &str) -> Result<()> {
     ensure_daemon_running(base).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `probe_health` against an unbound localhost port returns `false`
+    /// (connect refused) within the per-probe timeout.
+    #[tokio::test]
+    async fn probe_health_returns_false_on_connection_refused() {
+        // Port 1 is reserved and never bound by any normal process — pick a
+        // high-numbered port we believe is free. Using 65535 minimises the
+        // chance of collision with a real service.
+        let base = "http://127.0.0.1:65535";
+        let started = Instant::now();
+        let ok = probe_health(base).await;
+        assert!(!ok, "probe should fail against an unbound port");
+        // The probe must respect PROBE_TIMEOUT and not hang the test.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "probe took too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `probe_health` against a malformed URL returns `false` cleanly (no panic).
+    #[tokio::test]
+    async fn probe_health_returns_false_on_bad_url() {
+        let ok = probe_health("not-a-valid-url").await;
+        assert!(!ok);
+    }
+
+    /// `probe_health` against a port the kernel will refuse fast returns false
+    /// without exceeding the per-probe timeout.
+    #[tokio::test]
+    async fn probe_health_respects_short_timeout() {
+        // Use a host:port that's locally unreachable.
+        let started = Instant::now();
+        let _ = probe_health("http://127.0.0.1:1").await;
+        // Connect-refused is near-instant; even if it had to time out we'd be
+        // bounded by PROBE_TIMEOUT (750ms) + a small slack.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}

@@ -43,3 +43,50 @@ pub fn print_index_header(index_id: &str, warned: bool) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_index_explicit_wins() {
+        let explicit = Some("my-explicit-index".to_string());
+        let (id, warned) = resolve_index(&explicit);
+        assert_eq!(id, "my-explicit-index");
+        assert!(!warned, "explicit --index should never warn");
+    }
+
+    #[test]
+    fn resolve_index_explicit_empty_string_still_wins() {
+        // Even an empty string is preferred over auto-detect: callers are
+        // responsible for trimming/validating.
+        let explicit = Some(String::new());
+        let (id, warned) = resolve_index(&explicit);
+        assert_eq!(id, "");
+        assert!(!warned);
+    }
+
+    #[test]
+    fn resolve_index_none_falls_through_to_detection() {
+        // We can't assert the exact id (depends on CWD when test runs) but we
+        // can assert the contract: returns a non-empty index_id, doesn't panic.
+        let (id, _warned) = resolve_index(&None);
+        assert!(
+            !id.is_empty(),
+            "auto-detected index_id should never be empty"
+        );
+    }
+
+    #[test]
+    fn print_index_header_warned_false_is_silent() {
+        // When warned=false the function MUST NOT panic and should return cleanly.
+        // (stderr capture varies by test runner; we just smoke-test the call.)
+        print_index_header("any-id", false);
+    }
+
+    #[test]
+    fn print_index_header_warned_true_does_not_panic() {
+        // Smoke-test the warned branch — it formats a colored eprintln.
+        print_index_header("fallback-id", true);
+    }
+}
