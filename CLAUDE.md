@@ -434,17 +434,46 @@ Serves the embedded Svelte admin UI. Not part of the integration contract.
 
 ## Memory Tuning (Environment Variables)
 
-The daemon caps several in-memory structures to keep RAM bounded on
-long-running deployments (issue #75). Defaults are conservative; override
-via env when needed.
+> **System requirement: 16 GB RAM minimum.** `trusty-search start` performs
+> a hard RAM check at startup (`src/commands/start.rs`) and exits with an
+> error on hosts with less than 16 GB. Indexing large codebases on
+> under-spec machines is not supported. The legacy `Tiny` (<8 GB) and
+> `Small` (8–15 GB) memory tiers have been removed — `Medium` (16–31 GB)
+> is now the baseline.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TRUSTY_MAX_CHUNKS` | `200000` | Hard cap on chunks per index. Also clamps HNSW reserve growth, so a single index never holds more than this many vectors. New chunks past the cap are dropped with a warning. Lowered from 500 000 in issue #79. |
-| `TRUSTY_EMBEDDING_CACHE` | `1000` | LRU capacity for the in-memory chunk-embedding cache (≈1.5 MB at 384-dim f32). Evicted entries are gracefully re-embedded or fall back to relevance-only MMR. Lowered from 10 000 in issue #79. |
-| `TRUSTY_MAX_BATCH_SIZE` | `128` | Hard cap on the embedding batch size used inside `parse_and_embed_files` (chunks per ONNX `embed_batch` call). Clamped to `[32, 2048]`. The ORT session arena retains buffers sized to the largest batch it has seen, so on Apple Silicon a large value can trigger Jetsam kills during full reindexes; lower this on memory-constrained hosts. Lowered from 512 in issue #79. |
-| `TRUSTY_BM25_CORPUS_CAP` | `50000` | Maximum number of live BM25 documents per index. Once reached, new chunks are dropped from the lexical index (the HNSW lane still indexes them). Updates to existing chunks are always honoured. A single warn is logged on first cap hit. Added in issue #79. |
-| `TRUSTY_MEMORY_LIMIT_MB` | _(unset = disabled)_ | Optional soft RSS ceiling for the indexing pipeline. When set, the reindex orchestrator polls process RSS every 10 batches and skips remaining batches with a `tracing::warn!` once the limit is hit. The partial index is preserved (already-committed chunks stay searchable); `memory_limit_hit: true` appears in the SSE `complete` event and in the daemon log. |
+The daemon caps several in-memory structures to keep RAM bounded on
+long-running deployments (issue #75). **As of the memory-tier autosizing
+change, defaults are computed from detected system RAM at daemon startup**
+(`src/core/memory_policy.rs`). Env vars always override the auto-tuned
+values; precedence is **shell env > `daemon.env` > tier default**.
+
+### Auto-tuned defaults (per tier)
+
+`MemoryPolicy::detect()` reads `hw.memsize` (macOS) or `/proc/meminfo`
+(Linux) at daemon startup and selects one of five tiers:
+
+| Tier | Total RAM | `MEMORY_LIMIT_MB` | `MAX_CHUNKS` | `EMBEDDING_CACHE` | `MAX_BATCH_SIZE` | `BM25_CORPUS_CAP` | `MAX_KG_NODES` |
+|------|-----------|-------------------|--------------|-------------------|------------------|-------------------|----------------|
+| Tiny | < 8 GB | 1 024 | 50 000 | 500 | 64 | 20 000 | 30 000 |
+| Small | 8–15 GB | 2 048 | 100 000 | 1 000 | 128 | 50 000 | 75 000 |
+| Medium | 16–31 GB | 4 096 | 200 000 | 5 000 | 256 | 100 000 | 150 000 |
+| Large | 32–63 GB | 8 192 | 400 000 | 10 000 | 512 | 200 000 | 300 000 |
+| XLarge | ≥ 64 GB | 16 384 | 800 000 | 20 000 | 512 | 400 000 | 500 000 |
+
+The resolved policy is logged at daemon startup so operators can confirm
+which tier was selected. If RAM detection fails on an unsupported OS, the
+daemon falls back to the Tiny tier (8 GB assumption) with a `tracing::warn!`.
+
+### Per-variable reference
+
+| Variable | Description |
+|----------|-------------|
+| `TRUSTY_MAX_CHUNKS` | Hard cap on chunks per index. Also clamps HNSW reserve growth, so a single index never holds more than this many vectors. New chunks past the cap are dropped with a warning. |
+| `TRUSTY_EMBEDDING_CACHE` | LRU capacity for the in-memory chunk-embedding cache (≈1.5 MB per 1 000 entries at 384-dim f32). Evicted entries are gracefully re-embedded or fall back to relevance-only MMR. |
+| `TRUSTY_MAX_BATCH_SIZE` | Hard cap on the embedding batch size used inside `parse_and_embed_files` (chunks per ONNX `embed_batch` call). Clamped to `[32, 2048]`. The ORT session arena retains buffers sized to the largest batch it has seen, so on Apple Silicon a large value can trigger Jetsam kills during full reindexes. |
+| `TRUSTY_BM25_CORPUS_CAP` | Maximum number of live BM25 documents per index. Once reached, new chunks are dropped from the lexical index (the HNSW lane still indexes them). Updates to existing chunks are always honoured. A single warn is logged on first cap hit. |
+| `TRUSTY_MAX_KG_NODES` | Maximum number of nodes in the symbol-graph per index. Set to `0` to disable the cap entirely. |
+| `TRUSTY_MEMORY_LIMIT_MB` | Soft RSS ceiling for the indexing pipeline. When hit, the reindex orchestrator skips remaining batches with a `tracing::warn!`; the partial index is preserved (already-committed chunks stay searchable); `memory_limit_hit: true` appears in the SSE `complete` event and the daemon log. |
 
 Additional internal caps (not env-tunable):
 

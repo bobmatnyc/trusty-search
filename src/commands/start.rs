@@ -112,6 +112,36 @@ pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
     // This is primarily for the first `start` after upgrading, when the file
     // may already exist from a previous run.
     crate::service::load_daemon_env();
+
+    // Auto-tune memory caps based on detected system RAM (issue: memory-tier
+    // autosizing). Precedence: explicit env var > daemon.env (just loaded)
+    // > tier default. `MemoryPolicy::detect()` writes the resolved values
+    // back into the process env so existing readers (indexer, bm25,
+    // symbol_graph, memguard, store) pick them up automatically.
+    //
+    // SAFETY: invoked before tokio spawns any indexing workers — env mutation
+    // here is on the runtime's main worker thread but no other thread is
+    // reading these vars yet. Same invariant `load_daemon_env` relies on.
+    let policy = crate::core::MemoryPolicy::detect();
+
+    // Hard 16 GB minimum: trusty-search is designed for developer workstations.
+    // Machines with less than 16 GB cannot safely index large codebases —
+    // ONNX model load, HNSW resident memory, and indexing batches will OOM
+    // under realistic workloads. Exit before binding any port or loading
+    // the embedder so the operator gets a clear, actionable error.
+    const MIN_RAM_MB: u64 = 16 * 1024;
+    if policy.total_ram_mb < MIN_RAM_MB {
+        eprintln!(
+            "error: trusty-search requires at least 16 GB of RAM.\n\
+             Detected: {} MB ({:.1} GB)\n\
+             Indexing large codebases on machines with less memory is not supported.",
+            policy.total_ram_mb,
+            policy.total_ram_mb as f64 / 1024.0
+        );
+        std::process::exit(1);
+    }
+
+    policy.log_summary();
     // `foreground` is currently a no-op: `run_daemon` already runs inline
     // and never forks. The flag is accepted so launchd/systemd plists can
     // declare the supervised contract explicitly in ProgramArguments
