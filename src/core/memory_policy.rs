@@ -94,6 +94,28 @@ impl fmt::Display for MemoryTier {
 }
 
 impl MemoryTier {
+    /// Tier-specific hard cap on `max_batch_size`. Conservative bound that
+    /// protects against runaway env-var overrides on memory-constrained hosts
+    /// (issue #89).
+    ///
+    /// Why: `TRUSTY_MAX_BATCH_SIZE` is a runtime knob. An operator who sets it
+    /// to 2048 on a 16 GB box (the Medium tier) will trigger the same ORT
+    /// transient-arena spike that auto-tuning was designed to prevent. The
+    /// auto-derived defaults (Medium=55, Large=111, XLarge=223) already sit
+    /// well below these caps, so this hard ceiling only kicks in for explicit
+    /// overrides — exactly the case where additional safety is warranted.
+    /// What: Medium=64, Large=128, XLarge=256. The arena disable in
+    /// trusty-embedder (`with_arena_allocator(false)`) is the primary
+    /// mitigation; this cap is a defense in depth.
+    /// Test: `test_tier_batch_size_hard_cap` covers the table.
+    pub fn batch_size_hard_cap(self) -> usize {
+        match self {
+            MemoryTier::Medium => 64,
+            MemoryTier::Large => 128,
+            MemoryTier::XLarge => 256,
+        }
+    }
+
     /// Pick a tier from total RAM in megabytes.
     ///
     /// Why: tier selection drives default caps. The daemon enforces a 16 GB
@@ -199,13 +221,31 @@ impl MemoryPolicy {
             compute_max_batch_size(memory_limit_mb)
         };
 
+        // Apply tier-based hard cap on max_batch_size (issue #89). The cap
+        // only constrains env-var overrides; auto-derived defaults are already
+        // safely below it.
+        let raw_batch_size = env_override_usize("TRUSTY_MAX_BATCH_SIZE", derived_batch_size);
+        let batch_cap = tier.batch_size_hard_cap();
+        let max_batch_size = if raw_batch_size > batch_cap {
+            tracing::warn!(
+                "memory_policy: TRUSTY_MAX_BATCH_SIZE={} exceeds tier {} hard cap of {}; \
+                 clamping to protect against ORT transient-arena spike (issue #89)",
+                raw_batch_size,
+                tier,
+                batch_cap,
+            );
+            batch_cap
+        } else {
+            raw_batch_size
+        };
+
         let policy = MemoryPolicy {
             total_ram_mb,
             tier,
             memory_limit_mb,
             max_chunks: env_override_usize("TRUSTY_MAX_CHUNKS", d.max_chunks),
             embedding_cache: env_override_usize("TRUSTY_EMBEDDING_CACHE", d.embedding_cache),
-            max_batch_size: env_override_usize("TRUSTY_MAX_BATCH_SIZE", derived_batch_size),
+            max_batch_size,
             bm25_corpus_cap: env_override_usize("TRUSTY_BM25_CORPUS_CAP", d.bm25_corpus_cap),
             max_kg_nodes: env_override_usize("TRUSTY_MAX_KG_NODES", d.max_kg_nodes),
         };
@@ -426,6 +466,43 @@ mod tests {
             match prior {
                 Some(v) => std::env::set_var("TRUSTY_MAX_CHUNKS", v),
                 None => std::env::remove_var("TRUSTY_MAX_CHUNKS"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_tier_batch_size_hard_cap() {
+        // Issue #89: tier-specific batch-size hard caps protect against
+        // runaway TRUSTY_MAX_BATCH_SIZE overrides on memory-constrained hosts.
+        assert_eq!(MemoryTier::Medium.batch_size_hard_cap(), 64);
+        assert_eq!(MemoryTier::Large.batch_size_hard_cap(), 128);
+        assert_eq!(MemoryTier::XLarge.batch_size_hard_cap(), 256);
+    }
+
+    #[test]
+    fn test_batch_size_env_override_clamped_by_hard_cap() {
+        // Save & override.
+        let prior = std::env::var("TRUSTY_MAX_BATCH_SIZE").ok();
+        // SAFETY: tests run single-threaded within this module's env block.
+        unsafe {
+            std::env::set_var("TRUSTY_MAX_BATCH_SIZE", "2048");
+        }
+
+        // 16 GB → Medium tier, hard cap = 64. Env value of 2048 must be
+        // clamped down to the tier cap.
+        let policy = MemoryPolicy::from_total_ram_mb(16 * 1024);
+        assert_eq!(policy.tier, MemoryTier::Medium);
+        assert_eq!(
+            policy.max_batch_size, 64,
+            "Medium tier must clamp TRUSTY_MAX_BATCH_SIZE=2048 down to 64"
+        );
+
+        // Restore.
+        // SAFETY: same as above.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_MAX_BATCH_SIZE", v),
+                None => std::env::remove_var("TRUSTY_MAX_BATCH_SIZE"),
             }
         }
     }
