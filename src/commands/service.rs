@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use clap::Subcommand;
+#[cfg(target_os = "macos")]
 use colored::Colorize;
 
 /// Subcommands for `trusty-search service` (macOS launchd integration).
