@@ -149,6 +149,10 @@ enum Commands {
         /// Force a full reindex even if the index already has chunks
         #[arg(short, long)]
         force: bool,
+
+        /// SSE stream timeout in seconds (default: 600). Increase for very large repos.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
 
     /// Register current directory as a named index (see `index`)
@@ -205,6 +209,10 @@ enum Commands {
     Reindex {
         /// Directory to reindex (default: auto-detected project root)
         path: Option<std::path::PathBuf>,
+
+        /// SSE stream timeout in seconds (default: 600). Increase for very large repos.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
 
     // ── Global / multi-index commands ─────────────────────────────────────
@@ -754,7 +762,7 @@ impl ReindexUi {
 }
 
 /// Options controlling reindex CLI behaviour.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct ReindexOptions {
     /// After the reindex completes, fetch `/status` and issue a sanity-check
     /// search to verify the index is healthy. Enabled by `--force` to give
@@ -775,6 +783,22 @@ struct ReindexOptions {
     /// re-embeds every file (otherwise unchanged files would be skipped on a
     /// warm daemon and `--force` would have no effect).
     force: bool,
+    /// Maximum wall-clock seconds to wait for the SSE reindex stream to emit
+    /// a `complete` event. Default: 600. Use `--timeout 0` to disable (wait
+    /// forever). When the deadline is exceeded the CLI prints a warning and
+    /// exits; the daemon continues indexing in the background.
+    timeout_secs: u64,
+}
+
+impl Default for ReindexOptions {
+    fn default() -> Self {
+        Self {
+            verify_after: false,
+            prior_chunk_count: None,
+            force: false,
+            timeout_secs: 600,
+        }
+    }
 }
 
 /// Outcome of a reindex run, captured for the post-verify step and the final
@@ -817,21 +841,37 @@ struct ReindexTimings {
 /// bare `reindex` command, and the doctor auto-repair path. The daemon's
 /// hash-skip optimization (see `reindex.rs::hash_content`) means unchanged
 /// files are cheap, so calling this even when nothing changed is fine.
-async fn run_reindex(index_id: &str, root_path: &std::path::Path) -> Result<()> {
-    run_reindex_with(index_id, root_path, ReindexOptions::default())
-        .await
-        .map(|_| ())
+///
+/// `timeout_secs` caps how long the CLI waits for the SSE stream's `complete`
+/// event. 0 means no limit (wait forever). Default for callers that don't have
+/// an explicit user-supplied value: 600.
+async fn run_reindex(index_id: &str, root_path: &std::path::Path, timeout_secs: u64) -> Result<()> {
+    run_reindex_with(
+        index_id,
+        root_path,
+        ReindexOptions {
+            timeout_secs,
+            ..ReindexOptions::default()
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 /// `index --force` reindex: snapshot the prior chunk count, kick off a full
 /// reindex, and run a post-reindex health check. Exits 1 if the new index
 /// looks unhealthy (no chunks or empty sanity query).
-async fn run_reindex_force(index_id: &str, root_path: &std::path::Path) -> Result<()> {
+async fn run_reindex_force(
+    index_id: &str,
+    root_path: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<()> {
     let prior = fetch_chunk_count(index_id).await;
     let opts = ReindexOptions {
         verify_after: true,
         prior_chunk_count: prior,
         force: true,
+        timeout_secs,
     };
     run_reindex_with(index_id, root_path, opts)
         .await
@@ -889,6 +929,11 @@ async fn run_reindex_with(
     // `daemon_http_client()` (currently 5s) — a large repo reindex can run for
     // minutes. We build a dedicated client with only a connect timeout so the
     // byte stream stays open until the daemon emits the `complete` event.
+    //
+    // The per-request reqwest timeout only governs the *connection* phase here;
+    // we handle the overall stream deadline ourselves below via
+    // `tokio::time::timeout` so we can print a friendly warning instead of a
+    // raw timeout error.
     let sse_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::MAX)
@@ -965,6 +1010,19 @@ async fn run_reindex_with(
 
     let mut outcome = ReindexOutcome::default();
     let mut done = false;
+    let mut timed_out = false;
+
+    // Optional wall-clock deadline for the SSE stream. `timeout_secs == 0`
+    // means wait forever (legacy behaviour). Otherwise each `stream.next()`
+    // is raced against `tokio::time::sleep_until(deadline)` via
+    // `tokio::select!`. When the sleep wins we set `timed_out = true` and
+    // break so the post-loop path can print the canonical warning.
+    // The daemon continues indexing in the background.
+    let deadline: Option<tokio::time::Instant> = if opts.timeout_secs > 0 {
+        Some(tokio::time::Instant::now() + Duration::from_secs(opts.timeout_secs))
+    } else {
+        None
+    };
 
     // `eventsource-stream` handles SSE framing. The daemon emits these event
     // types (see `crates/trusty-search-service/src/reindex.rs::spawn_reindex`):
@@ -977,7 +1035,22 @@ async fn run_reindex_with(
     let stream = byte_stream.eventsource();
     tokio::pin!(stream);
     while !done {
-        let event = match stream.next().await {
+        // Race the next SSE event against the optional deadline. When the
+        // deadline fires `timed_out` is set and we break cleanly; the
+        // post-loop section emits the warning and returns Ok.
+        let maybe_event = if let Some(dl) = deadline {
+            tokio::select! {
+                biased;
+                ev = stream.next() => ev,
+                _ = tokio::time::sleep_until(dl) => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        } else {
+            stream.next().await
+        };
+        let event = match maybe_event {
             Some(Ok(e)) => e,
             Some(Err(e)) => {
                 ui.stats
@@ -1078,6 +1151,25 @@ async fn run_reindex_with(
     // final message during the brief window between finish() and shutdown.
     tick_done.store(true, Ordering::Release);
     let _ = ticker.await;
+
+    if timed_out {
+        // The SSE deadline fired before the daemon emitted `complete`. The
+        // daemon is still indexing in the background. Print the canonical
+        // warning (exact text the issue tracker refers to) and return Ok so
+        // callers don't treat this as a hard error.
+        ui.abandon(format!(
+            "{} trusty-search index timed out after {}s — continuing; re-run later if needed",
+            "⚠".yellow(),
+            opts.timeout_secs,
+        ));
+        eprintln!(
+            "{} Daemon is still indexing in the background. \
+             Use `trusty-search status` or re-run `trusty-search index` to check progress. \
+             Pass `--timeout <seconds>` to wait longer (e.g. `--timeout 1200`).",
+            "ℹ".cyan()
+        );
+        return Ok(outcome);
+    }
 
     if !outcome.completed {
         ui.abandon(format!(
@@ -2415,8 +2507,13 @@ async fn main() -> Result<()> {
             commands::init::handle_init(path, name, exclude).await?;
         }
 
-        Commands::Index { path, name, force } => {
-            commands::index::handle_index(path, name, force).await?;
+        Commands::Index {
+            path,
+            name,
+            force,
+            timeout,
+        } => {
+            commands::index::handle_index(path, name, force, timeout).await?;
         }
 
         Commands::Add { file } => {
@@ -2427,8 +2524,8 @@ async fn main() -> Result<()> {
             commands::remove::handle_remove(&cli.index, file).await?;
         }
 
-        Commands::Reindex { path } => {
-            commands::reindex::handle_reindex(&cli.index, path).await?;
+        Commands::Reindex { path, timeout } => {
+            commands::reindex::handle_reindex(&cli.index, path, timeout).await?;
         }
 
         Commands::List => {

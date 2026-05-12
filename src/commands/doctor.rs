@@ -87,7 +87,9 @@ async fn apply_fixes(checks: &[CheckResult], empty_indexes: &[EmptyIndex]) {
             }
             let root = std::path::PathBuf::from(&idx.root_path);
             println!("  Indexing '{}'...", idx.name);
-            match run_reindex(&idx.name, &root).await {
+            // Doctor auto-repair uses the default 600s timeout so very large
+            // repos still get a reasonable window without blocking forever.
+            match run_reindex(&idx.name, &root, 600).await {
                 Ok(()) => println!("  {} '{}' done", "✓".green(), idx.name),
                 Err(e) => println!("  {} '{}' failed: {e}", "✗".red(), idx.name),
             }

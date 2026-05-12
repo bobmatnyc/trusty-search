@@ -11,10 +11,13 @@ use colored::Colorize;
 /// health check).
 /// Test: `cargo run -- index --force` against a healthy daemon prints the
 /// registration line then drives the SSE progress bar.
+///
+/// `timeout_secs` is forwarded to the SSE stream reader; 0 = no limit.
 pub async fn handle_index(
     path: Option<std::path::PathBuf>,
     name: Option<String>,
     force: bool,
+    timeout_secs: u64,
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let project_path = path.unwrap_or(cwd);
@@ -71,9 +74,9 @@ pub async fn handle_index(
     //    sanity query) so the user gets immediate feedback if the
     //    rebuild produced an empty/broken index.
     if force {
-        run_reindex_force(&index_name, &project_path).await?;
+        run_reindex_force(&index_name, &project_path, timeout_secs).await?;
     } else {
-        run_reindex(&index_name, &project_path).await?;
+        run_reindex(&index_name, &project_path, timeout_secs).await?;
     }
     Ok(())
 }

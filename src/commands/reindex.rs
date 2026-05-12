@@ -9,9 +9,12 @@ use anyhow::Result;
 /// project root), then drives `run_reindex` which renders the SSE progress
 /// bar.
 /// Test: `cargo run -- reindex` from inside a registered project rebuilds it.
+///
+/// `timeout_secs` is forwarded to the SSE stream reader; 0 = no limit.
 pub async fn handle_reindex(
     explicit_index: &Option<String>,
     path: Option<std::path::PathBuf>,
+    timeout_secs: u64,
 ) -> Result<()> {
     let (index_id, warned) = resolve_index(explicit_index);
     print_index_header(&index_id, warned);
@@ -20,5 +23,5 @@ pub async fn handle_reindex(
         let cwd = std::env::current_dir().unwrap_or_default();
         detect_project(&cwd).root_path
     });
-    run_reindex(&index_id, &reindex_path).await
+    run_reindex(&index_id, &reindex_path, timeout_secs).await
 }
