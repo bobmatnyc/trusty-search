@@ -1,21 +1,18 @@
-# Publishes all crates in the trusty-search workspace to crates.io.
+# Publishes the trusty-search crate to crates.io.
 #
 # Triggered by:
-#   - Push of a tag matching v* (e.g. v0.1.58)
+#   - Push of a tag matching v* (e.g. v0.3.26)
 #   - Manual workflow_dispatch (with optional dry-run mode)
-#   - Downstream trigger from trusty-common's publish workflow
+#
+# Note: trusty-search is a single-crate repo (lib + bin) since v0.3.0.
+# The previous multi-crate workspace (trusty-search-core / -service / -mcp)
+# was consolidated in v0.3.0; those sub-crate names no longer exist.
 #
 # Cross-repo dependency:
-#   trusty-search-core depends on trusty-embedder (from trusty-common).
-#   trusty-search-service and trusty-search-mcp depend on trusty-common.
-#   Ensure trusty-common crates are published first before running this
-#   workflow with updated version pins.
-#
-# Publish order (dependency-first within workspace):
-#   1. trusty-search-core    — depends on trusty-embedder (external)
-#   2. trusty-search-service — depends on trusty-search-core + trusty-common
-#   3. trusty-search-mcp     — depends on trusty-search-core + trusty-search-service + trusty-mcp-core
-#   4. trusty-search (bin)   — depends on all three crates above
+#   trusty-search depends on trusty-common crates (trusty-embedder,
+#   trusty-mcp-core, trusty-common, trusty-symgraph). Ensure those are
+#   published to crates.io before running this workflow with updated
+#   version pins.
 #
 # Required repository secret:
 #   CARGO_REGISTRY_TOKEN — crates.io API token with publish scope.
@@ -39,7 +36,7 @@ env:
 
 jobs:
   publish:
-    name: Publish crates to crates.io
+    name: Publish trusty-search to crates.io
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -69,58 +66,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # ── Quality gate ──────────────────────────────────────────────────────
-      - name: Clippy (workspace, all targets)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (all targets)
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test (workspace)
-        run: cargo test --workspace
+      - name: Test
+        run: cargo test
 
       # ── Publish ───────────────────────────────────────────────────────────
-      # Note: [patch] overrides in Cargo.toml are ignored by `cargo publish`
-      # (by design — published crates must not rely on path patches). The
-      # workspace.dependencies entries reference the git-tagged versions of
-      # trusty-common crates which must already exist on crates.io.
+      # Note: [patch] overrides in Cargo.toml are stripped above — cargo
+      # publish uses the crates.io versions of trusty-common crates directly.
 
-      - name: Publish trusty-search-core
+      - name: Publish trusty-search
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p trusty-search-core --dry-run
+            cargo publish --dry-run
           else
-            cargo publish -p trusty-search-core --no-verify
-          fi
-
-      - name: Wait for index propagation (trusty-search-core)
-        if: ${{ inputs.dry_run != true }}
-        run: sleep 20
-
-      - name: Publish trusty-search-service
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p trusty-search-service --dry-run
-          else
-            cargo publish -p trusty-search-service --no-verify
-          fi
-
-      - name: Wait for index propagation (trusty-search-service)
-        if: ${{ inputs.dry_run != true }}
-        run: sleep 20
-
-      - name: Publish trusty-search-mcp
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p trusty-search-mcp --dry-run
-          else
-            cargo publish -p trusty-search-mcp --no-verify
-          fi
-
-      - name: Wait for index propagation (trusty-search-mcp)
-        if: ${{ inputs.dry_run != true }}
-        run: sleep 20
-
-      - name: Publish trusty-search (binary crate)
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p trusty-search --dry-run
-          else
-            cargo publish -p trusty-search --no-verify
+            cargo publish --no-verify
           fi
