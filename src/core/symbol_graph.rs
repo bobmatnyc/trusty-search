@@ -146,33 +146,77 @@ impl SymbolGraph {
         let cap = max_kg_nodes();
         let mut cap_warned = false;
         for (chunk_id, file, name, _calls, _inh, _ct) in chunks {
-            let Some(name) = name else { continue };
-            if name.is_empty() {
-                continue;
-            }
-            // First-write-wins so chunk_to_symbol stays stable.
-            if self.by_symbol.contains_key(name) {
-                self.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
-                continue;
-            }
-            if cap > 0 && self.by_symbol.len() >= cap {
-                if !cap_warned {
-                    tracing::warn!(
-                        "symbol graph node cap ({}) reached — skipping further new symbols \
-                         (override via TRUSTY_MAX_KG_NODES; 0 = unlimited)",
-                        cap
-                    );
-                    cap_warned = true;
-                }
-                continue;
-            }
-            let idx = self.graph.add_node(SymbolNode {
-                symbol: name.clone(),
-                chunk_id: chunk_id.clone(),
-                file: file.clone(),
-            });
-            self.by_symbol.insert(name.clone(), idx);
-            self.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
+            self.register_one_symbol(chunk_id, file, name.as_deref(), cap, &mut cap_warned);
+        }
+    }
+
+    /// Register a single chunk's symbol, honouring the node cap and
+    /// first-write-wins semantics.
+    ///
+    /// Why: keeps `register_symbol_nodes` flat — each branch (skip, alias an
+    /// existing symbol, hit the cap, or insert a new node) lives in one place
+    /// rather than as nested `continue` arms.
+    /// What: returns nothing; mutates `self` and toggles `cap_warned` the first
+    /// time the cap is hit.
+    /// Test: covered transitively by `test_build_simple_graph` and
+    /// `test_chunk_with_no_function_name_is_skipped`.
+    fn register_one_symbol(
+        &mut self,
+        chunk_id: &str,
+        file: &str,
+        name: Option<&str>,
+        cap: usize,
+        cap_warned: &mut bool,
+    ) {
+        let Some(name) = name else { return };
+        if name.is_empty() {
+            return;
+        }
+        // First-write-wins so chunk_to_symbol stays stable.
+        if self.by_symbol.contains_key(name) {
+            self.chunk_to_symbol
+                .insert(chunk_id.to_string(), name.to_string());
+            return;
+        }
+        if Self::cap_exceeded(cap, self.by_symbol.len()) {
+            Self::warn_cap_once(cap, cap_warned);
+            return;
+        }
+        let idx = self.graph.add_node(SymbolNode {
+            symbol: name.to_string(),
+            chunk_id: chunk_id.to_string(),
+            file: file.to_string(),
+        });
+        self.by_symbol.insert(name.to_string(), idx);
+        self.chunk_to_symbol
+            .insert(chunk_id.to_string(), name.to_string());
+    }
+
+    /// Returns true when a non-zero cap has been reached.
+    ///
+    /// Why: isolates the `cap > 0` sentinel so call sites read as a simple
+    /// boolean predicate.
+    /// What: `false` if the cap is disabled (`0`), else `current >= cap`.
+    /// Test: indirectly exercised by `register_one_symbol`'s callers.
+    fn cap_exceeded(cap: usize, current: usize) -> bool {
+        cap > 0 && current >= cap
+    }
+
+    /// Emit the node-cap warning exactly once per build.
+    ///
+    /// Why: `register_one_symbol` is called per chunk, and we don't want a
+    /// log line for every overflow.
+    /// What: logs at warn level and flips `cap_warned` on first invocation.
+    /// Test: behavioural — verified indirectly by builds completing without
+    /// log spam under the cap.
+    fn warn_cap_once(cap: usize, cap_warned: &mut bool) {
+        if !*cap_warned {
+            tracing::warn!(
+                "symbol graph node cap ({}) reached — skipping further new symbols \
+                 (override via TRUSTY_MAX_KG_NODES; 0 = unlimited)",
+                cap
+            );
+            *cap_warned = true;
         }
     }
 
@@ -260,23 +304,53 @@ impl SymbolGraph {
         }
         let by_file = self.group_symbols_by_file(chunks);
         for (_chunk_id, file, name, _calls, _inh, ct) in chunks {
-            if !Self::is_container(ct) {
+            self.emit_container_edges_for(file, name.as_deref(), ct, &by_file);
+        }
+    }
+
+    /// Emit `ModuleContains` edges from one container chunk to its file-mates.
+    ///
+    /// Why: peeling the per-chunk guards (`is_container`, name resolution,
+    /// sibling lookup) out of the outer loop drops the nesting depth and
+    /// removes three early-`continue` arms from
+    /// `add_module_contains_edges`.
+    /// What: no-op unless the chunk is a container with a registered symbol
+    /// and known siblings; otherwise calls `add_sibling_edges`.
+    /// Test: covered by `test_module_contains_edges_from_container_chunks`.
+    fn emit_container_edges_for(
+        &mut self,
+        file: &str,
+        name: Option<&str>,
+        ct: &ChunkType,
+        by_file: &HashMap<&str, Vec<(&str, NodeIndex)>>,
+    ) {
+        if !Self::is_container(ct) {
+            return;
+        }
+        let Some(name) = name else { return };
+        let Some(&from) = self.by_symbol.get(name) else {
+            return;
+        };
+        let Some(siblings) = by_file.get(file) else {
+            return;
+        };
+        self.add_sibling_edges(from, name, siblings);
+    }
+
+    /// Wire one `ModuleContains` edge per non-self sibling.
+    ///
+    /// Why: keeps the inner loop free of the self-edge / same-name filter so
+    /// the iteration intent is obvious.
+    /// What: walks `siblings`, skipping the container itself, and appends a
+    /// `ModuleContains` edge from `from` to every other registered symbol.
+    /// Test: covered by `test_module_contains_edges_from_container_chunks`.
+    fn add_sibling_edges(&mut self, from: NodeIndex, owner: &str, siblings: &[(&str, NodeIndex)]) {
+        for (sib_name, sib_idx) in siblings {
+            if *sib_idx == from || *sib_name == owner {
                 continue;
             }
-            let Some(name) = name else { continue };
-            let Some(&from) = self.by_symbol.get(name) else {
-                continue;
-            };
-            let Some(siblings) = by_file.get(file.as_str()) else {
-                continue;
-            };
-            for (sib_name, sib_idx) in siblings {
-                if *sib_idx == from || *sib_name == name.as_str() {
-                    continue;
-                }
-                self.graph
-                    .add_edge(from, *sib_idx, EdgeKind::ModuleContains);
-            }
+            self.graph
+                .add_edge(from, *sib_idx, EdgeKind::ModuleContains);
         }
     }
 
@@ -391,82 +465,181 @@ impl SymbolGraph {
         edge_kinds: &[EdgeKind],
         hops: usize,
     ) -> Vec<(String, String, EdgeKind)> {
-        let Some(&start) = self.by_symbol.get(symbol) else {
+        let Some(start) = self.start_index(symbol, hops) else {
             return Vec::new();
         };
-        if hops == 0 || edge_kinds.is_empty() {
+        if edge_kinds.is_empty() {
             return Vec::new();
         }
         let allowed: HashSet<&EdgeKind> = edge_kinds.iter().collect();
-
-        let mut visited: HashSet<NodeIndex> = HashSet::new();
-        visited.insert(start);
-        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
-        queue.push_back((start, 0));
         let mut out: Vec<(String, String, EdgeKind)> = Vec::new();
-
-        while let Some((node, depth)) = queue.pop_front() {
-            if depth >= hops {
-                continue;
-            }
-            // Walk both directions: caller→callee and callee→caller relations
-            // are both useful for KG expansion.
-            for dir in [Direction::Outgoing, Direction::Incoming] {
-                for edge in self.graph.edges_directed(node, dir) {
-                    if !allowed.contains(edge.weight()) {
-                        continue;
-                    }
-                    let nb = match dir {
-                        Direction::Outgoing => edge.target(),
-                        Direction::Incoming => edge.source(),
-                    };
-                    if visited.insert(nb) {
-                        let n = &self.graph[nb];
-                        out.push((n.symbol.clone(), n.chunk_id.clone(), edge.weight().clone()));
-                        queue.push_back((nb, depth + 1));
-                    }
-                }
-            }
-        }
+        self.bfs_walk(
+            start,
+            hops,
+            &[Direction::Outgoing, Direction::Incoming],
+            |edge| allowed.contains(edge.weight()),
+            |node, edge| {
+                out.push((
+                    node.symbol.clone(),
+                    node.chunk_id.clone(),
+                    edge.weight().clone(),
+                ));
+            },
+        );
         out
     }
 
     fn bfs_neighbors(&self, symbol: &str, hops: usize, dir: Direction) -> Vec<(String, String)> {
-        let Some(&start) = self.by_symbol.get(symbol) else {
+        let Some(start) = self.start_index(symbol, hops) else {
             return Vec::new();
         };
-        if hops == 0 {
-            return Vec::new();
-        }
+        let mut out: Vec<(String, String)> = Vec::new();
+        // Only walk call-graph edges; other `EdgeKind`s belong to entity
+        // expansion paths (Phase A/B/C) and shouldn't pollute callers/callees.
+        self.bfs_walk(
+            start,
+            hops,
+            &[dir],
+            |edge| edge.weight() == &EdgeKind::CallsFunction,
+            |node, _edge| {
+                out.push((node.symbol.clone(), node.chunk_id.clone()));
+            },
+        );
+        out
+    }
 
+    /// Resolve a start node for BFS expansion.
+    ///
+    /// Why: both `neighbors_by_edge` and `bfs_neighbors` open with the same
+    /// "look up the seed symbol, bail on `hops==0`" guard. Extracting it keeps
+    /// the BFS bodies focused on traversal.
+    /// What: returns `None` when the symbol is unknown or `hops==0`; otherwise
+    /// the node index of the seed.
+    /// Test: indirectly covered by `test_unknown_symbol_returns_empty` and the
+    /// `test_callers_of_*` family.
+    fn start_index(&self, symbol: &str, hops: usize) -> Option<NodeIndex> {
+        if hops == 0 {
+            return None;
+        }
+        self.by_symbol.get(symbol).copied()
+    }
+
+    /// Shared BFS engine for KG expansion.
+    ///
+    /// Why: `neighbors_by_edge` and `bfs_neighbors` previously duplicated the
+    /// visited-set / queue / direction-fan-out scaffolding, only differing in
+    /// the edge predicate and the per-neighbour visit callback. Centralising
+    /// this loop lets the public methods state *what* they want (edge filter +
+    /// output shape) without re-implementing *how* the traversal proceeds.
+    /// What: BFS up to `hops` levels from `start`, fanning out across every
+    /// direction in `dirs`. For each candidate edge, calls `edge_filter`; for
+    /// each newly-discovered neighbour, invokes `on_visit(node, edge)`.
+    /// Test: covered transitively by all `callers_of` / `callees_of` /
+    /// `neighbors_by_edge` tests in this module.
+    fn bfs_walk<F, V>(
+        &self,
+        start: NodeIndex,
+        hops: usize,
+        dirs: &[Direction],
+        edge_filter: F,
+        mut on_visit: V,
+    ) where
+        F: Fn(petgraph::graph::EdgeReference<'_, EdgeKind>) -> bool,
+        V: FnMut(&SymbolNode, petgraph::graph::EdgeReference<'_, EdgeKind>),
+    {
         let mut visited: HashSet<NodeIndex> = HashSet::new();
         visited.insert(start);
         let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
         queue.push_back((start, 0));
-        let mut out: Vec<(String, String)> = Vec::new();
 
         while let Some((node, depth)) = queue.pop_front() {
             if depth >= hops {
                 continue;
             }
-            // Only walk call-graph edges; other `EdgeKind`s belong to entity
-            // expansion paths (Phase A/B/C) and shouldn't pollute callers/callees.
+            self.expand_node(
+                node,
+                depth,
+                dirs,
+                &edge_filter,
+                &mut on_visit,
+                &mut visited,
+                &mut queue,
+            );
+        }
+    }
+
+    /// Visit every allowed neighbour of `node` and enqueue newly-seen ones.
+    ///
+    /// Why: keeps `bfs_walk`'s loop body small — direction fan-out, edge
+    /// filtering, and the visited/queue bookkeeping each have a clear home.
+    /// What: for each direction in `dirs`, iterates edges, applies
+    /// `edge_filter`, and forwards the resolved neighbour to
+    /// `record_neighbor`.
+    /// Test: covered by every `bfs_walk` consumer
+    /// (`callers_of`, `callees_of`, `neighbors_by_edge` tests).
+    #[allow(clippy::too_many_arguments)]
+    fn expand_node<F, V>(
+        &self,
+        node: NodeIndex,
+        depth: usize,
+        dirs: &[Direction],
+        edge_filter: &F,
+        on_visit: &mut V,
+        visited: &mut HashSet<NodeIndex>,
+        queue: &mut VecDeque<(NodeIndex, usize)>,
+    ) where
+        F: Fn(petgraph::graph::EdgeReference<'_, EdgeKind>) -> bool,
+        V: FnMut(&SymbolNode, petgraph::graph::EdgeReference<'_, EdgeKind>),
+    {
+        for &dir in dirs {
             for edge in self.graph.edges_directed(node, dir) {
-                if edge.weight() != &EdgeKind::CallsFunction {
+                if !edge_filter(edge) {
                     continue;
                 }
-                let nb = match dir {
-                    Direction::Outgoing => edge.target(),
-                    Direction::Incoming => edge.source(),
-                };
-                if visited.insert(nb) {
-                    let n = &self.graph[nb];
-                    out.push((n.symbol.clone(), n.chunk_id.clone()));
-                    queue.push_back((nb, depth + 1));
-                }
+                let nb = Self::neighbor_in_direction(edge, dir);
+                self.record_neighbor(nb, edge, depth, on_visit, visited, queue);
             }
         }
-        out
+    }
+
+    /// Resolve the "other end" of an edge given the traversal direction.
+    ///
+    /// Why: makes the direction → endpoint mapping explicit and reusable.
+    /// What: returns `target` for outgoing edges, `source` for incoming.
+    /// Test: implicitly covered by every BFS test.
+    fn neighbor_in_direction(
+        edge: petgraph::graph::EdgeReference<'_, EdgeKind>,
+        dir: Direction,
+    ) -> NodeIndex {
+        match dir {
+            Direction::Outgoing => edge.target(),
+            Direction::Incoming => edge.source(),
+        }
+    }
+
+    /// Record a newly-discovered neighbour and enqueue it for further expansion.
+    ///
+    /// Why: centralises the "first visit" check so we don't accidentally
+    /// double-emit a node when both directions reach it.
+    /// What: returns early when `nb` was already visited; otherwise calls
+    /// `on_visit` and pushes `(nb, depth+1)` onto the BFS queue.
+    /// Test: covered transitively by the `bfs_walk` consumers.
+    fn record_neighbor<V>(
+        &self,
+        nb: NodeIndex,
+        edge: petgraph::graph::EdgeReference<'_, EdgeKind>,
+        depth: usize,
+        on_visit: &mut V,
+        visited: &mut HashSet<NodeIndex>,
+        queue: &mut VecDeque<(NodeIndex, usize)>,
+    ) where
+        V: FnMut(&SymbolNode, petgraph::graph::EdgeReference<'_, EdgeKind>),
+    {
+        if visited.insert(nb) {
+            let n = &self.graph[nb];
+            on_visit(n, edge);
+            queue.push_back((nb, depth + 1));
+        }
     }
 }
 
