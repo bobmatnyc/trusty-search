@@ -22,8 +22,9 @@ use dashmap::DashMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
 /// Machine-wide reindex serializer.
@@ -290,16 +291,87 @@ pub fn spawn_reindex_with_cleanup(
         let mut total_vector_upsert_ms: u64 = 0;
         let mut total_vector_count: usize = 0;
 
-        // Memory-protection state (issue #76). `mem_limit` is `Some` only
-        // when `TRUSTY_MEMORY_LIMIT_MB` is set. `peak_rss_mb` tracks the
-        // maximum RSS observed across the whole reindex so we can log it at
-        // completion. `mem_limit_hit` records whether we bailed out early.
-        // `batch_index` lets us cheap-poll RSS every N batches instead of
-        // every batch (sysinfo refresh costs ~ms).
+        // Memory-protection state (issues #76, #82). `mem_limit` is `Some`
+        // only when `TRUSTY_MEMORY_LIMIT_MB` is set. The previous design
+        // sampled RSS every 10 batches *before* parse/embed/commit, which let
+        // a single batch push RSS 4× over the configured limit before being
+        // noticed (issue #82: 10 GB limit → 40 GB actual).
+        //
+        // The new design has three layers of protection:
+        //   1. A background poller task (spawned below) samples RSS every
+        //      `MEM_POLL_INTERVAL` and sets `mem_abort` the moment the limit
+        //      is breached. This catches mid-batch spikes that batch-boundary
+        //      checks miss.
+        //   2. The main loop checks `mem_abort` on EVERY batch (not every 10)
+        //      and also AFTER `commit_parsed_batch` returns, so the largest
+        //      allocator (HNSW + redb commit) is bracketed by checks.
+        //   3. The KG rebuild at the end also honours the abort flag.
+        //
+        // `peak_rss_mb` is updated by the poller via an atomic so the final
+        // log line reflects the true peak, not just batch-boundary samples.
         let mem_limit = memory_limit_mb();
-        let mut peak_rss_mb: u64 = current_rss_mb().unwrap_or(0);
+        let mem_abort = Arc::new(AtomicBool::new(false));
+        let peak_rss_atomic = Arc::new(AtomicU64::new(current_rss_mb().unwrap_or(0)));
         let mut mem_limit_hit: bool = false;
-        const MEM_CHECK_EVERY_N_BATCHES: usize = 10;
+
+        /// How often the background poller samples RSS. 1 s strikes a
+        /// balance between catching mid-batch spikes and the cost of
+        /// `sysinfo::refresh_processes_specifics` (~1–3 ms on macOS).
+        const MEM_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+        // Spawn the background poller. It runs until `poller_stop` flips,
+        // updating `peak_rss_atomic` and tripping `mem_abort` whenever RSS
+        // crosses `mem_limit`. When no limit is configured we still run the
+        // poller so `peak_rss_mb` is accurate for the final log line — the
+        // overhead is one sysinfo refresh per second.
+        let poller_stop = Arc::new(AtomicBool::new(false));
+        let poller_handle = {
+            let mem_abort = mem_abort.clone();
+            let peak_rss = peak_rss_atomic.clone();
+            let stop = poller_stop.clone();
+            let index_id_for_log = index_id.0.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(MEM_POLL_INTERVAL);
+                // Drop the immediate first tick so we don't double-sample
+                // with the synchronous `current_rss_mb()` already done above.
+                ticker.tick().await;
+                loop {
+                    if stop.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
+                    if let Some(rss) = current_rss_mb() {
+                        // Update peak monotonically.
+                        let mut prev = peak_rss.load(AtomicOrdering::Acquire);
+                        while rss > prev {
+                            match peak_rss.compare_exchange_weak(
+                                prev,
+                                rss,
+                                AtomicOrdering::AcqRel,
+                                AtomicOrdering::Acquire,
+                            ) {
+                                Ok(_) => break,
+                                Err(cur) => prev = cur,
+                            }
+                        }
+                        if let Some(limit) = mem_limit {
+                            if rss >= limit && !mem_abort.load(AtomicOrdering::Acquire) {
+                                tracing::warn!(
+                                    "reindex memory poller: rss={}MB >= limit={}MB \
+                                     — tripping abort flag for index {}",
+                                    rss,
+                                    limit,
+                                    index_id_for_log,
+                                );
+                                mem_abort.store(true, AtomicOrdering::Release);
+                                // Keep polling so peak_rss continues to track
+                                // until the main loop notices the flag.
+                            }
+                        }
+                    }
+                    ticker.tick().await;
+                }
+            })
+        };
 
         // Process files in batches. Each batch:
         //  1. Reads files concurrently (tokio::fs::read_to_string).
@@ -307,32 +379,23 @@ pub fn spawn_reindex_with_cleanup(
         //  3. Calls `CodeIndexer::index_files_batch` — one ONNX call per
         //     EMBED_BATCH_SIZE chunks across the whole batch, one symbol-graph
         //     rebuild per batch.
-        for (batch_index, batch) in walk.files.chunks(REINDEX_BATCH_SIZE).enumerate() {
-            // Memory-protection poll (issue #76). Every Nth batch (and on
-            // batch 0), refresh process RSS, update the peak, and bail out
-            // gracefully if a configured `TRUSTY_MEMORY_LIMIT_MB` has been
-            // breached. Skipping remaining batches preserves all chunks
-            // already committed — a partial reindex is safer than an
-            // OOM-kill that loses the daemon's in-memory state entirely.
-            if batch_index.is_multiple_of(MEM_CHECK_EVERY_N_BATCHES) {
-                if let Some(rss) = current_rss_mb() {
-                    if rss > peak_rss_mb {
-                        peak_rss_mb = rss;
-                    }
-                    if let Some(limit) = mem_limit {
-                        if rss >= limit {
-                            tracing::warn!(
-                                "reindex: memory limit hit (rss={}MB >= limit={}MB), \
-                                 skipping remaining batches for index {}",
-                                rss,
-                                limit,
-                                index_id.0
-                            );
-                            mem_limit_hit = true;
-                            break;
-                        }
-                    }
-                }
+        for batch in walk.files.chunks(REINDEX_BATCH_SIZE) {
+            // Memory-protection check (issues #76, #82). Honour the abort
+            // flag set by the background poller — checked on EVERY batch.
+            // Skipping remaining batches preserves all chunks already
+            // committed; a partial reindex is safer than an OOM-kill that
+            // loses the daemon's in-memory state entirely.
+            if mem_abort.load(AtomicOrdering::Acquire) {
+                let rss = current_rss_mb().unwrap_or(0);
+                tracing::warn!(
+                    "reindex: memory limit hit before batch (rss={}MB, \
+                     limit={:?}MB) — skipping remaining batches for index {}",
+                    rss,
+                    mem_limit,
+                    index_id.0
+                );
+                mem_limit_hit = true;
+                break;
             }
 
             // 1) Read all files in the batch concurrently.
@@ -477,6 +540,34 @@ pub fn spawn_reindex_with_cleanup(
                             "chunks_per_sec": chunks_per_sec,
                         }))
                         .await;
+                    // Post-commit memory check (issue #82). The commit phase
+                    // (HNSW insert + redb write + BM25 update) is the single
+                    // largest in-batch allocator. Sampling RSS *after* commit
+                    // — in addition to the pre-batch abort-flag check — means
+                    // a runaway batch can only push RSS one batch over the
+                    // limit before being noticed, instead of accumulating
+                    // across the previous `MEM_CHECK_EVERY_N_BATCHES` cadence.
+                    if let Some(limit) = mem_limit {
+                        if let Some(rss) = current_rss_mb() {
+                            let prev_peak = peak_rss_atomic.load(AtomicOrdering::Acquire);
+                            if rss > prev_peak {
+                                peak_rss_atomic.store(rss, AtomicOrdering::Release);
+                            }
+                            if rss >= limit {
+                                tracing::warn!(
+                                    "reindex: memory limit hit after commit \
+                                     (rss={}MB >= limit={}MB) — skipping \
+                                     remaining batches for index {}",
+                                    rss,
+                                    limit,
+                                    index_id.0
+                                );
+                                mem_abort.store(true, AtomicOrdering::Release);
+                                mem_limit_hit = true;
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     // Whole batch failed — surface a single error event listing
@@ -506,14 +597,34 @@ pub fn spawn_reindex_with_cleanup(
         // per-batch rebuilds above because each rebuild is O(N + E) over the
         // entire corpus and would scale quadratically with file count if run
         // per batch. One rebuild at the end gives the same final state.
+        //
+        // Issue #82: skip the KG rebuild if we already breached the memory
+        // limit during batch processing. The symbol graph is itself a
+        // significant allocator (petgraph adjacency lists scale with edge
+        // count) and pushing further into a busted memory budget risks
+        // OOM-kill of the whole daemon. A partial reindex with no fresh KG
+        // is recoverable; an OOM-killed daemon is not.
         let kg_start = Instant::now();
-        let (symbol_count, edge_count) = {
-            let indexer = handle.indexer.read().await;
-            indexer.rebuild_symbol_graph_now().await;
-            let g = indexer.symbol_graph().await;
-            (g.node_count(), g.edge_count())
-        };
+        let (symbol_count, edge_count, kg_skipped) =
+            if mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire) {
+                tracing::warn!(
+                    "reindex: skipping KG rebuild for index {} — memory limit \
+                     already breached during batch processing",
+                    index_id.0
+                );
+                (0usize, 0usize, true)
+            } else {
+                let indexer = handle.indexer.read().await;
+                indexer.rebuild_symbol_graph_now().await;
+                let g = indexer.symbol_graph().await;
+                (g.node_count(), g.edge_count(), false)
+            };
         let kg_ms = kg_start.elapsed().as_millis() as u64;
+
+        // Stop the background poller and collect the true peak it observed.
+        poller_stop.store(true, AtomicOrdering::Release);
+        // Best-effort: don't fail completion if the poller is wedged.
+        let _ = poller_handle.await;
 
         progress.status.store(ReindexStatus::Complete);
         let total_chunks = progress.total_chunks.load(Ordering::Acquire);
@@ -522,13 +633,16 @@ pub fn spawn_reindex_with_cleanup(
             .checked_div(elapsed_ms)
             .unwrap_or(0);
 
-        // Final RSS poll so the peak reflects post-commit memory (the symbol
-        // graph rebuild may itself push RSS higher than any per-batch sample).
+        // Final synchronous RSS poll so the peak reflects post-KG memory
+        // (the symbol graph rebuild may itself push RSS higher than any
+        // background sample taken before it ran).
         if let Some(rss) = current_rss_mb() {
-            if rss > peak_rss_mb {
-                peak_rss_mb = rss;
+            let prev = peak_rss_atomic.load(AtomicOrdering::Acquire);
+            if rss > prev {
+                peak_rss_atomic.store(rss, AtomicOrdering::Release);
             }
         }
+        let peak_rss_mb = peak_rss_atomic.load(AtomicOrdering::Acquire);
         let indexed_final = progress.indexed.load(Ordering::Acquire);
         tracing::info!(
             "reindex complete: index={} files={} chunks={} elapsed_ms={} \
@@ -552,6 +666,7 @@ pub fn spawn_reindex_with_cleanup(
                 "chunks_per_sec": chunks_per_sec,
                 "peak_rss_mb": peak_rss_mb,
                 "memory_limit_hit": mem_limit_hit,
+                "kg_skipped": kg_skipped,
                 "timings": {
                     "parse_ms": total_parse_ms,
                     "embed_ms": total_embed_ms,
