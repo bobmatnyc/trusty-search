@@ -403,22 +403,45 @@ impl CodeIndexer {
     /// O(N + E) over chunks/calls and the corpus is small + in-memory, so we
     /// favour simplicity over incremental maintenance.
     async fn rebuild_symbol_graph(&self) {
+        // Issue (180GB RSS fix): the temporary `Vec<ChunkTuple>` snapshot clones
+        // every chunk's strings (id, file, function_name, calls, inherits_from)
+        // and can hit 1-2 GB on a 1M-chunk corpus. We can't avoid the snapshot
+        // entirely (build_from_chunks needs a slice, and we don't want to hold
+        // the chunks read lock across `add_node`), but we cap snapshot size to
+        // the same KG node cap so we don't allocate more than we'll actually
+        // use. Chunks past the cap can't contribute new symbols anyway.
+        let kg_cap = crate::core::symbol_graph::max_kg_nodes();
         let chunks = self.chunks.read().await;
-        let tuples: Vec<ChunkTuple> = chunks
-            .values()
-            .map(|c| {
-                (
-                    c.id.clone(),
-                    c.file.clone(),
-                    c.function_name.clone(),
-                    c.calls.clone(),
-                    c.inherits_from.clone(),
-                    c.chunk_type.clone(),
-                )
-            })
-            .collect();
+        // Pre-size for the worst case. When `kg_cap == 0` (unlimited) fall back
+        // to corpus size. Multiplied by 2 because the cap is on unique symbols
+        // and a single function might be defined across a handful of duplicates.
+        let snapshot_cap = if kg_cap == 0 {
+            chunks.len()
+        } else {
+            // Heuristic: most chunks have a function name; cap snapshot at
+            // 2× the KG node cap to leave headroom for duplicates while still
+            // bounding peak allocation.
+            (kg_cap.saturating_mul(2)).min(chunks.len())
+        };
+        let mut tuples: Vec<ChunkTuple> = Vec::with_capacity(snapshot_cap);
+        for c in chunks.values() {
+            if tuples.len() >= snapshot_cap {
+                break;
+            }
+            tuples.push((
+                c.id.clone(),
+                c.file.clone(),
+                c.function_name.clone(),
+                c.calls.clone(),
+                c.inherits_from.clone(),
+                c.chunk_type.clone(),
+            ));
+        }
         drop(chunks);
         let new_graph = Arc::new(SymbolGraph::build_from_chunks(&tuples));
+        // Free the snapshot immediately — it's the second-largest allocation
+        // in this function and we don't need it past `build_from_chunks`.
+        drop(tuples);
         *self.symbol_graph.write().await = new_graph;
     }
 
@@ -897,12 +920,79 @@ impl CodeIndexer {
     ) -> Result<CommitTimings> {
         let ParsedBatch {
             chunks: mut all_chunks,
-            embeddings,
+            mut embeddings,
             entities_by_file,
             parse_ms: _,
             embed_ms: _,
             vector_count: _,
         } = parsed;
+
+        // Issue #N (180GB RSS fix): enforce the per-index chunk cap BEFORE
+        // ingesting anything into BM25, HNSW, or the embedding cache.
+        //
+        // Why: previously `commit_corpus` was the only place that honoured the
+        // cap. Chunks that were dropped from the corpus map still leaked into:
+        //   - the HNSW vector store (via `commit_vectors_batch`)
+        //   - the BM25 posting list (via `commit_bm25_batch`)
+        //   - the chunk_embeddings LRU (via `commit_embeddings_cache`)
+        // So on an over-cap repo, three structures grew unbounded while the
+        // corpus map looked "capped". Pre-filtering here keeps every in-memory
+        // structure consistent with the configured cap. Brand-new ids past the
+        // cap are dropped; updates to existing ids are always allowed (they
+        // don't grow the corpus).
+        //
+        // This is the structural fix for issue #82 — chunks dropped here never
+        // allocate downstream, so RSS stays bounded by `TRUSTY_MAX_CHUNKS`.
+        let cap = max_chunks_per_index();
+        let pre_filter_dropped = {
+            let corpus = self.chunks.read().await;
+            let mut keep_mask: Vec<bool> = Vec::with_capacity(all_chunks.len());
+            let mut new_count = corpus.len();
+            let mut dropped = 0usize;
+            for chunk in &all_chunks {
+                let is_update = corpus.contains_key(&chunk.id);
+                if is_update {
+                    keep_mask.push(true);
+                } else if new_count < cap {
+                    new_count += 1;
+                    keep_mask.push(true);
+                } else {
+                    dropped += 1;
+                    keep_mask.push(false);
+                }
+            }
+            drop(corpus);
+            if dropped > 0 {
+                // Rebuild chunks/embeddings in place, dropping over-cap entries
+                // so they never reach the downstream structures.
+                let mut kept_chunks: Vec<RawChunk> = Vec::with_capacity(all_chunks.len() - dropped);
+                let mut kept_embeddings: Vec<Option<Vec<f32>>> =
+                    Vec::with_capacity(all_chunks.len() - dropped);
+                for ((chunk, vec_opt), keep) in all_chunks
+                    .drain(..)
+                    .zip(embeddings.drain(..))
+                    .zip(keep_mask)
+                {
+                    if keep {
+                        kept_chunks.push(chunk);
+                        kept_embeddings.push(vec_opt);
+                    }
+                }
+                all_chunks = kept_chunks;
+                embeddings = kept_embeddings;
+            }
+            dropped
+        };
+        if pre_filter_dropped > 0 {
+            tracing::warn!(
+                "index '{}' chunk cap ({}) reached — pre-filtered {} chunks before commit \
+                 (prevents leak into BM25/HNSW/embedding cache)",
+                self.index_id,
+                cap,
+                pre_filter_dropped
+            );
+        }
+
         let chunk_total = all_chunks.len();
         if chunk_total == 0 {
             self.commit_entities(entities_by_file).await;

@@ -24,6 +24,26 @@ use serde::{Deserialize, Serialize};
 use crate::core::chunker::ChunkType;
 use crate::core::entity::EdgeKind;
 
+/// Default cap on symbol graph nodes (issue: 180GB RSS fix).
+///
+/// Why: each node clones three `String`s (symbol, chunk_id, file) plus the
+/// `by_symbol` and `chunk_to_symbol` HashMaps clone more strings. Edges are
+/// cheap (`EdgeKind` enum) but `build_suffix_lookup` builds yet another
+/// `HashMap<String, NodeIndex>`. On a 1M-chunk monorepo this graph can pin
+/// 3-5 GB of RAM. Capping at 100k symbols keeps KG expansion useful for the
+/// most-referenced code while bounding memory. Override via
+/// `TRUSTY_MAX_KG_NODES`; set to 0 to disable the cap entirely (legacy).
+const DEFAULT_MAX_KG_NODES: usize = 100_000;
+
+/// Read `TRUSTY_MAX_KG_NODES` from the environment, falling back to the
+/// default. Zero disables the cap (use only if you trust your corpus size).
+pub fn max_kg_nodes() -> usize {
+    std::env::var("TRUSTY_MAX_KG_NODES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_KG_NODES)
+}
+
 /// A node in the symbol graph. One node per defining symbol (function or method).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolNode {
@@ -119,6 +139,12 @@ impl SymbolGraph {
     /// Test: covered by `test_build_simple_graph` and
     /// `test_chunk_with_no_function_name_is_skipped`.
     fn register_symbol_nodes(&mut self, chunks: &[ChunkTuple]) {
+        // Issue (180GB RSS fix): hard cap on graph node count. Once exceeded,
+        // we stop adding **new** symbols. Existing symbol updates (and
+        // chunk_to_symbol pointers for already-known symbols) still proceed
+        // so KG expansion keeps working for the symbols already in the graph.
+        let cap = max_kg_nodes();
+        let mut cap_warned = false;
         for (chunk_id, file, name, _calls, _inh, _ct) in chunks {
             let Some(name) = name else { continue };
             if name.is_empty() {
@@ -127,6 +153,17 @@ impl SymbolGraph {
             // First-write-wins so chunk_to_symbol stays stable.
             if self.by_symbol.contains_key(name) {
                 self.chunk_to_symbol.insert(chunk_id.clone(), name.clone());
+                continue;
+            }
+            if cap > 0 && self.by_symbol.len() >= cap {
+                if !cap_warned {
+                    tracing::warn!(
+                        "symbol graph node cap ({}) reached — skipping further new symbols \
+                         (override via TRUSTY_MAX_KG_NODES; 0 = unlimited)",
+                        cap
+                    );
+                    cap_warned = true;
+                }
                 continue;
             }
             let idx = self.graph.add_node(SymbolNode {
