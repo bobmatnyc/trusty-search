@@ -418,9 +418,53 @@ struct BatchOutcome {
 /// stages that share read/filter state into one function whose responsibility
 /// is "advance the index by one batch".
 async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
+    // 1) Read + filter (errors, minified, hash-skip) → BatchPayload.
+    let payload = prepare_batch_payload(ctx, batch).await;
+    if payload.to_index.is_empty() {
+        return BatchOutcome::default();
+    }
+
+    // 2) Parse + embed (read lock) → commit (write lock).
+    let result = parse_embed_and_commit(&ctx.handle, payload.to_index.clone()).await;
+    let (parse_ms, embed_ms, vector_count, commit) = match result {
+        Ok(t) => t,
+        Err(e) => {
+            emit_batch_error(ctx, &payload.to_index_paths, e).await;
+            return BatchOutcome::default();
+        }
+    };
+
+    // 3) Apply success → update totals, persist hashes, emit `batch` event.
+    let batch_files = payload.to_index.len();
+    apply_successful_commit(ctx, payload.new_hashes, batch_files, &commit).await;
+
+    // 4) Post-commit memory check (issue #82).
+    let mem_limit_hit = check_post_commit_memory(ctx);
+
+    BatchOutcome {
+        parse_ms,
+        embed_ms,
+        bm25_ms: commit.bm25_ms,
+        vector_upsert_ms: commit.vector_upsert_ms,
+        vector_count,
+        mem_limit_hit,
+    }
+}
+
+/// Sanitised contents of one batch after read + filter passes.
+struct BatchPayload {
+    to_index: Vec<(String, String)>,
+    to_index_paths: Vec<PathBuf>,
+    new_hashes: Vec<(PathBuf, String)>,
+}
+
+/// Read every file in `batch` concurrently, then drop read errors, minified
+/// content, and hash-matches. Each drop emits the right SSE event so the UI
+/// progress bar advances even for skipped/error files.
+async fn prepare_batch_payload(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchPayload {
     use std::sync::atomic::Ordering;
 
-    // 1) Read every file in the batch concurrently.
+    // Read every file in the batch concurrently.
     let read_futs = batch.iter().map(|path| {
         let path = path.clone();
         async move {
@@ -430,9 +474,6 @@ async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
     });
     let read_results = futures::future::join_all(read_futs).await;
 
-    // 2) Build the batch payload, applying read-error, minified, and
-    //    hash-skip filters. Each drop emits the right SSE event so the UI
-    //    progress bar advances even for skipped/error files.
     let mut to_index: Vec<(String, String)> = Vec::with_capacity(batch.len());
     let mut to_index_paths: Vec<PathBuf> = Vec::with_capacity(batch.len());
     let mut new_hashes: Vec<(PathBuf, String)> = Vec::with_capacity(batch.len());
@@ -460,17 +501,7 @@ async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
         };
         if should_skip_content(&path, &content) {
             tracing::debug!("reindex: skipping minified content in {}", path.display());
-            ctx.progress.skipped.fetch_add(1, Ordering::Release);
-            let indexed = ctx.progress.indexed.fetch_add(1, Ordering::Release) + 1;
-            ctx.progress
-                .push(serde_json::json!({
-                    "event": "skip",
-                    "file": rel,
-                    "reason": "minified",
-                    "indexed": indexed,
-                    "total_files": ctx.total,
-                }))
-                .await;
+            emit_skip(ctx, &rel, Some("minified")).await;
             continue;
         }
         let h = hash_content(&content);
@@ -480,16 +511,7 @@ async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
             .map(|prev| *prev == h)
             .unwrap_or(false)
         {
-            ctx.progress.skipped.fetch_add(1, Ordering::Release);
-            let indexed = ctx.progress.indexed.fetch_add(1, Ordering::Release) + 1;
-            ctx.progress
-                .push(serde_json::json!({
-                    "event": "skip",
-                    "file": rel,
-                    "indexed": indexed,
-                    "total_files": ctx.total,
-                }))
-                .await;
+            emit_skip(ctx, &rel, None).await;
             continue;
         }
         let path_str = path.to_string_lossy().to_string();
@@ -498,59 +520,88 @@ async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
         new_hashes.push((path, h));
     }
 
-    if to_index.is_empty() {
-        return BatchOutcome::default();
+    BatchPayload {
+        to_index,
+        to_index_paths,
+        new_hashes,
     }
+}
 
-    // 3) Bulk-index: parse+embed under a read lock (pure CPU/ONNX, no write
-    //    lock held), then commit under a write lock. Search and the next
-    //    batch's I/O proceed unblocked during parse+embed.
-    let result: anyhow::Result<(u64, u64, usize, CommitTimings)> = async {
-        let parsed = {
-            let indexer = ctx.handle.indexer.read().await;
-            indexer.parse_and_embed_files(to_index.clone()).await?
-        };
-        let parse_ms = parsed.parse_ms;
-        let embed_ms = parsed.embed_ms;
-        let vector_count = parsed.vector_count;
-        let indexer = ctx.handle.indexer.write().await;
-        let commit = indexer.commit_parsed_batch(parsed, true).await?;
-        Ok((parse_ms, embed_ms, vector_count, commit))
+/// Push a `skip` SSE event, bumping the per-progress skipped/indexed
+/// counters. `reason` is included when supplied (e.g. `"minified"`).
+async fn emit_skip(ctx: &BatchCtx, rel: &str, reason: Option<&str>) {
+    use std::sync::atomic::Ordering;
+    ctx.progress.skipped.fetch_add(1, Ordering::Release);
+    let indexed = ctx.progress.indexed.fetch_add(1, Ordering::Release) + 1;
+    let mut event = serde_json::json!({
+        "event": "skip",
+        "file": rel,
+        "indexed": indexed,
+        "total_files": ctx.total,
+    });
+    if let Some(r) = reason {
+        event["reason"] = serde_json::Value::String(r.to_string());
     }
-    .await;
+    ctx.progress.push(event).await;
+}
 
-    let (parse_ms, embed_ms, vector_count, commit) = match result {
-        Ok(t) => t,
-        Err(e) => {
-            // Whole batch failed — surface one error event listing the
-            // affected files. Caller can retry individually via `index_file`.
-            let files_in_batch: Vec<String> = to_index_paths
-                .iter()
-                .map(|p| p.strip_prefix(&ctx.root).unwrap_or(p).display().to_string())
-                .collect();
-            ctx.progress
-                .errors
-                .fetch_add(to_index_paths.len(), Ordering::Release);
-            ctx.progress
-                .push(serde_json::json!({
-                    "event": "error",
-                    "files": files_in_batch,
-                    "message": format!("batch index: {e}"),
-                    "indexed": ctx.progress.indexed.load(Ordering::Acquire),
-                    "total_files": ctx.total,
-                }))
-                .await;
-            return BatchOutcome::default();
-        }
+/// Run parse+embed under a read lock, then the commit under a write lock.
+///
+/// Why: split this way to keep the read lock (concurrent search-safe) for the
+/// long, pure-CPU parse+embed phase, and only take the write lock for the
+/// short corpus/BM25/HNSW commit window. Returns the parse/embed timings plus
+/// the structured `CommitTimings` from the commit phase.
+async fn parse_embed_and_commit(
+    handle: &IndexHandle,
+    to_index: Vec<(String, String)>,
+) -> anyhow::Result<(u64, u64, usize, CommitTimings)> {
+    let parsed = {
+        let indexer = handle.indexer.read().await;
+        indexer.parse_and_embed_files(to_index).await?
     };
+    let parse_ms = parsed.parse_ms;
+    let embed_ms = parsed.embed_ms;
+    let vector_count = parsed.vector_count;
+    let indexer = handle.indexer.write().await;
+    let commit = indexer.commit_parsed_batch(parsed, true).await?;
+    Ok((parse_ms, embed_ms, vector_count, commit))
+}
 
-    // 4) Apply success: update totals via the returned `BatchOutcome`,
-    //    persist new hashes, emit the `batch` SSE event.
+/// Emit one `error` SSE event covering every file in a failed batch. Caller
+/// can retry the failing files individually via `index_file`.
+async fn emit_batch_error(ctx: &BatchCtx, to_index_paths: &[PathBuf], err: anyhow::Error) {
+    use std::sync::atomic::Ordering;
+    let files_in_batch: Vec<String> = to_index_paths
+        .iter()
+        .map(|p| p.strip_prefix(&ctx.root).unwrap_or(p).display().to_string())
+        .collect();
+    ctx.progress
+        .errors
+        .fetch_add(to_index_paths.len(), Ordering::Release);
+    ctx.progress
+        .push(serde_json::json!({
+            "event": "error",
+            "files": files_in_batch,
+            "message": format!("batch index: {err}"),
+            "indexed": ctx.progress.indexed.load(Ordering::Acquire),
+            "total_files": ctx.total,
+        }))
+        .await;
+}
+
+/// Apply a successful commit: update progress counters, persist hashes,
+/// shrink the hash cache if oversize, and emit the per-batch SSE event.
+async fn apply_successful_commit(
+    ctx: &BatchCtx,
+    new_hashes: Vec<(PathBuf, String)>,
+    batch_files: usize,
+    commit: &CommitTimings,
+) {
+    use std::sync::atomic::Ordering;
     let new_chunks = commit.chunks;
     ctx.progress
         .total_chunks
         .fetch_add(new_chunks, Ordering::Release);
-    let batch_files = to_index.len();
     let indexed = ctx
         .progress
         .indexed
@@ -577,42 +628,122 @@ async fn process_one_batch(ctx: &BatchCtx, batch: &[PathBuf]) -> BatchOutcome {
             "chunks_per_sec": chunks_per_sec,
         }))
         .await;
+}
 
-    // 5) Post-commit memory check (issue #82): the commit phase (HNSW insert +
-    //    redb write + BM25 update) is the single largest in-batch allocator.
-    //    Sampling RSS here, in addition to the pre-batch abort-flag check,
-    //    means a runaway batch can only push RSS one batch over the limit
-    //    before being noticed.
-    let mut mem_limit_hit = false;
-    if let Some(limit) = ctx.mem_limit {
-        if let Some(rss) = current_rss_mb() {
-            let prev_peak = ctx.peak_rss_atomic.load(AtomicOrdering::Acquire);
-            if rss > prev_peak {
-                ctx.peak_rss_atomic.store(rss, AtomicOrdering::Release);
-            }
-            if rss >= limit {
-                tracing::warn!(
-                    "reindex: memory limit hit after commit \
-                     (rss={}MB >= limit={}MB) — skipping \
-                     remaining batches for index {}",
-                    rss,
-                    limit,
-                    ctx.index_id.0
-                );
-                ctx.mem_abort.store(true, AtomicOrdering::Release);
-                mem_limit_hit = true;
-            }
-        }
+/// Sample RSS after the commit phase and trip the abort flag if the limit was
+/// hit. Returns `true` when the caller must break out of the batch loop.
+///
+/// Why: issue #82 — the commit phase (HNSW insert + redb write + BM25 update)
+/// is the single largest in-batch allocator. Sampling RSS here, in addition
+/// to the pre-batch abort-flag check, means a runaway batch can only push RSS
+/// one batch over the limit before being noticed.
+fn check_post_commit_memory(ctx: &BatchCtx) -> bool {
+    let Some(limit) = ctx.mem_limit else {
+        return false;
+    };
+    let Some(rss) = current_rss_mb() else {
+        return false;
+    };
+    let prev_peak = ctx.peak_rss_atomic.load(AtomicOrdering::Acquire);
+    if rss > prev_peak {
+        ctx.peak_rss_atomic.store(rss, AtomicOrdering::Release);
     }
+    if rss >= limit {
+        tracing::warn!(
+            "reindex: memory limit hit after commit \
+             (rss={}MB >= limit={}MB) — skipping \
+             remaining batches for index {}",
+            rss,
+            limit,
+            ctx.index_id.0
+        );
+        ctx.mem_abort.store(true, AtomicOrdering::Release);
+        return true;
+    }
+    false
+}
 
-    BatchOutcome {
-        parse_ms,
-        embed_ms,
-        bm25_ms: commit.bm25_ms,
-        vector_upsert_ms: commit.vector_upsert_ms,
-        vector_count,
-        mem_limit_hit,
+/// Result of the final symbol-graph rebuild.
+struct KgRebuildOutcome {
+    symbol_count: usize,
+    edge_count: usize,
+    kg_ms: u64,
+    kg_skipped: bool,
+}
+
+/// Rebuild the symbol graph once for the whole reindex.
+///
+/// Why: deferred from per-batch rebuilds because each rebuild is O(N + E) over
+/// the entire corpus and would scale quadratically with file count. Issue #90:
+/// always run even after a memory abort — the persisted chunks carry
+/// `function_name` and `calls`, graph construction is bounded by
+/// `TRUSTY_MAX_KG_NODES`, and it is independent of the embedding pipeline
+/// that caused the abort.
+async fn rebuild_symbol_graph_for_reindex(handle: &IndexHandle) -> KgRebuildOutcome {
+    let kg_start = Instant::now();
+    let indexer = handle.indexer.read().await;
+    indexer.rebuild_symbol_graph_now().await;
+    let g = indexer.symbol_graph().await;
+    KgRebuildOutcome {
+        symbol_count: g.node_count(),
+        edge_count: g.edge_count(),
+        kg_ms: kg_start.elapsed().as_millis() as u64,
+        kg_skipped: false,
     }
+}
+
+/// Run-level timing + memory totals collected across every batch.
+struct RunTotals {
+    parse_ms: u64,
+    embed_ms: u64,
+    bm25_ms: u64,
+    vector_upsert_ms: u64,
+    vector_count: usize,
+    mem_limit_hit: bool,
+}
+
+/// Emit the terminal `complete` SSE event with run-level timings + counters.
+///
+/// Why: extracted from `spawn_reindex_with_cleanup` (issue #98) so the
+/// orchestrator doesn't carry a ~30-line JSON literal at its tail.
+async fn emit_complete_event(
+    progress: &ReindexProgress,
+    started: Instant,
+    peak_rss_mb: u64,
+    totals: &RunTotals,
+    kg: &KgRebuildOutcome,
+) {
+    use std::sync::atomic::Ordering;
+    let total_chunks = progress.total_chunks.load(Ordering::Acquire);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let chunks_per_sec = (total_chunks as u64 * 1000)
+        .checked_div(elapsed_ms)
+        .unwrap_or(0);
+    let indexed_final = progress.indexed.load(Ordering::Acquire);
+    progress
+        .push(serde_json::json!({
+            "event": "complete",
+            "indexed": indexed_final,
+            "total_chunks": total_chunks,
+            "skipped": progress.skipped.load(Ordering::Acquire),
+            "errors": progress.errors.load(Ordering::Acquire),
+            "elapsed_ms": elapsed_ms,
+            "chunks_per_sec": chunks_per_sec,
+            "peak_rss_mb": peak_rss_mb,
+            "memory_limit_hit": totals.mem_limit_hit,
+            "kg_skipped": kg.kg_skipped,
+            "timings": {
+                "parse_ms": totals.parse_ms,
+                "embed_ms": totals.embed_ms,
+                "bm25_ms": totals.bm25_ms,
+                "vector_upsert_ms": totals.vector_upsert_ms,
+                "kg_ms": kg.kg_ms,
+                "vector_count": totals.vector_count,
+                "symbol_count": kg.symbol_count,
+                "edge_count": kg.edge_count,
+            },
+        }))
+        .await;
 }
 
 /// Variant of `spawn_reindex` that GC's the progress map after completion.
@@ -754,40 +885,11 @@ pub fn spawn_reindex_with_cleanup(
             }
         }
 
-        // Rebuild the symbol graph once for the whole reindex. We deferred
-        // per-batch rebuilds above because each rebuild is O(N + E) over the
-        // entire corpus and would scale quadratically with file count if run
-        // per batch. One rebuild at the end gives the same final state.
-        //
-        // Issue #90: previously this stage was skipped whenever
-        // `mem_limit_hit` had been tripped at any point during batch
-        // processing — even if memory pressure had since subsided. That left
-        // every reindex on memory-constrained hosts (or hosts with a
-        // transient embedding spike) with `symbol_count: 0, edge_count: 0`,
-        // which silently disabled KG-expansion (`hybrid+kg` never appears in
-        // search results) for the entire daemon lifetime until the next
-        // mutation-driven rebuild. The persisted chunks DO carry
-        // `function_name` and `calls`, so building the graph is cheap and
-        // bounded by `TRUSTY_MAX_KG_NODES` (default 100k). It is independent
-        // of the embedding pipeline that caused the spike, so we always run
-        // it now.
-        //
-        // Issue #82 (original concern): petgraph adjacency lists scale with
-        // edge count. For a 100k-node graph that's ~30 MB — negligible next
-        // to the GB-scale embedding spike. The hard cap remains the
-        // load-bearing safety net.
-        let kg_start = Instant::now();
-        let kg_skipped;
-        let symbol_count;
-        let edge_count;
-        {
-            let indexer = handle.indexer.read().await;
-            indexer.rebuild_symbol_graph_now().await;
-            let g = indexer.symbol_graph().await;
-            symbol_count = g.node_count();
-            edge_count = g.edge_count();
-            kg_skipped = false;
-        }
+        // Phase 3: rebuild the symbol graph once for the whole reindex.
+        // Issue #90: always run, even after a memory abort — graph
+        // construction is bounded by `TRUSTY_MAX_KG_NODES` and independent of
+        // the embedding spike. See `rebuild_symbol_graph_for_reindex`.
+        let kg = rebuild_symbol_graph_for_reindex(&handle).await;
         if mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire) {
             tracing::warn!(
                 "reindex: memory limit was breached during batch processing for \
@@ -797,11 +899,10 @@ pub fn spawn_reindex_with_cleanup(
                 index_id.0,
                 peak_rss_atomic.load(AtomicOrdering::Acquire),
                 mem_limit,
-                symbol_count,
-                edge_count,
+                kg.symbol_count,
+                kg.edge_count,
             );
         }
-        let kg_ms = kg_start.elapsed().as_millis() as u64;
 
         // Stop the background poller and collect the true peak it observed.
         poller_stop.store(true, AtomicOrdering::Release);
@@ -809,11 +910,6 @@ pub fn spawn_reindex_with_cleanup(
         let _ = poller_handle.await;
 
         progress.status.store(ReindexStatus::Complete);
-        let total_chunks = progress.total_chunks.load(Ordering::Acquire);
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let chunks_per_sec = (total_chunks as u64 * 1000)
-            .checked_div(elapsed_ms)
-            .unwrap_or(0);
 
         // Final synchronous RSS poll so the peak reflects post-KG memory
         // (the symbol graph rebuild may itself push RSS higher than any
@@ -826,6 +922,8 @@ pub fn spawn_reindex_with_cleanup(
         }
         let peak_rss_mb = peak_rss_atomic.load(AtomicOrdering::Acquire);
         let indexed_final = progress.indexed.load(Ordering::Acquire);
+        let total_chunks = progress.total_chunks.load(Ordering::Acquire);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         tracing::info!(
             "reindex complete: index={} files={} chunks={} elapsed_ms={} \
              peak_rss_mb={} memory_limit_hit={}",
@@ -837,30 +935,15 @@ pub fn spawn_reindex_with_cleanup(
             mem_limit_hit,
         );
 
-        progress
-            .push(serde_json::json!({
-                "event": "complete",
-                "indexed": indexed_final,
-                "total_chunks": total_chunks,
-                "skipped": progress.skipped.load(Ordering::Acquire),
-                "errors": progress.errors.load(Ordering::Acquire),
-                "elapsed_ms": elapsed_ms,
-                "chunks_per_sec": chunks_per_sec,
-                "peak_rss_mb": peak_rss_mb,
-                "memory_limit_hit": mem_limit_hit,
-                "kg_skipped": kg_skipped,
-                "timings": {
-                    "parse_ms": total_parse_ms,
-                    "embed_ms": total_embed_ms,
-                    "bm25_ms": total_bm25_ms,
-                    "vector_upsert_ms": total_vector_upsert_ms,
-                    "kg_ms": kg_ms,
-                    "vector_count": total_vector_count,
-                    "symbol_count": symbol_count,
-                    "edge_count": edge_count,
-                },
-            }))
-            .await;
+        let totals = RunTotals {
+            parse_ms: total_parse_ms,
+            embed_ms: total_embed_ms,
+            bm25_ms: total_bm25_ms,
+            vector_upsert_ms: total_vector_upsert_ms,
+            vector_count: total_vector_count,
+            mem_limit_hit,
+        };
+        emit_complete_event(&progress, started, peak_rss_mb, &totals, &kg).await;
 
         // Issue #75: GC the progress entry after a short delay
         // (helper-extracted: issue #98).
