@@ -42,11 +42,11 @@ fn test_index_registry() {
     let registry = IndexRegistry::new();
     let id = IndexId::new("test-project");
     let indexer = CodeIndexer::new("test-project", "/tmp/test");
-    registry.register(IndexHandle {
-        id: id.clone(),
-        indexer: Arc::new(RwLock::new(indexer)),
-        root_path: "/tmp/test".into(),
-    });
+    registry.register(IndexHandle::bare(
+        id.clone(),
+        Arc::new(RwLock::new(indexer)),
+        "/tmp/test".into(),
+    ));
     assert!(registry.get(&id).is_some());
     assert_eq!(registry.len(), 1);
 }

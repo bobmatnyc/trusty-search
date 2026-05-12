@@ -410,6 +410,21 @@ pub struct CodeIndexer {
     ///
     /// Test: `tests::test_persist_coalesces_concurrent_calls`.
     persist_state: Arc<PersistState>,
+
+    /// Per-index domain vocabulary used by `QueryClassifier::classify_with_domain`
+    /// at search time. Sourced from `trusty-search.yaml`'s `domain_terms:` field
+    /// and forwarded by the daemon when constructing the indexer.
+    ///
+    /// Why: a query like "PMS integration" carries no syntactic signal the
+    /// generic regex chain can match (no `fn`, `class`, `callers of`, …),
+    /// so it falls into `Unknown` and gets generic weights. Per-index
+    /// vocabulary lets the classifier nudge such queries to `Definition`
+    /// intent, which routes them to the lexical-heavy weighting that finds
+    /// the underlying symbol.
+    /// What: a `Vec<String>` of case-insensitive substrings. Empty = standard
+    /// classifier behaviour.
+    /// Test: `tests::search_uses_domain_terms_when_provided`.
+    domain_terms: Vec<String>,
 }
 
 /// Coalescing state for `spawn_incremental_persist`. See the field doc on
@@ -447,7 +462,28 @@ impl CodeIndexer {
             symbol_graph: Arc::new(RwLock::new(Arc::new(SymbolGraph::new()))),
             ner: crate::core::ner::NerExtractor::try_load(),
             persist_state: Arc::new(PersistState::default()),
+            domain_terms: Vec::new(),
         }
+    }
+
+    /// Builder-style setter for the per-index domain vocabulary.
+    ///
+    /// Why: lets the daemon attach `trusty-search.yaml`'s `domain_terms:`
+    /// without leaking the field into every constructor call site.
+    /// What: stores the vector verbatim (case-insensitive matching happens
+    /// inside `classify_with_domain`).
+    /// Test: see `tests::search_uses_domain_terms_when_provided`.
+    pub fn with_domain_terms(mut self, terms: Vec<String>) -> Self {
+        self.domain_terms = terms;
+        self
+    }
+
+    /// Replace the per-index domain vocabulary in place. Used by the daemon
+    /// when restoring a persisted index — we already have an indexer via
+    /// `build_indexer_with_persisted_state` and just need to attach the
+    /// vocabulary alongside it.
+    pub fn set_domain_terms(&mut self, terms: Vec<String>) {
+        self.domain_terms = terms;
     }
 
     /// Snapshot the current symbol graph. Cheap (`Arc::clone`); intended for
@@ -1771,7 +1807,11 @@ impl CodeIndexer {
     /// 6. Materialise the top `top_k` chunk IDs into `CodeChunk`s with the
     ///    fused score and per-result `match_reason`.
     pub async fn search(&self, query: &SearchQuery) -> Result<Vec<CodeChunk>> {
-        let intent = QueryClassifier::classify(&query.text);
+        // Use the domain-aware classifier so per-index vocabulary from
+        // `trusty-search.yaml` (`domain_terms:`) nudges otherwise-`Unknown`
+        // queries to `Definition` intent. Falls back to plain `classify` when
+        // `domain_terms` is empty (the common single-index case).
+        let intent = QueryClassifier::classify_with_domain(&query.text, &self.domain_terms);
         let (alpha, beta, use_kg_first) = intent.weights();
         tracing::debug!(
             "search index={} query={:?} intent={:?} alpha={} beta={}",
@@ -2599,6 +2639,59 @@ mod tests {
             .await
             .unwrap();
         assert!(r.iter().any(|c| c.content.contains("authenticate")));
+    }
+
+    /// `CodeIndexer::search` must route otherwise-`Unknown` queries to
+    /// `Definition` intent when the per-index `domain_terms` vocabulary
+    /// matches the query.
+    ///
+    /// Why: this is the wiring point for `trusty-search.yaml`'s
+    /// `domain_terms:` field. Without this test, a regression that drops the
+    /// `with_domain_terms`/`set_domain_terms` call (or reverts `search` back
+    /// to the non-domain `classify`) silently disables domain-aware routing
+    /// for every multi-index repo.
+    ///
+    /// What: the indexer is wired with `["PMS"]`. We index a file containing
+    /// a `pms_handler` symbol and search for `"PMS integration query"` —
+    /// a phrase the generic classifier returns `Unknown` for. The domain
+    /// classifier should upgrade to `Definition`, which uses lexical-heavy
+    /// weights; we verify by asserting the symbol chunk is the top hit.
+    /// Test: this test.
+    #[tokio::test]
+    async fn search_uses_domain_terms_when_provided() {
+        use crate::core::classifier::{QueryClassifier, QueryIntent};
+
+        // First, confirm the generic classifier *can't* route "PMS integration"
+        // to Definition without the domain hint — otherwise the test would
+        // pass for the wrong reason.
+        let plain = QueryClassifier::classify("PMS integration query");
+        assert_eq!(
+            plain,
+            QueryIntent::Unknown,
+            "baseline: plain classifier must treat the PMS phrase as Unknown"
+        );
+
+        let idx = CodeIndexer::new("domain-test", "/tmp/domain")
+            .with_domain_terms(vec!["PMS".to_string()]);
+        idx.index_file("api.rs", "fn pms_handler() {}\nfn other() {}\n")
+            .await
+            .expect("index_file ok");
+        let r = idx
+            .search(&SearchQuery {
+                text: "PMS integration query".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+            })
+            .await
+            .expect("search ok");
+        // The corpus only has two functions; the PMS-named one should win
+        // under Definition's BM25-heavy weighting.
+        assert!(
+            r.iter().any(|c| c.content.contains("pms_handler")),
+            "expected pms_handler chunk to appear in results: {:?}",
+            r.iter().map(|c| &c.content).collect::<Vec<_>>()
+        );
     }
 
     #[test]

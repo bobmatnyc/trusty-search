@@ -1320,13 +1320,57 @@ async fn register_index_with_daemon(
     index_name: &str,
     project_path: &std::path::Path,
 ) -> Result<(bool, bool)> {
+    register_index_with_daemon_filtered(index_name, project_path, &RegisterFilters::default()).await
+}
+
+/// Optional repo-config filters carried in `POST /indexes` request bodies.
+///
+/// Why: `trusty-search.yaml` declares per-index filter sets (`paths`,
+/// `exclude`, `languages`, `domain_terms`). The CLI loads the YAML and
+/// forwards the resolved values to the daemon when registering each
+/// index so the daemon stores them on the `IndexHandle` and applies them
+/// to subsequent reindex + search calls.
+/// What: thin struct carrying the four fields. `Default` = empty everywhere,
+/// which keeps the original single-index path unchanged.
+/// Test: `commands::index::handle_index` populates this from `IndexConfig`.
+#[derive(Debug, Default)]
+pub struct RegisterFilters {
+    pub include_paths: Vec<String>,
+    pub exclude_globs: Vec<String>,
+    pub extensions: Vec<String>,
+    pub domain_terms: Vec<String>,
+}
+
+/// Variant of [`register_index_with_daemon`] that forwards filter/domain
+/// fields in the request body so the daemon can store them on the handle.
+pub(crate) async fn register_index_with_daemon_filtered(
+    index_name: &str,
+    project_path: &std::path::Path,
+    filters: &RegisterFilters,
+) -> Result<(bool, bool)> {
     let base = daemon_base_url();
     let client = trusty_common::server::daemon_http_client()?;
     let create_url = format!("{}/indexes", base);
-    let create_body = serde_json::json!({
+    let mut create_body = serde_json::json!({
         "id": index_name,
         "root_path": project_path,
     });
+    // Only attach filter fields when non-empty. This keeps the wire format
+    // identical for the single-index case (no `trusty-search.yaml`) and lets
+    // older daemons reject unknown fields cleanly (they're `Option<Vec<…>>`
+    // on the daemon side, so this is forward-compatible anyway).
+    if !filters.include_paths.is_empty() {
+        create_body["include_paths"] = serde_json::json!(filters.include_paths);
+    }
+    if !filters.exclude_globs.is_empty() {
+        create_body["exclude_globs"] = serde_json::json!(filters.exclude_globs);
+    }
+    if !filters.extensions.is_empty() {
+        create_body["extensions"] = serde_json::json!(filters.extensions);
+    }
+    if !filters.domain_terms.is_empty() {
+        create_body["domain_terms"] = serde_json::json!(filters.domain_terms);
+    }
     match client.post(&create_url).json(&create_body).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value =

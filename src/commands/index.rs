@@ -6,8 +6,11 @@
 //! so a single `trusty-search index` command can populate multiple named
 //! slices (e.g. `duetto-api` and `duetto-ui`).
 
-use crate::core::repo_config::{RepoConfig, CONFIG_FILENAME};
-use crate::{daemon_base_url, register_index_with_daemon, run_reindex, run_reindex_force};
+use crate::core::repo_config::{language_to_exts, IndexConfig, RepoConfig, CONFIG_FILENAME};
+use crate::{
+    daemon_base_url, register_index_with_daemon, register_index_with_daemon_filtered, run_reindex,
+    run_reindex_force, RegisterFilters,
+};
 use anyhow::Result;
 use colored::Colorize;
 
@@ -61,7 +64,9 @@ pub async fn handle_index(
                 );
             }
             for idx in &cfg.indexes {
-                index_one(&idx.name, &project_path, force, timeout_secs).await?;
+                let filters = filters_from_index_config(idx);
+                index_one_with_filters(&idx.name, &project_path, force, timeout_secs, &filters)
+                    .await?;
             }
             return Ok(());
         }
@@ -88,6 +93,32 @@ pub async fn handle_index(
     index_one(&index_name, &project_path, force, timeout_secs).await
 }
 
+/// Map a parsed `IndexConfig` to the daemon-bound `RegisterFilters`.
+///
+/// Why: `IndexConfig` uses ergonomic YAML names (`paths`, `exclude`,
+/// `languages`); the daemon expects the resolved shape (`include_paths`,
+/// `exclude_globs`, `extensions`, `domain_terms`). One place to translate.
+/// What: clones `paths` and `exclude` verbatim, expands `languages` to file
+/// extensions via [`language_to_exts`], passes `domain_terms` through.
+/// Test: see `tests::filters_from_index_config_translates_languages` in
+/// `src/core/repo_config.rs`.
+pub(crate) fn filters_from_index_config(idx: &IndexConfig) -> RegisterFilters {
+    let mut extensions: Vec<String> = Vec::new();
+    for lang in &idx.languages {
+        for e in language_to_exts(lang) {
+            extensions.push((*e).to_string());
+        }
+    }
+    extensions.sort();
+    extensions.dedup();
+    RegisterFilters {
+        include_paths: idx.paths.clone(),
+        exclude_globs: idx.exclude.clone(),
+        extensions,
+        domain_terms: idx.domain_terms.clone(),
+    }
+}
+
 /// Register one named index and run a reindex against it.
 ///
 /// Why: extracted so both the single-index and yaml-multi-index paths share
@@ -100,14 +131,42 @@ async fn index_one(
     force: bool,
     timeout_secs: u64,
 ) -> Result<()> {
-    let (created, daemon_reachable) =
-        match register_index_with_daemon(index_name, project_path).await {
-            Ok(tuple) => tuple,
-            Err(e) => {
-                eprintln!("{} {}", "✗".red(), e);
-                std::process::exit(1);
-            }
-        };
+    index_one_with_filters(
+        index_name,
+        project_path,
+        force,
+        timeout_secs,
+        &RegisterFilters::default(),
+    )
+    .await
+}
+
+/// Filter-aware version of `index_one`. The yaml multi-index path uses this
+/// to forward per-index `paths`/`exclude`/`languages`/`domain_terms` to the
+/// daemon.
+async fn index_one_with_filters(
+    index_name: &str,
+    project_path: &std::path::Path,
+    force: bool,
+    timeout_secs: u64,
+    filters: &RegisterFilters,
+) -> Result<()> {
+    let result = if filters.include_paths.is_empty()
+        && filters.exclude_globs.is_empty()
+        && filters.extensions.is_empty()
+        && filters.domain_terms.is_empty()
+    {
+        register_index_with_daemon(index_name, project_path).await
+    } else {
+        register_index_with_daemon_filtered(index_name, project_path, filters).await
+    };
+    let (created, daemon_reachable) = match result {
+        Ok(tuple) => tuple,
+        Err(e) => {
+            eprintln!("{} {}", "✗".red(), e);
+            std::process::exit(1);
+        }
+    };
     if !daemon_reachable {
         eprintln!(
             "{} Daemon not reachable at {}. Start it with {}.",

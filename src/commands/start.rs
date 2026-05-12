@@ -45,12 +45,33 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             // A live create_index handler beat us to it — skip.
             continue;
         }
-        let indexer =
+        let mut indexer =
             build_indexer_with_persisted_state(&entry.id, entry.root_path.clone(), embedder).await;
+        // Restore per-index filters and domain vocabulary from indexes.toml.
+        // Resolve `include_paths` to absolute under `root_path` so the reindex
+        // walker can prune without per-call path arithmetic. `.` and empty
+        // entries collapse to "walk the whole root".
+        let include_paths: Vec<std::path::PathBuf> = entry
+            .include_paths
+            .iter()
+            .filter(|p| !p.trim().is_empty() && p.trim() != ".")
+            .map(|p| entry.root_path.join(p.trim()))
+            .collect();
+        let extensions: Vec<String> = entry
+            .extensions
+            .iter()
+            .map(|e| e.trim_start_matches('.').to_string())
+            .filter(|e| !e.is_empty())
+            .collect();
+        indexer.set_domain_terms(entry.domain_terms.clone());
         let handle = IndexHandle {
             id: id.clone(),
             indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
             root_path: entry.root_path,
+            include_paths,
+            exclude_globs: entry.exclude_globs,
+            extensions,
+            domain_terms: entry.domain_terms,
         };
         state.registry.register(handle);
     }

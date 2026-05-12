@@ -27,10 +27,24 @@ use std::path::{Path, PathBuf};
 
 /// On-disk record for one registered index. Kept tiny so the TOML file stays
 /// human-readable for ops debugging.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedIndex {
     pub id: String,
     pub root_path: PathBuf,
+    /// Subtrees (relative to `root_path`) to restrict indexing to. Sourced
+    /// from `trusty-search.yaml`'s `paths:` field. `#[serde(default)]` so
+    /// older `indexes.toml` files without these fields keep loading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_paths: Vec<String>,
+    /// Glob patterns to exclude on top of the built-in ignores.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_globs: Vec<String>,
+    /// Extension allow-list (e.g. `["rs", "py"]`, without leading dot).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// Domain vocabulary for the per-index intent classifier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_terms: Vec<String>,
 }
 
 /// TOML wrapper so the file uses `[[index]]` array-of-tables syntax —
@@ -151,7 +165,10 @@ pub fn save_index_registry(entries: &[PersistedIndex]) -> Result<()> {
 pub fn upsert_index_registry_entry(entry: PersistedIndex) -> Result<()> {
     let mut entries = load_index_registry()?;
     if let Some(existing) = entries.iter_mut().find(|e| e.id == entry.id) {
-        existing.root_path = entry.root_path;
+        // Overwrite the whole record (not just root_path) so updated
+        // `include_paths`/`exclude_globs`/`extensions`/`domain_terms` from
+        // `trusty-search.yaml` flow through to disk on re-registration.
+        *existing = entry;
     } else {
         entries.push(entry);
     }
@@ -220,10 +237,12 @@ mod tests {
                 PersistedIndex {
                     id: "a".into(),
                     root_path: PathBuf::from("/tmp/a"),
+                    ..Default::default()
                 },
                 PersistedIndex {
                     id: "b".into(),
                     root_path: PathBuf::from("/tmp/b"),
+                    ..Default::default()
                 },
             ],
         };
@@ -239,10 +258,12 @@ mod tests {
         let mut entries = vec![PersistedIndex {
             id: "a".into(),
             root_path: PathBuf::from("/old"),
+            ..Default::default()
         }];
         let new = PersistedIndex {
             id: "a".into(),
             root_path: PathBuf::from("/new"),
+            ..Default::default()
         };
         if let Some(existing) = entries.iter_mut().find(|e| e.id == new.id) {
             existing.root_path = new.root_path.clone();

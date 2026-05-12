@@ -329,6 +329,56 @@ indexes:
         ));
     }
 
+    /// Verify that the domain_terms on `IndexConfig` survive a YAML
+    /// round-trip and that an empty list disables classifier domain-bumping.
+    ///
+    /// Why: the daemon attaches these to the `CodeIndexer` and passes them to
+    /// `QueryClassifier::classify_with_domain` on every search. If the YAML
+    /// parser silently drops them (e.g. a renamed serde field), classification
+    /// would silently degrade for every multi-index repo.
+    /// What: parses a YAML body, asserts the field is preserved verbatim.
+    /// Test: this test.
+    #[test]
+    fn domain_terms_survive_yaml_roundtrip() {
+        let tmp = tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            r#"
+version: 1
+indexes:
+  - name: api
+    domain_terms: ["PMS", "rate strategy", "Cloudbeds"]
+"#,
+        );
+        let cfg = RepoConfig::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(cfg.indexes.len(), 1);
+        assert_eq!(
+            cfg.indexes[0].domain_terms,
+            vec![
+                "PMS".to_string(),
+                "rate strategy".into(),
+                "Cloudbeds".into()
+            ]
+        );
+    }
+
+    /// `path_matches_any_glob` is what the daemon-side walker filters use to
+    /// honour `IndexConfig::exclude`. Verify a few common patterns end-to-end
+    /// since regressions here silently leak files into the index.
+    #[test]
+    fn exclude_globs_match_common_patterns() {
+        // `**/__tests__/**` should match a deeply-nested test dir.
+        let excludes = vec!["**/__tests__/**".to_string()];
+        assert!(path_matches_any_glob(
+            Path::new("/repo/src/api/__tests__/foo.py"),
+            &excludes
+        ));
+        assert!(!path_matches_any_glob(
+            Path::new("/repo/src/api/foo.py"),
+            &excludes
+        ));
+    }
+
     #[test]
     fn test_resolved_extensions() {
         let cfg = IndexConfig {

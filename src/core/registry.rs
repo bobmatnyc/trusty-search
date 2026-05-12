@@ -22,6 +22,48 @@ pub struct IndexHandle {
     pub id: IndexId,
     pub indexer: Arc<RwLock<CodeIndexer>>,
     pub root_path: std::path::PathBuf,
+
+    /// Subtrees (absolute paths) to restrict indexing to. Empty = walk the
+    /// entire `root_path`. Sourced from `trusty-search.yaml`'s `paths:` field.
+    ///
+    /// Why: large polyrepos need to split a single tree into multiple logical
+    /// indexes (e.g. `api/` vs `ui/`). Storing the absolute subtree set on the
+    /// handle lets the reindex walker prune entire directories without
+    /// per-file path arithmetic.
+    pub include_paths: Vec<std::path::PathBuf>,
+
+    /// Glob patterns to exclude (on top of the built-in `SKIP_DIRS` /
+    /// `should_skip_path` checks). Each pattern is run through
+    /// `repo_config::path_matches_any_glob`.
+    pub exclude_globs: Vec<String>,
+
+    /// File extension allow-list (without leading dot, e.g. `["rs", "py"]`).
+    /// Empty = all supported extensions are indexed.
+    pub extensions: Vec<String>,
+
+    /// Domain-specific vocabulary fed to `QueryClassifier::classify_with_domain`
+    /// at search time. Empty = standard classifier behaviour.
+    pub domain_terms: Vec<String>,
+}
+
+impl IndexHandle {
+    /// Construct a handle with empty filter/domain fields. Convenience for the
+    /// many call sites (warm-boot, tests) that don't carry repo-level config.
+    pub fn bare(
+        id: IndexId,
+        indexer: Arc<RwLock<CodeIndexer>>,
+        root_path: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            id,
+            indexer,
+            root_path,
+            include_paths: Vec::new(),
+            exclude_globs: Vec::new(),
+            extensions: Vec::new(),
+            domain_terms: Vec::new(),
+        }
+    }
 }
 
 /// Machine-wide index registry. DashMap = concurrent, shard-locked.

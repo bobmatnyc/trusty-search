@@ -255,7 +255,57 @@ pub fn spawn_reindex_with_cleanup(
         let started = Instant::now();
         let root = handle.root_path.clone();
         let index_id: IndexId = handle.id.clone();
-        let walk = walk_source_files(&root);
+
+        // Determine which subtrees to walk. With no `include_paths` on the
+        // handle (the common single-index case) we walk the entire root.
+        // Otherwise we run one walk per configured subtree and concatenate —
+        // this is how `trusty-search.yaml` slices a polyrepo into independent
+        // indexes.
+        let include_paths: Vec<PathBuf> = if handle.include_paths.is_empty() {
+            vec![root.clone()]
+        } else {
+            handle.include_paths.clone()
+        };
+        let mut walked_files: Vec<PathBuf> = Vec::new();
+        let mut total_skipped_dirs: usize = 0;
+        for subtree in &include_paths {
+            let w = walk_source_files(subtree);
+            walked_files.extend(w.files);
+            total_skipped_dirs = total_skipped_dirs.saturating_add(w.skipped_dirs);
+        }
+
+        // Apply repo-config filters. These are AND-composed on top of the
+        // walker's built-in ignores (`SKIP_DIRS`, `should_skip_path`).
+        //
+        // 1. `exclude_globs`: drop any file whose path matches one of the
+        //    user-supplied glob patterns.
+        // 2. `extensions`: when non-empty, keep only files whose extension
+        //    appears in the allow-list (caller writes them without the
+        //    leading dot, e.g. `["rs", "py"]`).
+        if !handle.exclude_globs.is_empty() {
+            let excludes = handle.exclude_globs.clone();
+            walked_files.retain(|p| !crate::core::repo_config::path_matches_any_glob(p, &excludes));
+        }
+        if !handle.extensions.is_empty() {
+            let allowed = handle.extensions.clone();
+            walked_files.retain(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| allowed.iter().any(|x| x.eq_ignore_ascii_case(e)))
+                    .unwrap_or(false)
+            });
+        }
+
+        // De-duplicate when multiple `include_paths` overlap (e.g. `["."]` plus
+        // `["src"]`). `walk_source_files` returns canonicalised paths inside
+        // each subtree but doesn't dedupe across subtrees.
+        walked_files.sort();
+        walked_files.dedup();
+
+        let walk = crate::service::walker::WalkResult {
+            files: walked_files,
+            skipped_dirs: total_skipped_dirs,
+        };
         let total = walk.files.len();
         progress.total_files.store(total, Ordering::Release);
         progress
@@ -721,6 +771,81 @@ mod tests {
     use std::fs;
     use std::sync::atomic::Ordering;
 
+    /// Filter wiring: with `include_paths` set on the handle, the reindex
+    /// must walk ONLY those subtrees. Files outside the configured slice
+    /// must not appear in the corpus.
+    ///
+    /// Why: `trusty-search.yaml` declares `paths: [api/src]` to slice a
+    /// polyrepo. Without this test, a regression that drops the
+    /// `handle.include_paths` branch silently reverts to "walk everything",
+    /// which is the bug the YAML config exists to avoid.
+    /// What: stage a fixture with `api/keep.rs` and `ui/drop.rs`, register a
+    /// handle whose `include_paths = [<root>/api]`, run the reindex, and
+    /// assert only the api file was indexed.
+    /// Test: this test.
+    #[tokio::test]
+    async fn reindex_honours_include_paths_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("api")).unwrap();
+        fs::create_dir_all(root.join("ui")).unwrap();
+        fs::write(root.join("api/keep.rs"), "fn keep_me() {}\n").unwrap();
+        fs::write(root.join("ui/drop.rs"), "fn drop_me() {}\n").unwrap();
+
+        let indexer = CodeIndexer::new("filter-test", root.clone());
+        let handle = Arc::new(IndexHandle {
+            id: IndexId::new("filter-test"),
+            indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
+            root_path: root.clone(),
+            include_paths: vec![root.join("api")],
+            exclude_globs: vec![],
+            extensions: vec![],
+            domain_terms: vec![],
+        });
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        // Wait up to 10s for completion.
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+        assert_eq!(
+            progress.total_files.load(Ordering::Acquire),
+            1,
+            "only api/keep.rs should be walked"
+        );
+
+        // And the corpus must contain `keep_me` but not `drop_me`.
+        let idx = handle.indexer.read().await;
+        let r = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "keep_me".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+            })
+            .await
+            .unwrap();
+        assert!(r.iter().any(|c| c.content.contains("keep_me")));
+        let r2 = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "drop_me".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !r2.iter().any(|c| c.content.contains("drop_me")),
+            "ui/drop.rs must not have been indexed"
+        );
+    }
+
     #[tokio::test]
     async fn reindex_walks_directory_and_emits_events() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -731,11 +856,11 @@ mod tests {
         fs::write(root.join("target/skip.rs"), "fn skip() {}").unwrap();
 
         let indexer = CodeIndexer::new("test".to_string(), root.clone());
-        let handle = Arc::new(IndexHandle {
-            id: IndexId::new("test"),
-            indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
-            root_path: root.clone(),
-        });
+        let handle = Arc::new(IndexHandle::bare(
+            IndexId::new("test"),
+            Arc::new(tokio::sync::RwLock::new(indexer)),
+            root.clone(),
+        ));
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle, progress.clone(), false);
 

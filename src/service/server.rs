@@ -348,6 +348,20 @@ struct IndexListResponse {
 pub struct CreateIndexRequest {
     pub id: String,
     pub root_path: std::path::PathBuf,
+    /// Subtrees (relative to `root_path`) to restrict indexing to. Forwarded
+    /// from `trusty-search.yaml`'s `paths:` field by `trusty-search index`.
+    /// Empty / missing = walk the entire `root_path`.
+    #[serde(default)]
+    pub include_paths: Option<Vec<String>>,
+    /// Glob patterns to exclude on top of the built-in ignores.
+    #[serde(default)]
+    pub exclude_globs: Option<Vec<String>>,
+    /// Extension allow-list (e.g. `["rs", "py"]`, without leading dot).
+    #[serde(default)]
+    pub extensions: Option<Vec<String>>,
+    /// Domain vocabulary for the per-index intent classifier.
+    #[serde(default)]
+    pub domain_terms: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -578,12 +592,38 @@ async fn create_index_handler(
     //
     // Issue #85: if a previously-saved HNSW snapshot + chunks file exist for
     // this id, restore them so the daemon warm-boots without re-indexing.
-    let indexer = crate::service::persistence_loader::build_indexer_with_persisted_state(
+    let mut indexer = crate::service::persistence_loader::build_indexer_with_persisted_state(
         &req.id,
         req.root_path.clone(),
         &embedder,
     )
     .await;
+
+    // Resolve repo-config filters (issue: trusty-search.yaml wiring). The
+    // CLI sends `paths:` as relative strings; resolve them against `root_path`
+    // here so the registry handle carries absolute subtrees ready for the
+    // reindex walker. `domain_terms` is attached to the indexer so its
+    // `classify_with_domain` lookup runs on every search without needing to
+    // reach back into the handle.
+    let include_paths: Vec<std::path::PathBuf> = req
+        .include_paths
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.trim().is_empty() && p.trim() != ".")
+        .map(|p| req.root_path.join(p.trim()))
+        .collect();
+    let exclude_globs: Vec<String> = req.exclude_globs.clone().unwrap_or_default();
+    let extensions: Vec<String> = req
+        .extensions
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.trim_start_matches('.').to_string())
+        .filter(|e| !e.is_empty())
+        .collect();
+    let domain_terms: Vec<String> = req.domain_terms.clone().unwrap_or_default();
+    indexer.set_domain_terms(domain_terms.clone());
 
     // Persist the registration so a daemon restart can re-register
     // automatically. Best-effort: a write failure is logged but doesn't fail
@@ -592,6 +632,10 @@ async fn create_index_handler(
         crate::service::persistence::PersistedIndex {
             id: req.id.clone(),
             root_path: req.root_path.clone(),
+            include_paths: req.include_paths.clone().unwrap_or_default(),
+            exclude_globs: exclude_globs.clone(),
+            extensions: extensions.clone(),
+            domain_terms: domain_terms.clone(),
         },
     ) {
         tracing::warn!("could not persist index registry for {}: {e}", req.id);
@@ -601,6 +645,10 @@ async fn create_index_handler(
         id: id.clone(),
         indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
         root_path: req.root_path,
+        include_paths,
+        exclude_globs,
+        extensions,
+        domain_terms,
     };
     state.registry.register(handle);
     // Push event so connected dashboards refresh their index list without a
@@ -665,7 +713,9 @@ async fn search_handler(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let index_id = IndexId::new(id);
     let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
-    let intent = QueryClassifier::classify(&query.text);
+    // Use the same domain-aware classifier as `CodeIndexer::search` so the
+    // intent reported back to the caller matches what was used for routing.
+    let intent = QueryClassifier::classify_with_domain(&query.text, &handle.domain_terms);
     let started = std::time::Instant::now();
     let indexer = handle.indexer.read().await;
     let results = indexer
@@ -1004,10 +1054,16 @@ async fn reindex_handler(
         if let Some(new_root) = req.root_path {
             if handle.root_path.as_os_str().is_empty() || handle.root_path != new_root {
                 let indexer = Arc::clone(&handle.indexer);
+                // Preserve the filter set / domain vocabulary recorded on the
+                // existing handle — only the root_path is being overridden.
                 let new_handle = IndexHandle {
                     id: index_id.clone(),
                     indexer,
                     root_path: new_root,
+                    include_paths: handle.include_paths.clone(),
+                    exclude_globs: handle.exclude_globs.clone(),
+                    extensions: handle.extensions.clone(),
+                    domain_terms: handle.domain_terms.clone(),
                 };
                 handle = state.registry.register(new_handle);
             }
@@ -1111,14 +1167,14 @@ mod tests {
 
         let registry = IndexRegistry::new();
         let id = IndexId::new("health-test");
-        registry.register(IndexHandle {
-            id: id.clone(),
-            indexer: Arc::new(RwLock::new(CodeIndexer::new(
+        registry.register(IndexHandle::bare(
+            id.clone(),
+            Arc::new(RwLock::new(CodeIndexer::new(
                 "health-test",
                 "/tmp/health-test",
             ))),
-            root_path: "/tmp/health-test".into(),
-        });
+            "/tmp/health-test".into(),
+        ));
         let state = Arc::new(SearchAppState::new(registry));
         let Json(resp) = health_handler(State(state)).await;
         assert_eq!(resp.status, "ok");
@@ -1159,11 +1215,11 @@ mod tests {
                 )
                 .await
                 .expect("index_file ok");
-            registry.register(IndexHandle {
-                id: id.clone(),
-                indexer: Arc::new(RwLock::new(indexer)),
-                root_path: format!("/tmp/{name}").into(),
-            });
+            registry.register(IndexHandle::bare(
+                id.clone(),
+                Arc::new(RwLock::new(indexer)),
+                format!("/tmp/{name}").into(),
+            ));
         }
 
         let state = Arc::new(SearchAppState::new(registry));
