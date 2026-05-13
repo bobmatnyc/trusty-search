@@ -175,16 +175,24 @@ impl QueryClassifier {
         // "QueryClassifier intent classification") is most often a symbol
         // lookup → Definition.
         //
-        // The PascalCase regex requires a capital letter followed by at least
-        // one lower-case letter and one more capital (CamelCase) — guarding
-        // against single-cap acronyms like "API" or "TODO" matching here.
+        // Two alternatives are accepted:
+        //   1. CamelCase: capital letter, ≥1 lower-case letter, then another
+        //      capital (`QueryClassifier`, `CodeChunk`). This guards against
+        //      single-cap acronyms like "API" or "TODO" matching.
+        //   2. Leading-acronym: ≥2 consecutive capitals, optional digits, then
+        //      another capital + lower-case run (`BM25Index`, `IOError`,
+        //      `URLParser`). Identifiers whose acronym prefix runs into
+        //      digits and PascalCase are common in Rust/Python and should be
+        //      treated as symbol lookups.
         // Pure snake_case identifiers are intentionally NOT a trigger: many
         // long natural-language queries embed a function name without
         // intending a definition lookup (see
         // `test_long_query_with_code_token_not_long_nl_conceptual`).
         let pascal_ident_re = PASCAL_IDENT_RE.get_or_init(|| {
-            Regex::new(r"\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b")
-                .expect("static regex pattern must compile")
+            Regex::new(
+                r"\b(?:[A-Z][a-z]+[A-Z][a-zA-Z0-9]*|[A-Z]{2,}(?:[0-9]+[A-Za-z][a-zA-Z0-9]*|[0-9]+|[A-Z][a-z][a-zA-Z0-9]*))\b",
+            )
+            .expect("static regex pattern must compile")
         });
         if pascal_ident_re.is_match(trimmed) {
             return QueryIntent::Definition;
@@ -579,6 +587,56 @@ mod tests {
         assert_eq!(
             QueryClassifier::classify("enum for reservation status"),
             QueryIntent::Definition
+        );
+    }
+
+    // ── Leading-acronym identifier tests (issue #91) ───────────────────────
+
+    #[test]
+    fn test_leading_acronym_with_digits_is_definition() {
+        // BM25Index — acronym + digits + CamelCase suffix.
+        assert_eq!(
+            QueryClassifier::classify("BM25Index lookup"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_leading_acronym_io_error_is_definition() {
+        // IOError — two-letter acronym + CamelCase suffix.
+        assert_eq!(
+            QueryClassifier::classify("IOError handling path"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_leading_acronym_url_parser_is_definition() {
+        // URLParser — three-letter acronym + CamelCase suffix.
+        assert_eq!(
+            QueryClassifier::classify("URLParser implementation"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_bm25_alone_is_definition_via_pascal_fallback() {
+        // Standalone identifier `BM25` (acronym + digits) — no conceptual
+        // verb, so the PascalCase fallback should classify as Definition.
+        assert_eq!(
+            QueryClassifier::classify("BM25 ranking"),
+            QueryIntent::Definition
+        );
+    }
+
+    #[test]
+    fn test_pure_acronym_does_not_trigger_definition() {
+        // "API" / "TODO" without digits or CamelCase suffix must NOT match
+        // the leading-acronym fallback (TODO is handled by bug regex, but
+        // API has no other match — should stay Unknown).
+        assert_eq!(
+            QueryClassifier::classify("API endpoints"),
+            QueryIntent::Unknown
         );
     }
 
