@@ -644,11 +644,42 @@ Requirements when compiling with `--features cuda`:
   `ort` build scripts — this is expected, not a bug. Omit `--features cuda`
   for CPU-only environments.
 
+**Dynamic ORT linking + `ORT_DYLIB_PATH` (required for glibc 2.34 hosts,
+e.g. Amazon Linux 2023 — issue #114):** the CUDA build deliberately does
+NOT enable the default `bundled-ort` feature, so `ort-sys` skips its
+prebuilt static libraries (which require glibc ≥ 2.38) and `ort` loads
+`libonnxruntime.so` dynamically at runtime via `libloading`. The operator
+must install a host-compatible ONNX Runtime shared library and point to
+it with `ORT_DYLIB_PATH`. Always pair `--features cuda` with
+`--no-default-features`:
+
+```bash
+# Build trusty-search without bundled ORT (load-dynamic path)
+cargo install trusty-search --no-default-features --features cuda
+
+# Install ONNX Runtime GPU 1.20.x (built against glibc 2.31, runs on 2.34+)
+curl -L https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-gpu-1.20.1.tgz \
+  | sudo tar xz -C /opt
+sudo ln -s /opt/onnxruntime-linux-x64-gpu-1.20.1 /opt/onnxruntime
+
+# Point ort at the dynamic library and start the daemon
+export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+trusty-search start
+```
+
+On macOS / modern Linux (glibc ≥ 2.38) the default `bundled-ort` build
+keeps working unchanged — no `ORT_DYLIB_PATH` needed and no separate ORT
+install.
+
 The feature flag chain is:
 `trusty-search/cuda` → `trusty-embedder/cuda` →
-`{fastembed/cuda, ort/cuda}`. The `ort/cuda` link is the load-bearing one —
-the all-MiniLM-L6-v2 model uses the ONNX runtime path, so `fastembed/cuda`
-(which only enables candle-cuda) alone does not move embedding to the GPU.
+`{fastembed/cuda, fastembed/ort-load-dynamic, ort/cuda, ort/load-dynamic}`.
+The `ort/cuda` link is the load-bearing one for GPU dispatch — the
+all-MiniLM-L6-v2 model uses the ONNX runtime path, so `fastembed/cuda`
+(which only enables candle-cuda) alone does not move embedding to the
+GPU. The `ort/load-dynamic` link is the load-bearing one for glibc
+compatibility on AL2023 and any other host whose glibc is older than
+2.38.
 
 ### Apple Silicon GPU acceleration (CoreML, auto-detected)
 

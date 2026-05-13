@@ -43,7 +43,7 @@ trusty-symgraph = { path = "../trusty-common/crates/trusty-symgraph" }
 # ── Shared trusty-common crates ────────────────────────────────────────────
 trusty-common = { version = "0.3.2", features = ["axum-server"] }
 trusty-mcp-core = { version = "0.1.0" }
-trusty-embedder = { version = "0.1.3", features = ["test-support"] }
+trusty-embedder = { version = "0.1.3", default-features = false, features = ["test-support"] }
 trusty-symgraph = { version = "0.2.1", default-features = false }  # contracts surface only — no tree-sitter
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
@@ -142,7 +142,17 @@ tempfile = "3"
 serial_test = "3"
 
 [features]
-default = []
+# Default: bundle ORT static libs via trusty-embedder. Works on macOS and
+# modern Linux (glibc ≥ 2.38). For glibc 2.34 hosts (e.g. Amazon Linux
+# 2023) building with `--features cuda`, also pass `--no-default-features`
+# so trusty-embedder switches fastembed to `ort-load-dynamic` and the
+# operator can provide `ORT_DYLIB_PATH=/path/to/libonnxruntime.so` at
+# runtime (see trusty-search#114).
+default = ["bundled-ort"]
+# Forwards `trusty-embedder/bundled-ort`. Enables static linking of the
+# fastembed-downloaded ORT 1.24.x libraries. Mutually exclusive with the
+# load-dynamic path that `cuda` activates (see below).
+bundled-ort = ["trusty-embedder/bundled-ort"]
 # Exposes test doubles (e.g. `MockEmbedder`) outside `cfg(test)` so
 # downstream integration tests can reuse them. Kept for parity with the
 # previous trusty-search-core feature surface.
@@ -150,7 +160,18 @@ test-support = []
 # Compile in the ONNX NER extractor. Even with this feature on, NER stays
 # inert at runtime unless `~/.trusty-search/models/ner.onnx` is present.
 ner = ["dep:ort", "dep:tokenizers"]
-# GPU-accelerated embedding via fastembed-rs CUDA backend.
+# GPU-accelerated embedding via fastembed-rs CUDA backend. Activates the
+# `ort/cuda` + `ort/load-dynamic` path in trusty-embedder, so this build
+# does NOT bundle the (glibc-2.38-bound) ORT static libs. Install on
+# AL2023 with:
+#
+#     cargo install trusty-search --no-default-features --features cuda
+#     export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+#
+# Enabling `cuda` alongside the default `bundled-ort` feature is not
+# supported — Cargo will compile but the resulting binary will fail to
+# link ORT correctly. Always pair `--features cuda` with
+# `--no-default-features`.
 cuda = ["trusty-embedder/cuda"]
 # Deprecated: CoreML / Metal GPU acceleration is now auto-detected at runtime
 # on Apple Silicon and requires no opt-in. The `coreml` feature is kept as a
