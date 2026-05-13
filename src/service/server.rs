@@ -664,6 +664,8 @@ async fn create_index_handler(
         extensions,
         domain_terms,
         path_filter,
+        context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
+        context_summary: Arc::new(tokio::sync::RwLock::new(None)),
     };
     state.registry.register(handle);
     // Push event so connected dashboards refresh their index list without a
@@ -768,6 +770,26 @@ pub struct GlobalSearchRequest {
     /// fans out to every registered index (legacy behaviour).
     #[serde(default)]
     pub indexes: Option<Vec<String>>,
+
+    /// Fan-out routing strategy (issue #112). Controls how the daemon
+    /// weights or filters the per-index lanes by cosine similarity between
+    /// the query embedding and each index's stored `context_embedding`.
+    ///
+    /// - `"all"` (default): every index is searched; each index's RRF lane
+    ///   is multiplied by its cosine similarity weight (indexes with no
+    ///   context embedding use the neutral 1.0).
+    /// - `"top_n"`: only the top-N indexes (by cosine similarity) are
+    ///   searched; `routing_n` controls N (default 3).
+    /// - `"threshold"`: indexes with cosine similarity below
+    ///   `routing_threshold` (default 0.3) are skipped.
+    #[serde(default)]
+    pub routing: Option<String>,
+    /// Number of indexes to keep for `routing = "top_n"`. Default 3.
+    #[serde(default)]
+    pub routing_n: Option<usize>,
+    /// Cosine-similarity cutoff for `routing = "threshold"`. Default 0.3.
+    #[serde(default)]
+    pub routing_threshold: Option<f32>,
 }
 
 fn default_global_top_k() -> usize {
@@ -820,6 +842,25 @@ async fn global_search_handler(
     let started = std::time::Instant::now();
     let intent = QueryClassifier::classify(&req.query);
 
+    // Issue #112: compute per-index context weights, then apply the routing
+    // strategy to decide which indexes participate in the fan-out.
+    let routing_mode = RoutingMode::from_request(&req);
+    let weights = compute_context_weights(&state.registry, &index_ids, &req.query).await;
+    let (active_ids, weight_map) = routing_mode.apply(&index_ids, &weights);
+    let routing_label = routing_mode.label().to_string();
+    let routing_decisions: Vec<serde_json::Value> = index_ids
+        .iter()
+        .map(|id| {
+            let w = weights.get(id).copied().unwrap_or(1.0);
+            let included = weight_map.contains_key(id);
+            serde_json::json!({
+                "index_id": id.0,
+                "cosine_similarity": w,
+                "included": included,
+            })
+        })
+        .collect();
+
     // Build the same SearchQuery shape every per-index search uses. We
     // oversample per-index by passing the user's top_k unchanged: each lane
     // contributes up to top_k candidates, then RRF picks the best top_k
@@ -835,7 +876,7 @@ async fn global_search_handler(
     // skipped with a log line so a single broken index doesn't 500 the
     // whole fan-out.
     let registry = state.registry.clone();
-    let futures = index_ids.into_iter().map(|id| {
+    let futures = active_ids.into_iter().map(|id| {
         let registry = registry.clone();
         let query = per_index_query.clone();
         async move {
@@ -868,13 +909,18 @@ async fn global_search_handler(
     let mut indexes_searched: Vec<String> = Vec::with_capacity(per_index_results.len());
     for (id, results) in per_index_results {
         indexes_searched.push(id.0.clone());
+        // Issue #112: in `"all"` mode, multiply each lane's scores by the
+        // index's cosine-similarity weight; in `"top_n"` / `"threshold"`
+        // modes the weight is always 1.0 (selection has already happened).
+        let weight = weight_map.get(&id).copied().unwrap_or(1.0);
         let mut lane: Vec<(String, f32)> = Vec::with_capacity(results.len());
         for mut chunk in results {
             let namespaced = format!("{}::{}", id.0, chunk.id);
             // Tag the chunk with its origin index before storing it so the
             // returned CodeChunks know where they came from.
             chunk.index_id = Some(id.0.clone());
-            lane.push((namespaced.clone(), chunk.score));
+            let weighted_score = chunk.score * weight;
+            lane.push((namespaced.clone(), weighted_score));
             chunk_lookup.insert(namespaced, chunk);
         }
         lanes.push(lane);
@@ -907,7 +953,160 @@ async fn global_search_handler(
         "total_indexes": total_indexes,
         "latency_ms": latency_ms,
         "intent": format!("{:?}", intent),
+        "routing": routing_label,
+        "routing_decisions": routing_decisions,
     })))
+}
+
+/// Fan-out routing strategy resolved from a `GlobalSearchRequest` (issue #112).
+///
+/// Why: keeps the per-strategy logic (weight every lane, take top-N, filter
+/// below threshold) in one place so the global-search handler stays small.
+#[derive(Debug, Clone, Copy)]
+enum RoutingMode {
+    /// Search every index; multiply each lane's RRF scores by the index's
+    /// context cosine similarity (indexes with no context use 1.0).
+    All,
+    /// Search only the top-N indexes by cosine similarity. Weights are not
+    /// applied to lane scores (selection already encodes relevance).
+    TopN(usize),
+    /// Search only indexes whose cosine similarity ≥ threshold. Weights are
+    /// not applied to lane scores.
+    Threshold(f32),
+}
+
+impl RoutingMode {
+    const DEFAULT_TOP_N: usize = 3;
+    const DEFAULT_THRESHOLD: f32 = 0.3;
+
+    fn from_request(req: &GlobalSearchRequest) -> Self {
+        match req.routing.as_deref() {
+            Some("top_n") => Self::TopN(req.routing_n.unwrap_or(Self::DEFAULT_TOP_N).max(1)),
+            Some("threshold") => {
+                Self::Threshold(req.routing_threshold.unwrap_or(Self::DEFAULT_THRESHOLD))
+            }
+            // "all" or anything else (or absent) defaults to All.
+            _ => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::TopN(_) => "top_n",
+            Self::Threshold(_) => "threshold",
+        }
+    }
+
+    /// Filter `index_ids` according to the strategy and return the active
+    /// id list plus the per-id weight map the lane builder will consult.
+    ///
+    /// - `All`: every id is active; weight = its cosine similarity.
+    /// - `TopN`: top N by cosine similarity; weight = 1.0 for selected ids.
+    /// - `Threshold`: cosine ≥ threshold; weight = 1.0 for selected ids.
+    fn apply(
+        self,
+        index_ids: &[IndexId],
+        weights: &std::collections::HashMap<IndexId, f32>,
+    ) -> (Vec<IndexId>, std::collections::HashMap<IndexId, f32>) {
+        match self {
+            Self::All => {
+                let active: Vec<IndexId> = index_ids.to_vec();
+                let map: std::collections::HashMap<IndexId, f32> = index_ids
+                    .iter()
+                    .map(|id| (id.clone(), weights.get(id).copied().unwrap_or(1.0)))
+                    .collect();
+                (active, map)
+            }
+            Self::TopN(n) => {
+                let mut ranked: Vec<(&IndexId, f32)> = index_ids
+                    .iter()
+                    .map(|id| (id, weights.get(id).copied().unwrap_or(1.0)))
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let active: Vec<IndexId> =
+                    ranked.iter().take(n).map(|(id, _)| (*id).clone()).collect();
+                let map: std::collections::HashMap<IndexId, f32> =
+                    active.iter().map(|id| (id.clone(), 1.0)).collect();
+                (active, map)
+            }
+            Self::Threshold(t) => {
+                let active: Vec<IndexId> = index_ids
+                    .iter()
+                    .filter(|id| weights.get(id).copied().unwrap_or(1.0) >= t)
+                    .cloned()
+                    .collect();
+                let map: std::collections::HashMap<IndexId, f32> =
+                    active.iter().map(|id| (id.clone(), 1.0)).collect();
+                (active, map)
+            }
+        }
+    }
+}
+
+/// Embed the query once and compute cosine similarity against every index's
+/// stored `context_embedding` (issue #112).
+///
+/// Why: the fan-out router needs a single relevance score per index. Indexes
+/// without a context embedding (no recognised metadata, embedder unavailable
+/// during last reindex) default to a neutral 1.0 so they participate
+/// normally — the absence of a fingerprint is not a relevance signal.
+/// What: returns a `HashMap<IndexId, f32>` where every id in `index_ids` has
+/// an entry; the value is either `cosine_similarity(query, context)` or
+/// `1.0` for indexes with no context. Failures embedding the query (e.g.
+/// embedder not wired) also fall back to 1.0 across the board so the global
+/// search keeps working as a plain fan-out.
+async fn compute_context_weights(
+    registry: &crate::core::registry::IndexRegistry,
+    index_ids: &[IndexId],
+    query: &str,
+) -> std::collections::HashMap<IndexId, f32> {
+    use crate::core::mmr::cosine_similarity;
+
+    // Try to obtain a query embedding from any index that has an embedder
+    // wired. Every index in the registry shares the same machine-wide
+    // FastEmbedder, so the first successful embed is reused for all.
+    let mut query_embedding: Option<Vec<f32>> = None;
+    for id in index_ids {
+        let Some(handle) = registry.get(id) else {
+            continue;
+        };
+        let indexer = handle.indexer.read().await;
+        match indexer.embed_text(query).await {
+            Ok(Some(vec)) => {
+                query_embedding = Some(vec);
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!("context_routing: embed_text failed on {}: {e}", id.0);
+                continue;
+            }
+        }
+    }
+
+    let mut out = std::collections::HashMap::with_capacity(index_ids.len());
+    let Some(q) = query_embedding else {
+        // Couldn't embed at all — fall back to neutral weights everywhere.
+        for id in index_ids {
+            out.insert(id.clone(), 1.0);
+        }
+        return out;
+    };
+
+    for id in index_ids {
+        let Some(handle) = registry.get(id) else {
+            out.insert(id.clone(), 1.0);
+            continue;
+        };
+        let ctx_guard = handle.context_embedding.read().await;
+        let weight = match ctx_guard.as_ref() {
+            Some(ctx) if ctx.len() == q.len() => cosine_similarity(&q, ctx).max(0.0),
+            _ => 1.0,
+        };
+        out.insert(id.clone(), weight);
+    }
+    out
 }
 
 /// Body for `POST /indexes/:id/search_similar`.
@@ -976,11 +1175,25 @@ async fn index_status_handler(
                 .collect(),
         )
     };
+    // Issue #112: surface whether a context embedding has been computed
+    // for this index, plus the truncated human-readable summary that
+    // produced it. Helps operators verify metadata scraping found a
+    // recognised file.
+    let has_context_embedding = handle.context_embedding.read().await.is_some();
+    let context_summary = handle
+        .context_summary
+        .read()
+        .await
+        .clone()
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,
         "root_path": handle.root_path,
         "chunk_count": indexer.chunk_count(),
         "path_filter": path_filter,
+        "has_context_embedding": has_context_embedding,
+        "context_summary": context_summary,
     })))
 }
 
@@ -1113,6 +1326,11 @@ async fn reindex_handler(
                     extensions: handle.extensions.clone(),
                     domain_terms: handle.domain_terms.clone(),
                     path_filter: handle.path_filter.clone(),
+                    // Preserve the previously inferred context (if any). A
+                    // fresh reindex will overwrite this with the metadata
+                    // scraped from the new root.
+                    context_embedding: Arc::clone(&handle.context_embedding),
+                    context_summary: Arc::clone(&handle.context_summary),
                 };
                 handle = state.registry.register(new_handle);
             }
@@ -1279,6 +1497,9 @@ mod tests {
                 top_k: 10,
                 full_content: false,
                 indexes: None,
+                routing: None,
+                routing_n: None,
+                routing_threshold: None,
             }),
         )
         .await
@@ -1334,6 +1555,9 @@ mod tests {
                 top_k: 5,
                 full_content: false,
                 indexes: None,
+                routing: None,
+                routing_n: None,
+                routing_threshold: None,
             }),
         )
         .await
@@ -1380,6 +1604,9 @@ mod tests {
                 top_k: 10,
                 full_content: false,
                 indexes: Some(vec!["proj-a".into(), "proj-c".into()]),
+                routing: None,
+                routing_n: None,
+                routing_threshold: None,
             }),
         )
         .await
@@ -1401,6 +1628,135 @@ mod tests {
         for r in value["results"].as_array().unwrap() {
             let idx = r["index_id"].as_str().unwrap();
             assert_ne!(idx, "proj-b", "no result may come from excluded index");
+        }
+    }
+
+    /// Issue #112: `RoutingMode::All` keeps every index and surfaces the
+    /// cosine-similarity weight verbatim. Indexes without a weight entry
+    /// fall back to 1.0.
+    #[test]
+    fn routing_mode_all_preserves_every_index_with_weights() {
+        let ids = vec![IndexId::new("a"), IndexId::new("b"), IndexId::new("c")];
+        let weights: std::collections::HashMap<IndexId, f32> = [
+            (IndexId::new("a"), 0.9_f32),
+            (IndexId::new("b"), 0.2),
+            // "c" deliberately absent → falls back to 1.0
+        ]
+        .into_iter()
+        .collect();
+
+        let (active, map) = RoutingMode::All.apply(&ids, &weights);
+        assert_eq!(active.len(), 3, "all routing keeps every index");
+        assert!((map.get(&IndexId::new("a")).copied().unwrap() - 0.9).abs() < 1e-6);
+        assert!((map.get(&IndexId::new("b")).copied().unwrap() - 0.2).abs() < 1e-6);
+        assert!((map.get(&IndexId::new("c")).copied().unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// Issue #112: `RoutingMode::TopN` keeps only the N highest-similarity
+    /// indexes (ranked desc) and zeroes weights to 1.0 — selection has
+    /// already absorbed relevance.
+    #[test]
+    fn routing_mode_top_n_keeps_only_highest_similarity() {
+        let ids = vec![IndexId::new("low"), IndexId::new("hi"), IndexId::new("mid")];
+        let weights: std::collections::HashMap<IndexId, f32> = [
+            (IndexId::new("low"), 0.1_f32),
+            (IndexId::new("hi"), 0.95),
+            (IndexId::new("mid"), 0.5),
+        ]
+        .into_iter()
+        .collect();
+
+        let (active, map) = RoutingMode::TopN(2).apply(&ids, &weights);
+        assert_eq!(active.len(), 2);
+        let active_set: std::collections::HashSet<&str> =
+            active.iter().map(|id| id.0.as_str()).collect();
+        assert!(active_set.contains("hi"));
+        assert!(active_set.contains("mid"));
+        assert!(!active_set.contains("low"));
+        // Selected entries normalised to weight 1.0.
+        assert!((map.get(&IndexId::new("hi")).copied().unwrap() - 1.0).abs() < 1e-6);
+        assert!((map.get(&IndexId::new("mid")).copied().unwrap() - 1.0).abs() < 1e-6);
+        assert!(!map.contains_key(&IndexId::new("low")));
+    }
+
+    /// Issue #112: `RoutingMode::Threshold` drops anything strictly below
+    /// the threshold and keeps entries at/above it.
+    #[test]
+    fn routing_mode_threshold_drops_below_cutoff() {
+        let ids = vec![IndexId::new("a"), IndexId::new("b"), IndexId::new("c")];
+        let weights: std::collections::HashMap<IndexId, f32> = [
+            (IndexId::new("a"), 0.1_f32),
+            (IndexId::new("b"), 0.5),
+            (IndexId::new("c"), 0.8),
+        ]
+        .into_iter()
+        .collect();
+
+        let (active, map) = RoutingMode::Threshold(0.4).apply(&ids, &weights);
+        let active_set: std::collections::HashSet<&str> =
+            active.iter().map(|id| id.0.as_str()).collect();
+        assert!(!active_set.contains("a"), "0.1 < 0.4 must drop");
+        assert!(active_set.contains("b"), "0.5 >= 0.4 must keep");
+        assert!(active_set.contains("c"));
+        assert!(!map.contains_key(&IndexId::new("a")));
+    }
+
+    /// Indexes missing a weight entry default to neutral 1.0, so threshold
+    /// routing must not silently drop them — otherwise "no metadata"
+    /// becomes "no relevance" by accident.
+    #[test]
+    fn routing_threshold_keeps_neutral_indexes() {
+        let ids = vec![IndexId::new("known"), IndexId::new("missing")];
+        let weights: std::collections::HashMap<IndexId, f32> =
+            [(IndexId::new("known"), 0.05_f32)].into_iter().collect();
+
+        let (active, _map) = RoutingMode::Threshold(0.5).apply(&ids, &weights);
+        let active_set: std::collections::HashSet<&str> =
+            active.iter().map(|id| id.0.as_str()).collect();
+        assert!(!active_set.contains("known"), "0.05 < 0.5 dropped");
+        // Missing entries default to 1.0 → kept.
+        assert!(
+            active_set.contains("missing"),
+            "indexes without a context embedding must use neutral 1.0 weight"
+        );
+    }
+
+    /// Verify request → routing-mode resolution: missing or unknown values
+    /// fall back to `All`; explicit values pick the right strategy and
+    /// honour their `n` / `threshold` knobs.
+    #[test]
+    fn routing_mode_from_request_resolves_strategy() {
+        let base =
+            |routing: Option<&str>, n: Option<usize>, t: Option<f32>| -> GlobalSearchRequest {
+                GlobalSearchRequest {
+                    query: "x".into(),
+                    top_k: 1,
+                    full_content: false,
+                    indexes: None,
+                    routing: routing.map(|s| s.to_string()),
+                    routing_n: n,
+                    routing_threshold: t,
+                }
+            };
+        assert!(matches!(
+            RoutingMode::from_request(&base(None, None, None)),
+            RoutingMode::All
+        ));
+        assert!(matches!(
+            RoutingMode::from_request(&base(Some("garbage"), None, None)),
+            RoutingMode::All
+        ));
+        match RoutingMode::from_request(&base(Some("top_n"), Some(5), None)) {
+            RoutingMode::TopN(n) => assert_eq!(n, 5),
+            _ => panic!("expected TopN"),
+        }
+        match RoutingMode::from_request(&base(Some("top_n"), None, None)) {
+            RoutingMode::TopN(n) => assert_eq!(n, RoutingMode::DEFAULT_TOP_N),
+            _ => panic!("expected TopN default"),
+        }
+        match RoutingMode::from_request(&base(Some("threshold"), None, Some(0.7))) {
+            RoutingMode::Threshold(t) => assert!((t - 0.7).abs() < 1e-6),
+            _ => panic!("expected Threshold"),
         }
     }
 }

@@ -41,6 +41,24 @@ impl CodeIndexer {
             .and_then(|g| g.peek(chunk_id).cloned())
     }
 
+    /// Embed an arbitrary text using the wired embedder, bypassing the
+    /// query-LRU cache.
+    ///
+    /// Why: callers outside the search hot path (e.g. context-embedding
+    /// generation in `service::context_inference`, fan-out routing in
+    /// `service::server`) need to produce embeddings without polluting the
+    /// query cache and without going through `embed_query`'s `pub(super)`
+    /// gate. Returns `None` when no embedder is wired (BM25-only mode).
+    /// What: thin wrapper around `embedder.embed(text)`.
+    /// Test: covered indirectly via the context-embedding integration test.
+    pub async fn embed_text(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        let Some(embedder) = self.embedder.clone() else {
+            return Ok(None);
+        };
+        let vec = embedder.embed(text).await.context("embed text")?;
+        Ok(Some(vec))
+    }
+
     /// Resolve a query → embedding, using the LRU cache to skip repeats.
     pub(super) async fn embed_query(&self, query: &str) -> Result<Option<Vec<f32>>> {
         let Some(embedder) = self.embedder.clone() else {

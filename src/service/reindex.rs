@@ -387,6 +387,67 @@ fn schedule_progress_cleanup(
     });
 }
 
+/// Refresh `handle.context_embedding` and `handle.context_summary` from the
+/// root-level metadata files (issue #112).
+///
+/// Why: cross-index fan-out routing in `POST /search` weights each index by
+/// cosine similarity between the query embedding and the index's stored
+/// context embedding. The embedding is regenerated at the end of every
+/// reindex so it tracks changes to README / CLAUDE.md / manifest files.
+/// What: scrapes metadata via `context_inference::scrape_metadata_summary`,
+/// embeds the resulting string with the indexer's embedder, and writes the
+/// result into the handle's `RwLock`-guarded slots. Failure (no metadata,
+/// no embedder, embed error) leaves the slots as `None` so the router
+/// treats this index with a neutral 1.0 weight.
+/// Test: `context_embedding_populated_after_reindex` in this module.
+async fn refresh_context_embedding(handle: &Arc<IndexHandle>) {
+    use crate::service::context_inference::{make_display_summary, scrape_metadata_summary};
+
+    let Some(summary) = scrape_metadata_summary(&handle.root_path) else {
+        tracing::debug!(
+            "context_inference: no recognised metadata files under {} for index {}",
+            handle.root_path.display(),
+            handle.id.0
+        );
+        *handle.context_embedding.write().await = None;
+        *handle.context_summary.write().await = None;
+        return;
+    };
+
+    let display = make_display_summary(&summary);
+
+    let indexer = handle.indexer.read().await;
+    let embed_result = indexer.embed_text(&summary).await;
+    drop(indexer);
+
+    match embed_result {
+        Ok(Some(vec)) => {
+            *handle.context_embedding.write().await = Some(vec);
+            *handle.context_summary.write().await = Some(display);
+            tracing::info!(
+                "context_inference: refreshed context embedding for index {}",
+                handle.id.0
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "context_inference: no embedder wired on index {} — skipping context embedding",
+                handle.id.0
+            );
+            *handle.context_embedding.write().await = None;
+            *handle.context_summary.write().await = Some(display);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "context_inference: embed failed for index {}: {e}",
+                handle.id.0
+            );
+            *handle.context_embedding.write().await = None;
+            *handle.context_summary.write().await = Some(display);
+        }
+    }
+}
+
 /// Shared context threaded into `process_one_batch` so the per-batch helper
 /// doesn't take a dozen arguments. Cheap to clone (everything is `Arc` /
 /// `PathBuf` / scalar).
@@ -957,6 +1018,12 @@ pub fn spawn_reindex_with_cleanup(
         };
         emit_complete_event(&progress, started, peak_rss_mb, &totals, &kg).await;
 
+        // Issue #112: refresh the per-index context embedding from the
+        // root-level metadata files. Best-effort — failure here is logged
+        // and the handle's `context_embedding` stays `None`, which the
+        // fan-out router treats as a neutral 1.0 weight.
+        refresh_context_embedding(&handle).await;
+
         // Issue #75: GC the progress entry after a short delay
         // (helper-extracted: issue #98).
         schedule_progress_cleanup(cleanup_map, cleanup_id);
@@ -1001,6 +1068,8 @@ mod tests {
             extensions: vec![],
             domain_terms: vec![],
             path_filter: vec![],
+            context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
+            context_summary: Arc::new(tokio::sync::RwLock::new(None)),
         });
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle.clone(), progress.clone(), false);
@@ -1068,6 +1137,8 @@ mod tests {
             extensions: vec![],
             domain_terms: vec![],
             path_filter: vec!["common-*".to_string()],
+            context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
+            context_summary: Arc::new(tokio::sync::RwLock::new(None)),
         });
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle.clone(), progress.clone(), false);
@@ -1149,5 +1220,89 @@ mod tests {
             .last()
             .map(|s| s.contains("\"complete\""))
             .unwrap_or(false));
+    }
+
+    /// Issue #112: after a reindex completes, the handle's
+    /// `context_embedding` and `context_summary` must be populated when
+    /// recognised metadata files exist in `root_path`. Uses a `MockEmbedder`
+    /// so the test is fully hermetic.
+    #[tokio::test]
+    async fn context_embedding_populated_after_reindex() {
+        use crate::core::embed::{Embedder, MockEmbedder};
+        use crate::core::store::{UsearchStore, VectorStore};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // Stage a source file plus a README so the metadata scraper has
+        // something to embed.
+        fs::write(root.join("lib.rs"), "fn hello() {}\n").unwrap();
+        fs::write(
+            root.join("README.md"),
+            "# proj\n\nA test project for #112.\n",
+        )
+        .unwrap();
+
+        let dim = 32;
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(dim));
+        let store: Arc<dyn VectorStore> = Arc::new(UsearchStore::new(dim).expect("usearch new"));
+        let indexer = CodeIndexer::new("ctx-test", root.clone()).with_components(embedder, store);
+
+        let handle = Arc::new(IndexHandle::bare(
+            IndexId::new("ctx-test"),
+            Arc::new(tokio::sync::RwLock::new(indexer)),
+            root.clone(),
+        ));
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+
+        let ctx = handle.context_embedding.read().await.clone();
+        assert!(
+            ctx.is_some(),
+            "context_embedding must be populated when metadata is present and embedder is wired"
+        );
+        assert_eq!(ctx.unwrap().len(), dim, "embedding must have embedder dim");
+
+        let summary = handle.context_summary.read().await.clone();
+        assert!(summary.is_some(), "context_summary must be populated");
+        let s = summary.unwrap();
+        assert!(s.contains("proj") || s.contains("README"));
+    }
+
+    /// Issue #112: when no recognised metadata files exist, the context
+    /// embedding stays `None` so the router falls back to a neutral 1.0
+    /// weight for this index.
+    #[tokio::test]
+    async fn context_embedding_none_when_no_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // Only a source file — no README, no Cargo.toml, etc.
+        fs::write(root.join("lib.rs"), "fn hello() {}\n").unwrap();
+
+        let indexer = CodeIndexer::new("no-meta", root.clone());
+        let handle = Arc::new(IndexHandle::bare(
+            IndexId::new("no-meta"),
+            Arc::new(tokio::sync::RwLock::new(indexer)),
+            root.clone(),
+        ));
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+        assert!(handle.context_embedding.read().await.is_none());
+        assert!(handle.context_summary.read().await.is_none());
     }
 }

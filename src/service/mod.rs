@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config;
 pub mod constants;
+pub mod context_inference;
 pub mod daemon;
 pub mod indexed_files;
 pub mod persistence;

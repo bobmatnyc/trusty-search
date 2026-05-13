@@ -59,6 +59,29 @@ pub struct IndexHandle {
     /// Test: `path_filter_matches_immediate_subdir` covers the glob logic;
     /// `reindex_honours_path_filter` covers the end-to-end walk.
     pub path_filter: Vec<String>,
+
+    /// Embedded semantic fingerprint of the index's root-level metadata
+    /// (`README.md`, `CLAUDE.md`, `Cargo.toml`, …) — issue #112.
+    ///
+    /// Why: cross-index fan-out (`POST /search`) needs a cheap way to
+    /// weight or skip indexes based on query relevance to each project's
+    /// description. Storing a single pre-computed embedding here lets the
+    /// fan-out handler compute cosine similarity against the query
+    /// embedding in O(d) per index, rather than running a full per-index
+    /// search probe.
+    /// What: `None` when no recognised metadata file was found (cosine
+    /// weight defaults to neutral 1.0 in the router); `Some(vec)` carries a
+    /// `dim`-length unit-ish vector produced by the same embedder used for
+    /// chunks. Populated by [`crate::service::context_inference`] at the
+    /// end of every reindex.
+    /// Test: `context_embedding_*` tests in
+    /// `crate::service::context_inference::tests`.
+    pub context_embedding: Arc<RwLock<Option<Vec<f32>>>>,
+
+    /// Truncated (≤500 char) human-readable preview of the metadata
+    /// summary that produced [`Self::context_embedding`]. Surfaced via
+    /// `GET /indexes/:id/status` for operator visibility.
+    pub context_summary: Arc<RwLock<Option<String>>>,
 }
 
 impl IndexHandle {
@@ -78,6 +101,8 @@ impl IndexHandle {
             extensions: Vec::new(),
             domain_terms: Vec::new(),
             path_filter: Vec::new(),
+            context_embedding: Arc::new(RwLock::new(None)),
+            context_summary: Arc::new(RwLock::new(None)),
         }
     }
 }
