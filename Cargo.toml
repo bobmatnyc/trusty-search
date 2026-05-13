@@ -1,6 +1,6 @@
 [package]
 name = "trusty-search"
-version = "0.3.31"
+version = "0.3.32"
 edition = "2021"
 description = "Machine-wide hybrid code search service: BM25 + vector + KG, zero cold-start, MCP server"
 license = "MIT"
@@ -183,6 +183,11 @@ ner = ["dep:ort", "dep:tokenizers"]
 # link ORT correctly. Always pair `--features cuda` with
 # `--no-default-features`.
 cuda = ["trusty-embedder/cuda"]
+# Dynamic ORT loading without CUDA — for AL2023 (glibc 2.34) CPU-only cross-compilation.
+# Enables fastembed/ort-load-dynamic so no glibc-2.38-bound static ORT binaries are bundled.
+# Build: cargo build --no-default-features --features load-dynamic
+# Runtime: set ORT_DYLIB_PATH=/path/to/libonnxruntime.so
+load-dynamic = ["trusty-embedder/load-dynamic"]
 # Deprecated: CoreML / Metal GPU acceleration is now auto-detected at runtime
 # on Apple Silicon and requires no opt-in. The `coreml` feature is kept as a
 # no-op alias for backward compatibility so `cargo install --features coreml`
