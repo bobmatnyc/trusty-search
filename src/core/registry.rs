@@ -44,6 +44,21 @@ pub struct IndexHandle {
     /// Domain-specific vocabulary fed to `QueryClassifier::classify_with_domain`
     /// at search time. Empty = standard classifier behaviour.
     pub domain_terms: Vec<String>,
+
+    /// Glob patterns matched against the *immediate subdirectory name* under
+    /// `root_path`. When non-empty, the reindex walker keeps only files
+    /// whose first path component (relative to `root_path`) matches one of
+    /// these patterns. Issue #111.
+    ///
+    /// Why: large polyrepo roots (e.g. a directory of cloned Git repos) need
+    /// a quick way to scope an index to a subset of sibling repositories
+    /// without enumerating every absolute subtree. Glob patterns (`*` only,
+    /// no `**`) match repo-name shapes like `common-*` or `duetto-common*`.
+    /// What: A `Vec<String>` of glob patterns; empty = scan the whole
+    /// `root_path` (current behaviour, no regression).
+    /// Test: `path_filter_matches_immediate_subdir` covers the glob logic;
+    /// `reindex_honours_path_filter` covers the end-to-end walk.
+    pub path_filter: Vec<String>,
 }
 
 impl IndexHandle {
@@ -62,7 +77,157 @@ impl IndexHandle {
             exclude_globs: Vec::new(),
             extensions: Vec::new(),
             domain_terms: Vec::new(),
+            path_filter: Vec::new(),
         }
+    }
+}
+
+/// Match a file path against a set of glob patterns applied to the immediate
+/// subdirectory of `root_path` (issue #111).
+///
+/// Why: `path_filter` on a registered index lets callers restrict indexing
+/// to a subset of immediate subdirectories — usually repo names inside a
+/// polyrepo. The match runs against the *first path component* of
+/// `path.strip_prefix(root_path)` so the filter never has to know about
+/// the deeper file tree.
+/// What: returns `true` when `patterns` is empty (no filtering) or when at
+/// least one pattern in `patterns` matches the immediate subdir's basename
+/// via `glob::Pattern` (`*` wildcards, no `**`). Files that live directly in
+/// `root_path` (depth 0) are kept only if a pattern equals `"."` or matches
+/// the empty string — typically they aren't there for polyrepo layouts but
+/// we err on the side of keeping them when no pattern is supplied.
+/// Test: `path_filter_matches_immediate_subdir` in this module.
+pub fn path_matches_filter(
+    path: &std::path::Path,
+    root_path: &std::path::Path,
+    patterns: &[String],
+) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let Ok(rel) = path.strip_prefix(root_path) else {
+        // Path is outside the configured root; treat as non-match so the
+        // walker drops it.
+        return false;
+    };
+    let first_component = rel.components().next().and_then(|c| c.as_os_str().to_str());
+    let Some(subdir) = first_component else {
+        return false;
+    };
+    for pat in patterns {
+        let Ok(pattern) = glob::Pattern::new(pat) else {
+            // Malformed pattern: log once via tracing and fall back to a
+            // literal string compare so a typo doesn't silently drop every
+            // file.
+            tracing::warn!("path_filter pattern '{pat}' is not a valid glob; using exact match");
+            if pat == subdir {
+                return true;
+            }
+            continue;
+        };
+        if pattern.matches(subdir) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Verify the glob matcher only inspects the *first* path component
+    /// (the immediate subdir name) and supports `*` wildcards.
+    #[test]
+    fn path_filter_matches_immediate_subdir() {
+        let root = PathBuf::from("/data/repos");
+
+        // Empty pattern set ⇒ everything passes.
+        assert!(path_matches_filter(
+            &PathBuf::from("/data/repos/anything/src/lib.rs"),
+            &root,
+            &[],
+        ));
+
+        // Exact match on immediate subdir.
+        let patterns = vec!["duetto-common".to_string()];
+        assert!(path_matches_filter(
+            &PathBuf::from("/data/repos/duetto-common/src/lib.rs"),
+            &root,
+            &patterns,
+        ));
+        assert!(!path_matches_filter(
+            &PathBuf::from("/data/repos/other/src/lib.rs"),
+            &root,
+            &patterns,
+        ));
+
+        // Glob wildcard with `*`.
+        let patterns = vec!["common-*".to_string(), "duetto-common*".to_string()];
+        assert!(path_matches_filter(
+            &PathBuf::from("/data/repos/common-utils/foo.rs"),
+            &root,
+            &patterns,
+        ));
+        assert!(path_matches_filter(
+            &PathBuf::from("/data/repos/duetto-common-events/lib.rs"),
+            &root,
+            &patterns,
+        ));
+        assert!(!path_matches_filter(
+            &PathBuf::from("/data/repos/totally-other/lib.rs"),
+            &root,
+            &patterns,
+        ));
+
+        // Path outside root → not matched.
+        assert!(!path_matches_filter(
+            &PathBuf::from("/elsewhere/duetto-common/lib.rs"),
+            &root,
+            &patterns,
+        ));
+    }
+
+    /// Multiple matching patterns: any one match is enough.
+    #[test]
+    fn path_filter_matches_any_pattern() {
+        let root = PathBuf::from("/repos");
+        let patterns = vec!["api".to_string(), "frontend".to_string()];
+        assert!(path_matches_filter(
+            &PathBuf::from("/repos/api/handlers.rs"),
+            &root,
+            &patterns,
+        ));
+        assert!(path_matches_filter(
+            &PathBuf::from("/repos/frontend/app.tsx"),
+            &root,
+            &patterns,
+        ));
+        assert!(!path_matches_filter(
+            &PathBuf::from("/repos/docs/README.md"),
+            &root,
+            &patterns,
+        ));
+    }
+
+    /// Malformed glob pattern: falls back to literal match so a typo never
+    /// silently drops every file. The non-matching path still returns false.
+    #[test]
+    fn path_filter_malformed_pattern_falls_back_to_exact() {
+        let root = PathBuf::from("/r");
+        // `[` opens a glob character class that is never closed.
+        let patterns = vec!["[unclosed".to_string()];
+        assert!(path_matches_filter(
+            &PathBuf::from("/r/[unclosed/file.rs"),
+            &root,
+            &patterns,
+        ));
+        assert!(!path_matches_filter(
+            &PathBuf::from("/r/other/file.rs"),
+            &root,
+            &patterns,
+        ));
     }
 }
 

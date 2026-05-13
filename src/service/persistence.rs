@@ -45,6 +45,15 @@ pub struct PersistedIndex {
     /// Domain vocabulary for the per-index intent classifier.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_terms: Vec<String>,
+    /// Glob patterns matched against immediate subdirectory names under
+    /// `root_path`. When non-empty, only files inside subdirectories whose
+    /// basename matches at least one pattern are indexed. Distinct from
+    /// `include_paths` (which holds absolute subtrees from
+    /// `trusty-search.yaml`) — `path_filter` is the API-level glob filter
+    /// added for issue #111, intended for filtering polyrepo monorepos by
+    /// repo-name pattern.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_filter: Vec<String>,
 }
 
 /// TOML wrapper so the file uses `[[index]]` array-of-tables syntax —

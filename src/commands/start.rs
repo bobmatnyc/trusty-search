@@ -72,6 +72,7 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             exclude_globs: entry.exclude_globs,
             extensions,
             domain_terms: entry.domain_terms,
+            path_filter: entry.path_filter,
         };
         state.registry.register(handle);
     }

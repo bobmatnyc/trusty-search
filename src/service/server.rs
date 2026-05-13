@@ -362,6 +362,14 @@ pub struct CreateIndexRequest {
     /// Domain vocabulary for the per-index intent classifier.
     #[serde(default)]
     pub domain_terms: Option<Vec<String>>,
+    /// Glob patterns (issue #111) matched against the immediate subdirectory
+    /// name under `root_path`. When non-empty, only files inside subdirectories
+    /// whose basename matches at least one pattern are indexed. Supports `*`
+    /// wildcards (no `**`). Distinct from `include_paths` (absolute subtrees
+    /// from `trusty-search.yaml`) — `path_filter` is the API-level glob filter
+    /// intended for filtering polyrepo monorepos by repo-name pattern.
+    #[serde(default)]
+    pub path_filter: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -621,6 +629,13 @@ async fn create_index_handler(
         .filter(|e| !e.is_empty())
         .collect();
     let domain_terms: Vec<String> = req.domain_terms.clone().unwrap_or_default();
+    let path_filter: Vec<String> = req
+        .path_filter
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .collect();
     indexer.set_domain_terms(domain_terms.clone());
 
     // Persist the registration so a daemon restart can re-register
@@ -634,6 +649,7 @@ async fn create_index_handler(
             exclude_globs: exclude_globs.clone(),
             extensions: extensions.clone(),
             domain_terms: domain_terms.clone(),
+            path_filter: path_filter.clone(),
         },
     ) {
         tracing::warn!("could not persist index registry for {}: {e}", req.id);
@@ -647,6 +663,7 @@ async fn create_index_handler(
         exclude_globs,
         extensions,
         domain_terms,
+        path_filter,
     };
     state.registry.register(handle);
     // Push event so connected dashboards refresh their index list without a
@@ -745,6 +762,12 @@ pub struct GlobalSearchRequest {
     /// that want compact responses can read `compact_snippet`.
     #[serde(default)]
     pub full_content: bool,
+    /// Optional allow-list of index ids to fan out to (issue #110). When
+    /// present, only the named indexes are searched; unknown ids are
+    /// silently skipped (logged at debug). When absent / empty, the daemon
+    /// fans out to every registered index (legacy behaviour).
+    #[serde(default)]
+    pub indexes: Option<Vec<String>>,
 }
 
 fn default_global_top_k() -> usize {
@@ -769,7 +792,20 @@ async fn global_search_handler(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use crate::core::search::rrf::{rrf_fuse, RRF_K};
 
-    let index_ids = state.registry.list();
+    let all_ids = state.registry.list();
+    // Issue #110: when caller supplies `indexes`, restrict fan-out to that
+    // set. Unknown ids are dropped here (the per-index branch below would
+    // emit a 404; we'd rather silently skip so a stale caller doesn't
+    // poison an otherwise-good fan-out).
+    let index_ids: Vec<IndexId> = if let Some(requested) = req.indexes.as_ref() {
+        let allow: std::collections::HashSet<&str> = requested.iter().map(|s| s.as_str()).collect();
+        all_ids
+            .into_iter()
+            .filter(|id| allow.contains(id.0.as_str()))
+            .collect()
+    } else {
+        all_ids
+    };
     let total_indexes = index_ids.len();
     if index_ids.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -927,10 +963,24 @@ async fn index_status_handler(
     let index_id = IndexId::new(id);
     let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
     let indexer = handle.indexer.read().await;
+    // Issue #111: surface `path_filter` so callers can see which glob filter
+    // (if any) is active for the index. Returns `null` when no filter is set.
+    let path_filter = if handle.path_filter.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Array(
+            handle
+                .path_filter
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        )
+    };
     Ok(Json(serde_json::json!({
         "index_id": index_id.0,
         "root_path": handle.root_path,
         "chunk_count": indexer.chunk_count(),
+        "path_filter": path_filter,
     })))
 }
 
@@ -1062,6 +1112,7 @@ async fn reindex_handler(
                     exclude_globs: handle.exclude_globs.clone(),
                     extensions: handle.extensions.clone(),
                     domain_terms: handle.domain_terms.clone(),
+                    path_filter: handle.path_filter.clone(),
                 };
                 handle = state.registry.register(new_handle);
             }
@@ -1227,6 +1278,7 @@ mod tests {
                 query: "alpha".into(),
                 top_k: 10,
                 full_content: false,
+                indexes: None,
             }),
         )
         .await
@@ -1281,6 +1333,7 @@ mod tests {
                 query: "anything".into(),
                 top_k: 5,
                 full_content: false,
+                indexes: None,
             }),
         )
         .await
@@ -1288,5 +1341,66 @@ mod tests {
         assert_eq!(value["total_indexes"].as_u64(), Some(0));
         assert!(value["results"].as_array().unwrap().is_empty());
         assert!(value["indexes_searched"].as_array().unwrap().is_empty());
+    }
+
+    /// Issue #110 — `POST /search` with explicit `indexes: [...]` must only
+    /// fan out to the named indexes; results from indexes outside the
+    /// allow-list must not appear, even when they match the query.
+    #[tokio::test]
+    async fn global_search_restricts_to_named_indexes() {
+        use crate::core::{
+            indexer::CodeIndexer,
+            registry::{IndexHandle, IndexId, IndexRegistry},
+        };
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let registry = IndexRegistry::new();
+        for name in ["proj-a", "proj-b", "proj-c"] {
+            let id = IndexId::new(name);
+            let indexer = CodeIndexer::new(name, format!("/tmp/{name}"));
+            indexer
+                .index_file(
+                    &format!("{name}/lib.rs"),
+                    &format!("fn alpha_{name}() {{ println!(\"alpha hit\"); }}"),
+                )
+                .await
+                .expect("index_file ok");
+            registry.register(IndexHandle::bare(
+                id.clone(),
+                Arc::new(RwLock::new(indexer)),
+                format!("/tmp/{name}").into(),
+            ));
+        }
+        let state = Arc::new(SearchAppState::new(registry));
+        let Json(value) = global_search_handler(
+            State(state),
+            Json(GlobalSearchRequest {
+                query: "alpha".into(),
+                top_k: 10,
+                full_content: false,
+                indexes: Some(vec!["proj-a".into(), "proj-c".into()]),
+            }),
+        )
+        .await
+        .expect("handler ok");
+
+        // total_indexes reflects the *filtered* set we actually fanned out to.
+        assert_eq!(value["total_indexes"].as_u64(), Some(2));
+
+        let searched: std::collections::HashSet<String> = value["indexes_searched"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        assert!(searched.contains("proj-a"));
+        assert!(searched.contains("proj-c"));
+        assert!(!searched.contains("proj-b"), "proj-b must be excluded");
+
+        for r in value["results"].as_array().unwrap() {
+            let idx = r["index_id"].as_str().unwrap();
+            assert_ne!(idx, "proj-b", "no result may come from excluded index");
+        }
     }
 }

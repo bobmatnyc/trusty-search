@@ -277,6 +277,18 @@ fn collect_files_to_index(handle: &IndexHandle) -> crate::service::walker::WalkR
         });
     }
 
+    // Issue #111: `path_filter` restricts indexing to files under immediate
+    // subdirectories of `root_path` matching one of the configured glob
+    // patterns. Distinct from `include_paths` (absolute subtrees) — this
+    // operates on the *basename* of the first component under `root_path`,
+    // so callers can write `["common-*", "duetto-common*"]` without enumerating
+    // every repo path manually.
+    if !handle.path_filter.is_empty() {
+        let patterns = handle.path_filter.clone();
+        let root = handle.root_path.clone();
+        walked_files.retain(|p| crate::core::registry::path_matches_filter(p, &root, &patterns));
+    }
+
     // De-duplicate when multiple `include_paths` overlap (e.g. `["."]` plus
     // `["src"]`). `walk_source_files` returns canonicalised paths inside each
     // subtree but doesn't dedupe across subtrees.
@@ -988,6 +1000,7 @@ mod tests {
             exclude_globs: vec![],
             extensions: vec![],
             domain_terms: vec![],
+            path_filter: vec![],
         });
         let progress = Arc::new(ReindexProgress::new());
         spawn_reindex(handle.clone(), progress.clone(), false);
@@ -1030,6 +1043,71 @@ mod tests {
         assert!(
             !r2.iter().any(|c| c.content.contains("drop_me")),
             "ui/drop.rs must not have been indexed"
+        );
+    }
+
+    /// Issue #111 end-to-end: with `path_filter = ["common-*"]`, the reindex
+    /// must include files inside `common-utils/` but exclude `other-repo/`.
+    /// Uses the BM25-only path (no embedder needed) for hermetic execution.
+    #[tokio::test]
+    async fn reindex_honours_path_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("common-utils")).unwrap();
+        std::fs::create_dir_all(root.join("other-repo")).unwrap();
+        std::fs::write(root.join("common-utils/keep.rs"), "fn keep_common() {}\n").unwrap();
+        std::fs::write(root.join("other-repo/drop.rs"), "fn drop_other() {}\n").unwrap();
+
+        let indexer = CodeIndexer::new("pf-test", root.clone());
+        let handle = Arc::new(IndexHandle {
+            id: IndexId::new("pf-test"),
+            indexer: Arc::new(tokio::sync::RwLock::new(indexer)),
+            root_path: root.clone(),
+            include_paths: vec![],
+            exclude_globs: vec![],
+            extensions: vec![],
+            domain_terms: vec![],
+            path_filter: vec!["common-*".to_string()],
+        });
+        let progress = Arc::new(ReindexProgress::new());
+        spawn_reindex(handle.clone(), progress.clone(), false);
+
+        for _ in 0..100 {
+            if progress.status.load() == ReindexStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(progress.status.load(), ReindexStatus::Complete);
+        assert_eq!(
+            progress.total_files.load(Ordering::Acquire),
+            1,
+            "only common-utils/keep.rs should pass the path_filter"
+        );
+
+        let idx = handle.indexer.read().await;
+        let r = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "keep_common".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+            })
+            .await
+            .unwrap();
+        assert!(r.iter().any(|c| c.content.contains("keep_common")));
+        let r2 = idx
+            .search(&crate::core::indexer::SearchQuery {
+                text: "drop_other".into(),
+                top_k: 5,
+                expand_graph: false,
+                compact: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !r2.iter().any(|c| c.content.contains("drop_other")),
+            "other-repo must not have been indexed"
         );
     }
 
