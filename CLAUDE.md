@@ -600,8 +600,8 @@ SKIP_UI_BUILD=1 cargo publish
 ### GPU-accelerated embedding (CUDA, optional)
 
 Default builds and installs are CPU-only and require no GPU drivers. To enable
-GPU-accelerated embedding via fastembed-rs's CUDA (candle) backend, opt in
-with the `cuda` Cargo feature:
+GPU-accelerated embedding via the ONNX Runtime CUDA execution provider, opt in
+with the `cuda` Cargo feature at *build time*:
 
 ```bash
 # Install with CUDA support (machine must have CUDA toolkit + NVIDIA GPU)
@@ -611,16 +611,44 @@ cargo install trusty-search --features cuda
 cargo build --features cuda
 ```
 
+**Runtime behaviour (issue #113):** when the binary is built with `--features
+cuda`, the CUDA EP is auto-registered at daemon startup and prepended to the
+ORT execution-provider list, with CPU-no-arena as the fallback. There is no
+runtime flag to "enable" it — once the binary has CUDA support compiled in,
+GPU usage is the default. Operators can:
+
+- Force CPU at runtime: `trusty-search start --device cpu` (or `TRUSTY_DEVICE=cpu`)
+- Require GPU (fail-fast if absent): `trusty-search start --device gpu`
+- Auto-detect (default): `trusty-search start --device auto`
+
+When CUDA is the active EP, the daemon **auto-bumps `TRUSTY_MAX_BATCH_SIZE`
+to 512** so ONNX dispatches use the GPU efficiently (CPU's ≈55 MB/slot ORT
+arena formula starves the GPU). Set `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1` to
+preserve a manually configured batch size. The startup log reports the
+resolved provider:
+
+```
+embedder initialized: model=AllMiniLML6V2(Q) dim=384 provider=CUDA (CUDA GPU)
+gpu_batch_tuning: provider=CUDA → TRUSTY_MAX_BATCH_SIZE=512 (was 128)
+```
+
+If CUDA EP initialisation fails at runtime (no driver, wrong CUDA version,
+GPU in use by another process), the daemon falls back to CPU with a warning —
+unless `--device gpu` was specified, in which case it exits non-zero so the
+operator is not silently running CPU-bound on a "GPU node".
+
 Requirements when compiling with `--features cuda`:
 - NVIDIA CUDA toolkit installed (`nvcc` on PATH, or `CUDA_PATH` env set)
 - Compatible NVIDIA GPU available at runtime
-- Builds on CPU-only machines (including macOS) **will fail** the `cudarc`
-  build script — this is expected, not a bug. Omit `--features cuda` for
-  CPU-only environments.
+- Builds on CPU-only machines (including macOS) **will fail** the `cudarc` /
+  `ort` build scripts — this is expected, not a bug. Omit `--features cuda`
+  for CPU-only environments.
 
 The feature flag chain is:
-`trusty-search/cuda` → `trusty-search-core/cuda` → `trusty-embedder/cuda` →
-`fastembed/cuda`.
+`trusty-search/cuda` → `trusty-embedder/cuda` →
+`{fastembed/cuda, ort/cuda}`. The `ort/cuda` link is the load-bearing one —
+the all-MiniLM-L6-v2 model uses the ONNX runtime path, so `fastembed/cuda`
+(which only enables candle-cuda) alone does not move embedding to the GPU.
 
 ### Apple Silicon GPU acceleration (CoreML, auto-detected)
 

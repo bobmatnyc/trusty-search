@@ -278,6 +278,22 @@ enum Commands {
         /// and to make the launchd/systemd contract explicit in ProgramArguments.
         #[arg(long, default_value_t = false)]
         foreground: bool,
+
+        /// Embedding execution device: `auto` (default), `cpu`, or `gpu`.
+        ///
+        /// - `auto`: prefer CUDA on Linux/Windows (binary must be built with
+        ///   `--features cuda`), then CoreML on Apple Silicon, otherwise CPU.
+        /// - `cpu`: force CPU even when a GPU is available — useful for A/B
+        ///   benchmarking or freeing the GPU for another workload.
+        /// - `gpu`: require GPU acceleration; exit 1 if no GPU EP can be
+        ///   initialised. Useful on a dedicated GPU indexing node where
+        ///   silent CPU fallback would mean a 10× slower reindex.
+        ///
+        /// Implemented as the `TRUSTY_DEVICE` env var, which the embedder
+        /// reads at session-init time. Set explicitly to override the daemon
+        /// default.
+        #[arg(long, value_parser = ["auto", "cpu", "gpu"], default_value = "auto")]
+        device: String,
     },
 
     /// Stop the running background daemon
@@ -520,8 +536,12 @@ async fn run() -> Result<()> {
             commands::status::handle_status(cli.json).await?;
         }
 
-        Commands::Start { port, foreground } => {
-            commands::start::handle_start(port, foreground).await?;
+        Commands::Start {
+            port,
+            foreground,
+            device,
+        } => {
+            commands::start::handle_start(port, foreground, &device).await?;
         }
 
         Commands::Stop => {

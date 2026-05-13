@@ -73,6 +73,8 @@ async fn restore_indexes(state: &SearchAppState, embedder: &Arc<dyn crate::core:
             extensions,
             domain_terms: entry.domain_terms,
             path_filter: entry.path_filter,
+            context_embedding: Arc::new(tokio::sync::RwLock::new(None)),
+            context_summary: Arc::new(tokio::sync::RwLock::new(None)),
         };
         state.registry.register(handle);
     }
@@ -112,7 +114,65 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
     tracing::info!(
         "embedder initialized: model=AllMiniLML6V2(Q) dim={dim} provider={provider}{metal_hint}"
     );
+    tune_batch_size_for_provider(provider);
     Ok(std::sync::Arc::new(embedder))
+}
+
+/// When the resolved execution provider is a GPU, retune `TRUSTY_MAX_BATCH_SIZE`
+/// upward so ONNX dispatches use the GPU efficiently.
+///
+/// Why (issue #113): the CPU batch-size formula (≈55 MB transient ORT arena
+/// per batch slot, clamped to `[32, 512]`) is sized to keep the *CPU* ORT
+/// path under the soft RSS cap. On a CUDA GPU the arena lives in device
+/// memory and the per-slot transient is much smaller, so the CPU-tuned
+/// default (e.g. 128 on Medium tier) starves the GPU — most wall-clock is
+/// spent on host↔device round-trips instead of compute. Bumping the default
+/// to 512 cuts host↔device transitions ~4× and is what turns a 5-hour
+/// reindex into a ~30-minute one on a Tesla T4 (40 k files, INT8 model).
+/// What: if a GPU EP is active AND the operator did NOT opt out by setting
+/// `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1`, retune `TRUSTY_MAX_BATCH_SIZE` to 512.
+/// Test: on a CUDA-enabled binary the startup log shows
+/// `gpu_batch_tuning: TRUSTY_MAX_BATCH_SIZE=512 (was N)`; running with
+/// `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 TRUSTY_MAX_BATCH_SIZE=256 trusty-search start`
+/// keeps 256.
+fn tune_batch_size_for_provider(provider: trusty_embedder::ExecutionProvider) {
+    const GPU_BATCH_DEFAULT: usize = 512;
+
+    let is_gpu = matches!(
+        provider,
+        trusty_embedder::ExecutionProvider::Cuda | trusty_embedder::ExecutionProvider::CoreML
+    );
+    if !is_gpu {
+        return;
+    }
+
+    if std::env::var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        tracing::info!(
+            "gpu_batch_tuning: TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 set, leaving batch size unchanged"
+        );
+        return;
+    }
+
+    let current = std::env::var("TRUSTY_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128);
+    if current >= GPU_BATCH_DEFAULT {
+        return;
+    }
+
+    // SAFETY: invoked on the main thread before any indexing worker has
+    // started. Same invariant `MemoryPolicy::apply_to_env` relies on.
+    unsafe {
+        std::env::set_var("TRUSTY_MAX_BATCH_SIZE", GPU_BATCH_DEFAULT.to_string());
+    }
+    tracing::info!(
+        "gpu_batch_tuning: provider={provider} → TRUSTY_MAX_BATCH_SIZE={GPU_BATCH_DEFAULT} (was {current}); \
+         set TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 to keep your value"
+    );
 }
 
 /// Why: extracted from `main()`. The boot sequence is intricate (lockfile probe,
@@ -123,7 +183,28 @@ async fn build_embedder() -> Result<std::sync::Arc<dyn crate::core::Embedder>> {
 /// exit-1 message.
 /// Test: run twice in a row — the second invocation must exit 1 with the
 /// "another daemon is already running" message.
-pub async fn handle_start(port: u16, foreground: bool) -> Result<()> {
+pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<()> {
+    // Translate the `--device` CLI flag into the `TRUSTY_DEVICE` env var that
+    // `trusty-embedder` reads at session-init time. An explicit shell-level
+    // `TRUSTY_DEVICE` always wins so launchd/systemd unit files can set the
+    // policy in one place; the CLI flag only fills in when no env value is
+    // already present. `auto` is a no-op (existing behaviour: try GPU EPs in
+    // priority order, fall back to CPU on failure).
+    //
+    // SAFETY: invoked on the main thread before tokio spawns any workers.
+    // Same invariant `MemoryPolicy::apply_to_env` relies on.
+    if std::env::var_os("TRUSTY_DEVICE").is_none() {
+        match device {
+            "cpu" | "gpu" => unsafe {
+                std::env::set_var("TRUSTY_DEVICE", device);
+            },
+            "auto" => {}
+            other => {
+                anyhow::bail!("invalid --device value '{other}'; expected one of: auto, cpu, gpu")
+            }
+        }
+    }
+
     // Persist any memory-limit env vars set in the current shell so that
     // launchd restarts (which run without the user's shell environment) pick
     // them up via `daemon.env`. This runs before the fast-path check so the
