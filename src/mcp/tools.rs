@@ -121,6 +121,16 @@ impl McpServer {
             "tools/list" => {
                 return Response::ok(id, serde_json::json!({ "tools": tool_descriptors() }));
             }
+            // OpenRPC 1.3.2 discovery — see `mcp::openrpc`. Returns the
+            // full service description so orchestrators (open-mpm, etc.)
+            // can introspect every tool and its required
+            // `search.read`/`search.write` scope without bespoke adapters.
+            "rpc.discover" => {
+                return Response::ok(
+                    id,
+                    crate::mcp::openrpc::build_discover_response(env!("CARGO_PKG_VERSION")),
+                );
+            }
             other => (other.to_string(), params, false),
         };
 

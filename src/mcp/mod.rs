@@ -13,6 +13,7 @@
 //! Test: `cargo test -p trusty-search-mcp` covers JSON-RPC parsing, error
 //! shapes, and tool-name dispatch with a mocked daemon URL.
 
+pub mod openrpc;
 pub mod sse;
 pub mod stdio;
 pub mod tools;
