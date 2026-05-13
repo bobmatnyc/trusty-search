@@ -48,7 +48,7 @@ trusty-symgraph = { path = "../trusty-common/crates/trusty-symgraph" }
 # ── Shared trusty-common crates ────────────────────────────────────────────
 trusty-common = { version = "0.3.2", features = ["axum-server"] }
 trusty-mcp-core = { version = "0.1.0" }
-trusty-embedder = { version = "0.1.3", default-features = false, features = ["test-support"] }
+trusty-embedder = { version = "0.1.4", default-features = false, features = ["test-support"] }
 trusty-symgraph = { version = "0.2.1", default-features = false }  # contracts surface only — no tree-sitter
 
 # ── Async runtime / HTTP ───────────────────────────────────────────────────
