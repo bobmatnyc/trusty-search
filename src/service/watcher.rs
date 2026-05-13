@@ -114,25 +114,25 @@ mod tests {
         let file_path = dir.path().join("hello.txt");
         fs::write(&file_path, b"hello").expect("write file");
 
-        let event = timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("event arrives within 2s")
-            .expect("channel still open");
-
-        match event {
-            WatchEvent::Modified(p) => {
+        // Drain events until we see a Modified for our path or time out. We
+        // tolerate stray Modified events (e.g., tempdir creation events on macOS).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = timeout(remaining, rx.recv())
+                .await
+                .expect("event arrives before deadline")
+                .expect("channel still open");
+            if let WatchEvent::Modified(p) = event {
                 // Use file_name() rather than ends_with() so the assertion is
                 // immune to macOS resolving /tmp → /private/var/folders/…
                 // (the watcher delivers the canonicalized path; ends_with does
                 // component matching which is correct, but file_name() is more
                 // explicit and also survives any future path-normalization changes).
-                assert_eq!(
-                    p.file_name().and_then(|n| n.to_str()),
-                    Some("hello.txt"),
-                    "expected path filename to be hello.txt, got {p:?}"
-                );
+                if p.file_name().and_then(|n| n.to_str()) == Some("hello.txt") {
+                    return;
+                }
             }
-            other => panic!("expected Modified, got {other:?}"),
         }
     }
 
