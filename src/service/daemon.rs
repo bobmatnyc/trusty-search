@@ -425,6 +425,10 @@ pub async fn run_daemon(state: SearchAppState, requested_port: u16) -> Result<()
     // can locate the daemon without depending on the platform-specific
     // data-local dir. Best-effort: a missing $HOME is not fatal — the legacy
     // `daemon.port` file above is still authoritative for the local CLI.
+    //
+    // Note (issue #117): `write_http_addr_file` is unconditional and uses
+    // tmp+rename, so a freshly-booted daemon always corrects a stale file
+    // left behind by a crashed previous daemon or a SIGKILL'd `serve --http`.
     let http_addr_written = match http_addr_path() {
         Some(path) => match write_http_addr_file(&path, &addr) {
             Ok(()) => Some(path),

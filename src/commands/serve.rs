@@ -1,17 +1,19 @@
 //! Handler for `trusty-search serve` — MCP server (stdio + optional HTTP/SSE).
 
-use super::daemon_utils::{daemon_base_url, http_addr_path};
+use super::daemon_utils::{daemon_base_url, mcp_http_addr_path};
 use anyhow::Result;
 use colored::Colorize;
 
 /// Why: extracted from `main()`. The HTTP path involves a discovery file
-/// (`~/.trusty-search/http_addr`) and cleanup-on-exit logic that's easier to
-/// follow in isolation.
+/// (`~/.trusty-search/mcp_http_addr`) and cleanup-on-exit logic that's easier
+/// to follow in isolation.
 /// What: routes between three modes: explicit `--http <addr>`, port-based
 /// HTTP, or stdio-only via `--no-http`.
 /// Test: `cargo run -- serve --no-http` runs MCP over stdio; with HTTP, the
-/// discovery file appears at `~/.trusty-search/http_addr` then is removed on
-/// shutdown.
+/// discovery file appears at `~/.trusty-search/mcp_http_addr` then is removed
+/// on shutdown. Note: the MCP SSE listener writes its address to
+/// `mcp_http_addr` (distinct from the daemon's `http_addr`) so a crashed
+/// `serve` cannot clobber the daemon's discovery file (issue #117).
 pub async fn handle_serve(no_http: bool, port: u16, http: Option<String>) -> Result<()> {
     let daemon_url = daemon_base_url();
 
@@ -50,10 +52,13 @@ async fn serve_http(server: crate::mcp::McpServer, addr: String, daemon_url: &st
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local = listener.local_addr()?;
 
-    // Write `~/.trusty-search/http_addr` so `trusty-search dashboard` (and
-    // other clients) can find this MCP server's HTTP transport. Best-effort:
+    // Write `~/.trusty-search/mcp_http_addr` so MCP HTTP/SSE clients can find
+    // this MCP server's transport. Distinct from the daemon's `http_addr` file
+    // (issue #117): two processes writing the same file caused stale-address
+    // races where a SIGKILL'd `serve --http` would leave a dead address that
+    // `daemon_base_url()` reads first, then waits 60s for. Best-effort:
     // a missing $HOME is reported but doesn't abort.
-    let addr_file = http_addr_path();
+    let addr_file = mcp_http_addr_path();
     if let Some(ref path) = addr_file {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

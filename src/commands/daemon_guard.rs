@@ -132,7 +132,7 @@ pub async fn ensure_daemon_running(base: &str) -> Result<()> {
         let elapsed = start.elapsed().as_secs();
         let glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
         eprint!(
-            "\r{} Waiting for embedder to initialize… ({}s) ",
+            "\r{} Waiting for daemon to become ready… ({}s) ",
             glyph.cyan(),
             elapsed
         );
