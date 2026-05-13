@@ -103,23 +103,28 @@ rayon = "1"
 sha2 = "0.10"
 regex = "1"
 
-# ── Tree-sitter grammars (ABI 14 pinned) ───────────────────────────────────
-tree-sitter = "0.24"
+# ── Tree-sitter grammars (ABI 15) ──────────────────────────────────────────
+# Upgraded to tree-sitter 0.26 to align with open-mpm (issue #116) so that
+# trusty-search can be directly linked as an rlib without violating Cargo's
+# `links = "tree-sitter"` single-copy rule. Grammar versions match the set
+# used by open-mpm where possible; remaining grammars bumped to the latest
+# release compatible with tree-sitter 0.26.
+tree-sitter = "0.26"
 tree-sitter-language = "0.1"
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-javascript = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
-tree-sitter-go = "0.23"
+tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"
-tree-sitter-c = "0.23"
+tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
-tree-sitter-php = "0.23"
-tree-sitter-scala = "0.24"
-tree-sitter-c-sharp = "=0.23.0"
+tree-sitter-php = "0.24"
+tree-sitter-scala = "0.26"
+tree-sitter-c-sharp = "0.23"
 tree-sitter-kotlin-ng = "1.1"
-tree-sitter-swift = "=0.6.0"
+tree-sitter-swift = "0.7"
 
 # ── File watching / FS ─────────────────────────────────────────────────────
 notify = "6"
