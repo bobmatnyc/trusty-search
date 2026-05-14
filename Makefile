@@ -14,7 +14,7 @@ UI_DIR      := ui
 UI_DIST     := $(UI_DIR)/dist
 UI_EMBED    := ui-dist
 
-.PHONY: ui build-ui sync-ui release-prep install patch reinstall check clippy test
+.PHONY: ui build-ui sync-ui release-prep install patch reinstall check clippy test smoke
 
 ## Build Svelte UI (pnpm preferred, npm fallback)
 build-ui:
@@ -49,13 +49,25 @@ install:
 	sleep 1
 	cargo install --path . --locked
 
-## Bump the patch version, stop the daemon, install, and start it again.
+## Bump the patch version, commit + tag + push, install, and restart the daemon.
 ## Why: same macOS binary-replacement hazard as `install`; version bump and
 ## daemon restart are always paired during development patch cycles.
+## The git commit/tag/push steps are included here so every patch release
+## produces the canonical `v<VERSION>` tag that triggers the crates.io publish
+## workflow (.github/workflows/publish.yml matches on `v*` tags).
+## Version is read in the SAME shell as the bump (shell var, not Make eval)
+## to avoid Make's parse-time expansion of $(eval $(shell ...)).
 patch:
-	trusty-search stop 2>/dev/null || true
 	cargo set-version --bump patch
-	cargo install --path . --locked
+	@VERSION=$$(cargo metadata --no-deps --format-version 1 \
+	  | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])") && \
+	git add Cargo.toml Cargo.lock && \
+	git commit -m "chore(release): bump trusty-search to v$$VERSION" && \
+	git tag "v$$VERSION" && \
+	git push origin main && \
+	git push origin "v$$VERSION" && \
+	(trusty-search stop 2>/dev/null || true) && \
+	cargo install --path . --locked && \
 	trusty-search start
 
 ## Stop daemon, install new binary from source, restart (closes #87)
