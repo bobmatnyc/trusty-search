@@ -30,12 +30,17 @@ const FALLBACK_RAM_MB: u64 = 8 * 1024;
 /// Empirically measured ORT transient arena cost per `embed_batch` slot in MB.
 ///
 /// Why: ORT allocates working memory proportional to `batch_size × emb_dim ×
-/// seq_len` during each `embed_batch` call. At `batch_size=512` on
-/// all-MiniLM-L6-v2 (seq_len=512, 384-dim) we observe a 28 GB transient RSS
-/// peak — 28 GB / 512 ≈ 55 MB per slot. The between-batch RSS poller in
-/// `memguard` cannot catch this intra-call spike, so we bound batch size
-/// up-front from the configured memory limit. See issue #95.
-const EMBED_MB_PER_BATCH_SLOT: u64 = 55;
+/// seq_len` during each `embed_batch` call. The previous estimate of 55 MB
+/// per slot was measured on a small synthetic test corpus with short chunks
+/// and turned out to be a severe underestimate on real workloads. Production
+/// reindex on a 128 GB host showed peak RSS of 26–94 GB at the XLarge-tier
+/// default of 223 slots — i.e. ~150–400 MB per slot for typical code files,
+/// not 55. We now use 200 MB/slot as a realistic upper-bound estimate
+/// reflecting actual large-chunk behaviour. The between-batch RSS poller in
+/// `memguard` cannot catch this intra-call spike (it polls AFTER each batch,
+/// not during), so batch size MUST be bounded up-front from the configured
+/// memory limit. See issue #95 and the 94 GB reindex incident report.
+const EMBED_MB_PER_BATCH_SLOT: u64 = 200;
 
 /// Reserve this fraction of `memory_limit_mb` for the ORT transient arena
 /// when computing `max_batch_size`. The remaining 25% accounts for the
@@ -43,12 +48,18 @@ const EMBED_MB_PER_BATCH_SLOT: u64 = 55;
 const EMBED_ARENA_BUDGET_NUM: u64 = 75;
 const EMBED_ARENA_BUDGET_DEN: u64 = 100;
 
-/// Floor for the computed batch size. Below this throughput collapses.
-const MIN_COMPUTED_BATCH_SIZE: usize = 32;
+/// Floor for the computed batch size. Below this throughput collapses but the
+/// process is still functional. Lowered from 32 → 8 to give the formula room
+/// to recommend safer values on memory-constrained hosts.
+const MIN_COMPUTED_BATCH_SIZE: usize = 8;
 
-/// Ceiling for the computed batch size. We never exceed the historical cap
-/// even on very-high-memory hosts (returns diminish past ~512).
-const MAX_COMPUTED_BATCH_SIZE: usize = 512;
+/// Ceiling for the computed batch size. Lowered from 512 → 64 (issue: 94 GB
+/// reindex spike). At 200 MB/slot, even 64 slots × 200 MB = 12.8 GB transient
+/// peak — already close to the Medium tier's 4 GB soft cap, so anything
+/// higher would be reckless on the smallest supported host. GPU paths that
+/// genuinely need 512 explicitly opt out via `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1`
+/// (see `commands::start::tune_batch_size_for_provider`).
+const MAX_COMPUTED_BATCH_SIZE: usize = 64;
 
 /// Compute the safe `max_batch_size` for a given memory limit so that the ORT
 /// transient arena (≈ `EMBED_MB_PER_BATCH_SLOT` per slot) stays within
@@ -57,7 +68,11 @@ const MAX_COMPUTED_BATCH_SIZE: usize = 512;
 ///
 /// Why: see `EMBED_MB_PER_BATCH_SLOT` doc — intra-call spikes are invisible to
 /// the RSS poller, so batch size must be sized from the limit, not against it.
-/// What: `floor(memory_limit_mb * 0.75 / 55)`, clamped to `[32, 512]`.
+/// What: `floor(memory_limit_mb * 0.75 / 200)`, clamped to `[8, 64]`. With the
+/// corrected 200 MB/slot estimate this yields: Medium (4 GB) → 15, Large
+/// (8 GB) → 30, XLarge (16 GB) → 61. The previous formula (55 MB/slot,
+/// `[32, 512]`) produced 55/111/223 which blew through every soft cap on
+/// real workloads — see the 94 GB reindex incident report.
 /// Test: `test_compute_max_batch_size_from_limit` covers the tier table and
 /// the clamp endpoints.
 fn compute_max_batch_size(memory_limit_mb: usize) -> usize {
@@ -101,18 +116,21 @@ impl MemoryTier {
     /// Why: `TRUSTY_MAX_BATCH_SIZE` is a runtime knob. An operator who sets it
     /// to 2048 on a 16 GB box (the Medium tier) will trigger the same ORT
     /// transient-arena spike that auto-tuning was designed to prevent. The
-    /// auto-derived defaults (Medium=55, Large=111, XLarge=223) already sit
+    /// auto-derived defaults (Medium=15, Large=30, XLarge=61) already sit
     /// well below these caps, so this hard ceiling only kicks in for explicit
     /// overrides — exactly the case where additional safety is warranted.
-    /// What: Medium=64, Large=128, XLarge=256. The arena disable in
-    /// trusty-embedder (`with_arena_allocator(false)`) is the primary
-    /// mitigation; this cap is a defense in depth.
+    /// What: Medium=16, Large=32, XLarge=64. Lowered from {64, 128, 256}
+    /// after the 94 GB reindex incident (issue: 55→200 MB/slot correction):
+    /// at the corrected 200 MB/slot, even 64 slots × 200 MB = 12.8 GB
+    /// intra-call peak, which is already aggressive on Medium's 4 GB soft cap.
+    /// The arena disable in trusty-embedder (`with_arena_allocator(false)`)
+    /// is the primary mitigation; this cap is defense in depth.
     /// Test: `test_tier_batch_size_hard_cap` covers the table.
     pub fn batch_size_hard_cap(self) -> usize {
         match self {
-            MemoryTier::Medium => 64,
-            MemoryTier::Large => 128,
-            MemoryTier::XLarge => 256,
+            MemoryTier::Medium => 16,
+            MemoryTier::Large => 32,
+            MemoryTier::XLarge => 64,
         }
     }
 
@@ -224,12 +242,37 @@ impl MemoryPolicy {
         // Apply tier-based hard cap on max_batch_size (issue #89). The cap
         // only constrains env-var overrides; auto-derived defaults are already
         // safely below it.
+        //
+        // Escape hatch: `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1` opts the operator
+        // out of the tier hard cap, honoring `TRUSTY_MAX_BATCH_SIZE` verbatim.
+        // Why: the GPU tuning path (commands::start::tune_batch_size_for_provider)
+        // needs to set 512 to feed CUDA efficiently, and other power users may
+        // have measured their own per-slot cost on specific workloads. This
+        // mirrors the GPU path's existing semantics and makes the flag apply
+        // universally (CPU + GPU), not just at GPU init. See the 94 GB reindex
+        // incident report.
+        let explicit = std::env::var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let env_set = std::env::var("TRUSTY_MAX_BATCH_SIZE").is_ok();
         let raw_batch_size = env_override_usize("TRUSTY_MAX_BATCH_SIZE", derived_batch_size);
         let batch_cap = tier.batch_size_hard_cap();
-        let max_batch_size = if raw_batch_size > batch_cap {
+        let max_batch_size = if explicit && env_set {
+            tracing::warn!(
+                "memory_policy: TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 — honoring \
+                 TRUSTY_MAX_BATCH_SIZE={} verbatim and bypassing tier {} hard cap of {}. \
+                 Ensure you have measured the actual ORT transient-arena cost per slot \
+                 on your workload (defaults assume 200 MB/slot).",
+                raw_batch_size,
+                tier,
+                batch_cap,
+            );
+            raw_batch_size
+        } else if raw_batch_size > batch_cap {
             tracing::warn!(
                 "memory_policy: TRUSTY_MAX_BATCH_SIZE={} exceeds tier {} hard cap of {}; \
-                 clamping to protect against ORT transient-arena spike (issue #89)",
+                 clamping to protect against ORT transient-arena spike (issue #89). \
+                 Set TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 to bypass this clamp.",
                 raw_batch_size,
                 tier,
                 batch_cap,
@@ -372,6 +415,13 @@ fn detect_linux_ram_mb() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize env-mutating tests within this module. Cargo runs tests on
+    /// multiple threads by default and `std::env::set_var` is process-global,
+    /// so without this guard a concurrent test can stomp on the env vars a
+    /// sibling test relies on (e.g. `TRUSTY_MAX_BATCH_SIZE_EXPLICIT`).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_tier_selection() {
@@ -401,40 +451,45 @@ mod tests {
     #[test]
     fn test_tier_defaults_table() {
         // Spot-check the documented Memory Tier Table from the design doc.
+        // Batch sizes updated for the 200 MB/slot estimate (was 55).
         let medium = MemoryTier::Medium.defaults();
         assert_eq!(medium.memory_limit_mb, 4_096);
         assert_eq!(medium.max_chunks, 200_000);
-        // max_batch_size = floor(4096 * 0.75 / 55) = floor(55.85) = 55
-        assert_eq!(medium.max_batch_size, 55);
+        // max_batch_size = floor(4096 * 0.75 / 200) = floor(15.36) = 15
+        assert_eq!(medium.max_batch_size, 15);
 
         let large = MemoryTier::Large.defaults();
         assert_eq!(large.memory_limit_mb, 8_192);
-        // max_batch_size = floor(8192 * 0.75 / 55) = floor(111.71) = 111
-        assert_eq!(large.max_batch_size, 111);
+        // max_batch_size = floor(8192 * 0.75 / 200) = floor(30.72) = 30
+        assert_eq!(large.max_batch_size, 30);
 
         let xl = MemoryTier::XLarge.defaults();
         assert_eq!(xl.memory_limit_mb, 16_384);
         assert_eq!(xl.max_chunks, 800_000);
         assert_eq!(xl.embedding_cache, 20_000);
         assert_eq!(xl.max_kg_nodes, 500_000);
-        // max_batch_size = floor(16384 * 0.75 / 55) = floor(223.42) = 223
-        assert_eq!(xl.max_batch_size, 223);
+        // max_batch_size = floor(16384 * 0.75 / 200) = floor(61.44) = 61
+        assert_eq!(xl.max_batch_size, 61);
     }
 
     #[test]
     fn test_compute_max_batch_size_from_limit() {
-        // Tier table per issue #95.
-        assert_eq!(compute_max_batch_size(4_096), 55);
-        assert_eq!(compute_max_batch_size(8_192), 111);
-        assert_eq!(compute_max_batch_size(16_384), 223);
+        // Tier table with corrected 200 MB/slot estimate (was 55).
+        assert_eq!(compute_max_batch_size(4_096), 15);
+        assert_eq!(compute_max_batch_size(8_192), 30);
+        assert_eq!(compute_max_batch_size(16_384), 61);
 
         // Floor clamp: tiny limits still produce a usable batch size.
         assert_eq!(compute_max_batch_size(0), MIN_COMPUTED_BATCH_SIZE);
+        // 1024 MB → floor(1024 * 0.75 / 200) = floor(3.84) = 3 → clamped to 8
         assert_eq!(compute_max_batch_size(1_024), MIN_COMPUTED_BATCH_SIZE);
 
-        // Ceiling clamp: enormous limits don't push past historical cap.
+        // Ceiling clamp: enormous limits don't push past new [8, 64] cap.
         assert_eq!(compute_max_batch_size(64_000), MAX_COMPUTED_BATCH_SIZE);
         assert_eq!(compute_max_batch_size(1_000_000), MAX_COMPUTED_BATCH_SIZE);
+        // Just above where the raw formula reaches 64:
+        // floor(17_067 * 0.75 / 200) = 64, anything above stays clamped at 64.
+        assert_eq!(compute_max_batch_size(20_000), MAX_COMPUTED_BATCH_SIZE);
     }
 
     /// Verify that an env-var override beats the tier default.
@@ -448,6 +503,7 @@ mod tests {
     /// module with more env-touching tests.
     #[test]
     fn test_env_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Save & override.
         let prior = std::env::var("TRUSTY_MAX_CHUNKS").ok();
         // SAFETY: tests run single-threaded within this module's env block.
@@ -474,27 +530,32 @@ mod tests {
     fn test_tier_batch_size_hard_cap() {
         // Issue #89: tier-specific batch-size hard caps protect against
         // runaway TRUSTY_MAX_BATCH_SIZE overrides on memory-constrained hosts.
-        assert_eq!(MemoryTier::Medium.batch_size_hard_cap(), 64);
-        assert_eq!(MemoryTier::Large.batch_size_hard_cap(), 128);
-        assert_eq!(MemoryTier::XLarge.batch_size_hard_cap(), 256);
+        // Lowered after the 94 GB reindex incident (55→200 MB/slot correction).
+        assert_eq!(MemoryTier::Medium.batch_size_hard_cap(), 16);
+        assert_eq!(MemoryTier::Large.batch_size_hard_cap(), 32);
+        assert_eq!(MemoryTier::XLarge.batch_size_hard_cap(), 64);
     }
 
     #[test]
     fn test_batch_size_env_override_clamped_by_hard_cap() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Save & override.
         let prior = std::env::var("TRUSTY_MAX_BATCH_SIZE").ok();
+        let prior_explicit = std::env::var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT").ok();
         // SAFETY: tests run single-threaded within this module's env block.
         unsafe {
             std::env::set_var("TRUSTY_MAX_BATCH_SIZE", "2048");
+            // Ensure the explicit-bypass flag is unset for this test.
+            std::env::remove_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT");
         }
 
-        // 16 GB → Medium tier, hard cap = 64. Env value of 2048 must be
+        // 16 GB → Medium tier, hard cap = 16. Env value of 2048 must be
         // clamped down to the tier cap.
         let policy = MemoryPolicy::from_total_ram_mb(16 * 1024);
         assert_eq!(policy.tier, MemoryTier::Medium);
         assert_eq!(
-            policy.max_batch_size, 64,
-            "Medium tier must clamp TRUSTY_MAX_BATCH_SIZE=2048 down to 64"
+            policy.max_batch_size, 16,
+            "Medium tier must clamp TRUSTY_MAX_BATCH_SIZE=2048 down to 16"
         );
 
         // Restore.
@@ -503,6 +564,45 @@ mod tests {
             match prior {
                 Some(v) => std::env::set_var("TRUSTY_MAX_BATCH_SIZE", v),
                 None => std::env::remove_var("TRUSTY_MAX_BATCH_SIZE"),
+            }
+            match prior_explicit {
+                Some(v) => std::env::set_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT", v),
+                None => std::env::remove_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_size_explicit_flag_bypasses_clamp() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Save & override.
+        let prior = std::env::var("TRUSTY_MAX_BATCH_SIZE").ok();
+        let prior_explicit = std::env::var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT").ok();
+        // SAFETY: tests run single-threaded within this module's env block.
+        unsafe {
+            std::env::set_var("TRUSTY_MAX_BATCH_SIZE", "512");
+            std::env::set_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT", "1");
+        }
+
+        // 16 GB → Medium tier, hard cap = 16. With EXPLICIT=1 the operator's
+        // 512 must be honored verbatim (GPU path, expert opt-out).
+        let policy = MemoryPolicy::from_total_ram_mb(16 * 1024);
+        assert_eq!(policy.tier, MemoryTier::Medium);
+        assert_eq!(
+            policy.max_batch_size, 512,
+            "TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1 must bypass the tier hard cap"
+        );
+
+        // Restore.
+        // SAFETY: same as above.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_MAX_BATCH_SIZE", v),
+                None => std::env::remove_var("TRUSTY_MAX_BATCH_SIZE"),
+            }
+            match prior_explicit {
+                Some(v) => std::env::set_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT", v),
+                None => std::env::remove_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT"),
             }
         }
     }

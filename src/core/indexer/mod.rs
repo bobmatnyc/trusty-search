@@ -91,15 +91,27 @@ pub(crate) fn max_chunks_per_index() -> usize {
 /// bounded while still being large enough to amortise ONNX kernel launch
 /// overhead.
 ///
-/// Override at runtime via `TRUSTY_MAX_BATCH_SIZE` (clamped to `[32, 2048]`).
+/// Override at runtime via `TRUSTY_MAX_BATCH_SIZE` (clamped to
+/// `[EMBED_BATCH_MIN, EMBED_BATCH_MAX]`).
 ///
 /// Default lowered from 512 → 128 (issue #79) — the ONNX activation arena
 /// retains buffers sized to the largest batch it has seen, and on Apple
-/// Silicon this triggered Jetsam kills on large repos. 128 is the value the
-/// doc-comment above already recommended.
-const DEFAULT_EMBED_BATCH_SIZE: usize = 128;
-const EMBED_BATCH_MIN: usize = 32;
-const EMBED_BATCH_MAX: usize = 2048;
+/// Silicon this triggered Jetsam kills on large repos. The authoritative
+/// per-tier default is now computed by [`crate::core::MemoryPolicy`] and
+/// written back into `TRUSTY_MAX_BATCH_SIZE` before this function is called,
+/// so the constant here is only a safety net when the env is unset.
+const DEFAULT_EMBED_BATCH_SIZE: usize = 32;
+/// Floor for env-clamped batch size. Aligned with
+/// `core::memory_policy::MIN_COMPUTED_BATCH_SIZE` (lowered from 32 → 8 after
+/// the 94 GB reindex incident — the corrected 200 MB/slot ORT estimate makes
+/// even 32 dangerous on the Medium tier).
+const EMBED_BATCH_MIN: usize = 8;
+/// Ceiling for env-clamped batch size. Aligned with the tier hard-cap
+/// envelope in `core::memory_policy` (XLarge=64) PLUS headroom for the GPU
+/// opt-out path (`TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1` sets 512 on CUDA/CoreML).
+/// Lowered from 2048 → 512 since no real workload above 512 has been
+/// validated and the previous ceiling allowed catastrophic env-typo values.
+const EMBED_BATCH_MAX: usize = 512;
 
 /// Read the embedding batch size from `TRUSTY_MAX_BATCH_SIZE`, clamped to
 /// `[EMBED_BATCH_MIN, EMBED_BATCH_MAX]`. Falls back to `DEFAULT_EMBED_BATCH_SIZE`
