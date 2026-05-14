@@ -132,8 +132,14 @@ pub fn chunks_path(index_id: &str) -> Result<PathBuf> {
 /// warning and returns empty so a bad save doesn't brick the daemon.
 /// Test: `tests::registry_roundtrip` writes a file then loads it back.
 pub fn load_index_registry() -> Result<Vec<PersistedIndex>> {
-    let path = indexes_toml_path()?;
-    let content = match std::fs::read_to_string(&path) {
+    load_index_registry_at(&indexes_toml_path()?)
+}
+
+/// Path-injectable variant of [`load_index_registry`]. Exists so the
+/// roundtrip / delete-persistence tests can drive the load/save/upsert/remove
+/// pipeline against a tempfile without monkey-patching `dirs::data_local_dir`.
+pub(crate) fn load_index_registry_at(path: &Path) -> Result<Vec<PersistedIndex>> {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).context("read indexes.toml"),
@@ -153,14 +159,18 @@ pub fn load_index_registry() -> Result<Vec<PersistedIndex>> {
 /// Persist the registry atomically (write-tmp + rename) so a crash mid-write
 /// never leaves a partially-written file.
 pub fn save_index_registry(entries: &[PersistedIndex]) -> Result<()> {
-    let path = indexes_toml_path()?;
+    save_index_registry_at(&indexes_toml_path()?, entries)
+}
+
+/// Path-injectable variant of [`save_index_registry`].
+pub(crate) fn save_index_registry_at(path: &Path, entries: &[PersistedIndex]) -> Result<()> {
     let file = IndexRegistryFile {
         indexes: entries.to_vec(),
     };
     let serialized = toml::to_string_pretty(&file).context("serialize indexes.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, serialized).context("write indexes.toml tmp")?;
-    std::fs::rename(&tmp, &path).context("rename indexes.toml")?;
+    std::fs::rename(&tmp, path).context("rename indexes.toml")?;
     Ok(())
 }
 
@@ -172,7 +182,14 @@ pub fn save_index_registry(entries: &[PersistedIndex]) -> Result<()> {
 /// What: load → upsert by id → save (atomically). Cheap; the file is tiny.
 /// Test: `tests::registry_upsert_idempotent` covers re-registration.
 pub fn upsert_index_registry_entry(entry: PersistedIndex) -> Result<()> {
-    let mut entries = load_index_registry()?;
+    upsert_index_registry_entry_at(&indexes_toml_path()?, entry)
+}
+
+/// Path-injectable variant. Same upsert semantics, but reads/writes the
+/// supplied TOML path. Used by the persistence tests (issue #118) to assert
+/// that re-registering the same id never produces a duplicate `[[index]]`.
+pub(crate) fn upsert_index_registry_entry_at(path: &Path, entry: PersistedIndex) -> Result<()> {
+    let mut entries = load_index_registry_at(path)?;
     if let Some(existing) = entries.iter_mut().find(|e| e.id == entry.id) {
         // Overwrite the whole record (not just root_path) so updated
         // `include_paths`/`exclude_globs`/`extensions`/`domain_terms` from
@@ -181,19 +198,34 @@ pub fn upsert_index_registry_entry(entry: PersistedIndex) -> Result<()> {
     } else {
         entries.push(entry);
     }
-    save_index_registry(&entries)
+    save_index_registry_at(path, &entries)
 }
 
 /// Remove an entry from the registry file. Silently no-ops when the id is
 /// absent (idempotent delete).
+///
+/// Why (issue #118): `DELETE /indexes/:id` evicts an index from the in-memory
+/// `DashMap`, but unless the on-disk `indexes.toml` is also rewritten, the
+/// next daemon restart re-registers the entry and pre-allocates an HNSW arena
+/// for it — production saw 60+ "deleted" indexes accumulate this way and pin
+/// 24 GB of RSS. This function is the persistence half of that fix; it is
+/// called from `delete_index_handler` so the removal survives restart.
+/// What: load → filter out `id` → atomic save. No-op when id absent.
+/// Test: `tests::remove_index_persists_to_toml` registers two indexes, removes
+/// one, reloads the file, asserts only the survivor remains.
 pub fn remove_index_registry_entry(id: &str) -> Result<()> {
-    let mut entries = load_index_registry()?;
+    remove_index_registry_entry_at(&indexes_toml_path()?, id)
+}
+
+/// Path-injectable variant of [`remove_index_registry_entry`].
+pub(crate) fn remove_index_registry_entry_at(path: &Path, id: &str) -> Result<()> {
+    let mut entries = load_index_registry_at(path)?;
     let before = entries.len();
     entries.retain(|e| e.id != id);
     if entries.len() == before {
         return Ok(());
     }
-    save_index_registry(&entries)
+    save_index_registry_at(path, &entries)
 }
 
 /// Delete the on-disk data directory for an index (HNSW + chunks).
@@ -258,6 +290,95 @@ mod tests {
         let s = toml::to_string_pretty(&file).unwrap();
         let parsed: IndexRegistryFile = toml::from_str(&s).unwrap();
         assert_eq!(parsed.indexes, file.indexes);
+    }
+
+    /// Regression test for issue #118: `DELETE /indexes/:id` must rewrite
+    /// `indexes.toml` so the removal survives a daemon restart.
+    ///
+    /// Why: production accumulated 60+ "deleted" indexes because the DELETE
+    /// path only mutated the in-memory `DashMap`. Each empty entry replayed
+    /// from disk pre-allocates an HNSW arena (80–150 MB). The fix wires
+    /// `delete_index_handler` to `remove_index_registry_entry`; this test
+    /// pins that behaviour at the persistence boundary by driving the
+    /// load/save/remove pipeline against a tempfile and asserting the
+    /// deleted id is absent from the rehydrated registry.
+    #[test]
+    fn remove_index_persists_to_toml() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        upsert_index_registry_entry_at(
+            &path,
+            PersistedIndex {
+                id: "keep".into(),
+                root_path: PathBuf::from("/tmp/keep"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        upsert_index_registry_entry_at(
+            &path,
+            PersistedIndex {
+                id: "drop".into(),
+                root_path: PathBuf::from("/tmp/drop"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(load_index_registry_at(&path).unwrap().len(), 2);
+
+        // Delete the second entry — this is the persistence call that
+        // `delete_index_handler` makes on the DELETE handler path.
+        remove_index_registry_entry_at(&path, "drop").unwrap();
+
+        // Rehydrate from disk (simulating a daemon restart) and confirm only
+        // the survivor comes back. This is the assertion that would have
+        // failed before the fix.
+        let restored = load_index_registry_at(&path).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, "keep");
+        assert!(restored.iter().all(|e| e.id != "drop"));
+
+        // Idempotent delete: removing again is a silent no-op.
+        remove_index_registry_entry_at(&path, "drop").unwrap();
+        assert_eq!(load_index_registry_at(&path).unwrap().len(), 1);
+    }
+
+    /// Regression test for the add-side of issue #118: re-registering the
+    /// same `id` must upsert (not append) in the on-disk file.
+    ///
+    /// Why: if `POST /indexes` appended a duplicate `[[index]]` block on
+    /// every call, a flapping daemon would build up the same accumulation
+    /// pathology the DELETE bug caused — every duplicate replays as a
+    /// separate HNSW arena at startup.
+    #[test]
+    fn upsert_index_dedupes_on_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        upsert_index_registry_entry_at(
+            &path,
+            PersistedIndex {
+                id: "proj".into(),
+                root_path: PathBuf::from("/old"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Re-register with the same id but a different root_path.
+        upsert_index_registry_entry_at(
+            &path,
+            PersistedIndex {
+                id: "proj".into(),
+                root_path: PathBuf::from("/new"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let entries = load_index_registry_at(&path).unwrap();
+        assert_eq!(entries.len(), 1, "duplicate [[index]] block written");
+        assert_eq!(entries[0].root_path, PathBuf::from("/new"));
     }
 
     #[test]
