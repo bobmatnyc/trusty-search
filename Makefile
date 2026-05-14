@@ -78,10 +78,21 @@ patch:
 ## 10–20 GB RAM during compilation and has triggered the OOM killer against
 ## tmux sessions on this machine. CARGO_BUILD_JOBS=2 caps compile threads.
 ## Use this target instead of bare `cargo install` for local dev installs.
+##
+## Why launchctl unload (not `trusty-search stop`): the daemon is managed by
+## launchd with KeepAlive=true, which respawns the process within ~30s of a
+## SIGTERM. That meant `cargo install` ran while the daemon was already back
+## up (and possibly mid-reindex), and the trailing `launchctl load` then
+## no-op'd because the plist was still loaded — occasionally falling through
+## to `trusty-search start` and double-starting the daemon. `launchctl
+## unload` cleanly deregisters the job so KeepAlive can't fight us, and the
+## paired `launchctl load` at the end is the single source of truth for
+## restart.
 deploy:
-	(trusty-search stop 2>/dev/null || true)
+	-launchctl unload ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null
+	sleep 2
 	CARGO_BUILD_JOBS=2 cargo install --path . --locked
-	launchctl load ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null || trusty-search start
+	launchctl load ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist
 
 ## Stop daemon, install new binary from source, restart (closes #87)
 ## Why: replacing the binary while the daemon is running causes macOS to
