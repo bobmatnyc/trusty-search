@@ -87,6 +87,12 @@ pub const PERSISTED_ENV_VARS: &[&str] = &[
     "TRUSTY_EMBEDDING_CACHE",
     "TRUSTY_MAX_BATCH_SIZE",
     "TRUSTY_BM25_CORPUS_CAP",
+    // Persist the device selection so launchd/systemd restarts (which run
+    // without the user's shell env) keep honouring `--device cpu`. This is
+    // load-bearing on Apple Silicon: CoreML inflates virtual RSS to ~100 GB
+    // and triggers macOS jetsam kill on large repos, so operators who pin
+    // CPU must have that pin survive every restart.
+    "TRUSTY_DEVICE",
 ];
 
 /// Write memory-limit env vars from the current process environment to
