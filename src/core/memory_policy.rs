@@ -48,6 +48,67 @@ const EMBED_MB_PER_BATCH_SLOT: u64 = 200;
 const EMBED_ARENA_BUDGET_NUM: u64 = 75;
 const EMBED_ARENA_BUDGET_DEN: u64 = 100;
 
+/// Fraction of total system RAM allocated to `memory_limit_mb` (the soft cap
+/// on the indexing pipeline's working set). Why 25%: the daemon shares the
+/// host with the user's editor, browser, language servers, OS, and frequently
+/// other dev daemons. Reserving 75% for everything else has empirically kept
+/// reindex runs from triggering OOM-killer cascades on workstations between
+/// 16 GB and 256 GB. See issue #120 (104 GB reindex on a 128 GB host with a
+/// hardcoded 128 GB plist override).
+const MEMORY_LIMIT_FRACTION_NUM: u64 = 25;
+const MEMORY_LIMIT_FRACTION_DEN: u64 = 100;
+
+/// Absolute minimum `memory_limit_mb` (1 GB). On hosts smaller than 4 GB the
+/// 25% rule would otherwise drop below where the indexer can meaningfully run.
+const MEMORY_LIMIT_FLOOR_MB: u64 = 1_024;
+
+/// Absolute maximum `memory_limit_mb` (64 GB). Even on 256 GB workstations we
+/// cap the soft limit here — beyond this point the bottleneck is no longer
+/// RAM but ORT transient-arena behaviour and HNSW serialization, and very
+/// large limits encourage configurations that are hard to reason about.
+const MEMORY_LIMIT_CEIL_MB: u64 = 65_536;
+
+/// Ratio of `max_chunks` to `memory_limit_mb` (chunks per MB of soft limit).
+/// Derived from the historical Medium tier (200 000 chunks / 4 096 MB ≈ 49)
+/// — see the prior tier table. Why preserve it: this ratio reflects empirical
+/// HNSW + redb overhead per chunk in steady state.
+const CHUNKS_PER_MB: u64 = 50;
+
+/// Floor / ceiling for the computed `max_chunks`. Match the prior tier table
+/// endpoints (Tiny → 50 000, XLarge → 800 000) so behavior on previously
+/// supported hosts is unchanged.
+const MAX_CHUNKS_FLOOR: usize = 50_000;
+const MAX_CHUNKS_CEIL: usize = 800_000;
+
+/// Compute `memory_limit_mb` proportional to detected system RAM.
+///
+/// Why: prior to issue #120 the XLarge tier capped the soft limit at 16 GB
+/// regardless of host size, so a 128 GB box was indistinguishable from a
+/// 64 GB box — and a launchd plist override pushed it to 128 GB, allowing a
+/// reindex to consume 104 GB and OOM-kill the tmux server. The fix is to
+/// scale the limit with available RAM: 25% of host RAM, clamped to
+/// [`MEMORY_LIMIT_FLOOR_MB`, `MEMORY_LIMIT_CEIL_MB`].
+/// What: `clamp(total_ram_mb * 0.25, 1024, 65536)`. Examples: 16 GB → 4 GB,
+/// 32 GB → 8 GB, 64 GB → 16 GB, 128 GB → 32 GB, 256 GB → 64 GB (ceiling).
+/// Test: `test_compute_memory_limit_from_ram` covers the table and clamps.
+fn compute_memory_limit_mb(total_ram_mb: u64) -> usize {
+    let raw = total_ram_mb * MEMORY_LIMIT_FRACTION_NUM / MEMORY_LIMIT_FRACTION_DEN;
+    raw.clamp(MEMORY_LIMIT_FLOOR_MB, MEMORY_LIMIT_CEIL_MB) as usize
+}
+
+/// Compute `max_chunks` proportional to `memory_limit_mb`.
+///
+/// Why: chunk capacity should scale with the working-set budget, not with
+/// fixed tier buckets. At ~50 chunks/MB (the historical Medium-tier ratio)
+/// every MB of soft limit corresponds to one chunk of HNSW + redb overhead
+/// in steady state.
+/// What: `clamp(memory_limit_mb * 50, 50_000, 800_000)`.
+/// Test: `test_compute_max_chunks_from_limit` covers the tier table.
+fn compute_max_chunks(memory_limit_mb: usize) -> usize {
+    let raw = (memory_limit_mb as u64) * CHUNKS_PER_MB;
+    (raw as usize).clamp(MAX_CHUNKS_FLOOR, MAX_CHUNKS_CEIL)
+}
+
 /// Floor for the computed batch size. Below this throughput collapses but the
 /// process is still functional. Lowered from 32 → 8 to give the formula room
 /// to recommend safer values on memory-constrained hosts.
@@ -153,21 +214,26 @@ impl MemoryTier {
         }
     }
 
-    /// Default caps for this tier.
+    /// Default caps for this tier given a precomputed proportional
+    /// `memory_limit_mb` (see [`compute_memory_limit_mb`]).
     ///
     /// `max_batch_size` is derived from `memory_limit_mb` via
-    /// [`compute_max_batch_size`] so the ORT transient arena (≈55 MB per
+    /// [`compute_max_batch_size`] so the ORT transient arena (≈200 MB per
     /// batch slot) cannot exceed 75% of the configured soft cap. See issue #95.
-    fn defaults(self) -> TierDefaults {
-        let (memory_limit_mb, max_chunks, embedding_cache, bm25_corpus_cap, max_kg_nodes) =
-            match self {
-                MemoryTier::Medium => (4_096, 200_000, 5_000, 100_000, 150_000),
-                MemoryTier::Large => (8_192, 400_000, 10_000, 200_000, 300_000),
-                MemoryTier::XLarge => (16_384, 800_000, 20_000, 400_000, 500_000),
-            };
+    /// `max_chunks` is derived from `memory_limit_mb` via [`compute_max_chunks`]
+    /// so capacity scales with the working-set budget rather than fixed tier
+    /// buckets (issue #120). The remaining fields (`embedding_cache`,
+    /// `bm25_corpus_cap`, `max_kg_nodes`) keep their tier-based defaults since
+    /// they're driven more by index size than absolute RAM.
+    fn defaults(self, memory_limit_mb: usize) -> TierDefaults {
+        let (embedding_cache, bm25_corpus_cap, max_kg_nodes) = match self {
+            MemoryTier::Medium => (5_000, 100_000, 150_000),
+            MemoryTier::Large => (10_000, 200_000, 300_000),
+            MemoryTier::XLarge => (20_000, 400_000, 500_000),
+        };
         TierDefaults {
             memory_limit_mb,
-            max_chunks,
+            max_chunks: compute_max_chunks(memory_limit_mb),
             embedding_cache,
             max_batch_size: compute_max_batch_size(memory_limit_mb),
             bm25_corpus_cap,
@@ -227,7 +293,12 @@ impl MemoryPolicy {
     /// tests and for callers that have already measured RAM.
     pub fn from_total_ram_mb(total_ram_mb: u64) -> Self {
         let tier = MemoryTier::from_total_ram_mb(total_ram_mb);
-        let d = tier.defaults();
+        // Compute the proportional memory limit (25% of system RAM, clamped)
+        // BEFORE selecting tier-keyed defaults so max_chunks / max_batch_size
+        // scale with the actual host RAM rather than a fixed tier bucket.
+        // See issue #120 (104 GB reindex on a 128 GB host).
+        let proportional_limit_mb = compute_memory_limit_mb(total_ram_mb);
+        let d = tier.defaults(proportional_limit_mb);
 
         // Resolve memory limit first so the derived max_batch_size default
         // tracks any TRUSTY_MEMORY_LIMIT_MB override. TRUSTY_MAX_BATCH_SIZE
@@ -237,6 +308,14 @@ impl MemoryPolicy {
             d.max_batch_size
         } else {
             compute_max_batch_size(memory_limit_mb)
+        };
+        // Recompute max_chunks if the operator overrode the memory limit so
+        // chunk capacity tracks the actual configured limit (env var for
+        // max_chunks still wins below via env_override_usize).
+        let derived_max_chunks = if memory_limit_mb == d.memory_limit_mb {
+            d.max_chunks
+        } else {
+            compute_max_chunks(memory_limit_mb)
         };
 
         // Apply tier-based hard cap on max_batch_size (issue #89). The cap
@@ -286,7 +365,7 @@ impl MemoryPolicy {
             total_ram_mb,
             tier,
             memory_limit_mb,
-            max_chunks: env_override_usize("TRUSTY_MAX_CHUNKS", d.max_chunks),
+            max_chunks: env_override_usize("TRUSTY_MAX_CHUNKS", derived_max_chunks),
             embedding_cache: env_override_usize("TRUSTY_EMBEDDING_CACHE", d.embedding_cache),
             max_batch_size,
             bm25_corpus_cap: env_override_usize("TRUSTY_BM25_CORPUS_CAP", d.bm25_corpus_cap),
@@ -325,7 +404,15 @@ impl MemoryPolicy {
     /// `tracing::info!` at daemon startup.
     pub fn log_summary(&self) {
         let gb = self.total_ram_mb / 1024;
-        tracing::info!("trusty-search: detected {} GB RAM → tier={}", gb, self.tier);
+        let proportional = compute_memory_limit_mb(self.total_ram_mb);
+        tracing::info!(
+            "trusty-search: detected {} GB RAM → tier={} (proportional memory_limit_mb={}, 25% of RAM clamped to [{}, {}])",
+            gb,
+            self.tier,
+            proportional,
+            MEMORY_LIMIT_FLOOR_MB,
+            MEMORY_LIMIT_CEIL_MB,
+        );
         tracing::info!(
             "  MEMORY_LIMIT_MB={}  MAX_CHUNKS={}  EMBEDDING_CACHE={}  \
              MAX_BATCH_SIZE={}  BM25_CORPUS_CAP={}  MAX_KG_NODES={}",
@@ -450,26 +537,127 @@ mod tests {
 
     #[test]
     fn test_tier_defaults_table() {
-        // Spot-check the documented Memory Tier Table from the design doc.
-        // Batch sizes updated for the 200 MB/slot estimate (was 55).
-        let medium = MemoryTier::Medium.defaults();
+        // Spot-check the documented Memory Tier Table. As of issue #120 the
+        // tier's defaults are parameterised by a proportional memory_limit_mb
+        // (25% of host RAM, clamped). We feed each tier its representative
+        // host size and assert the derived caps match the table.
+
+        // 16 GB host → Medium → proportional limit = 4 GB.
+        let medium = MemoryTier::Medium.defaults(compute_memory_limit_mb(16 * 1024));
         assert_eq!(medium.memory_limit_mb, 4_096);
-        assert_eq!(medium.max_chunks, 200_000);
+        // max_chunks = clamp(4096 * 50, 50_000, 800_000) = 204_800
+        assert_eq!(medium.max_chunks, 204_800);
         // max_batch_size = floor(4096 * 0.75 / 200) = floor(15.36) = 15
         assert_eq!(medium.max_batch_size, 15);
+        assert_eq!(medium.embedding_cache, 5_000);
 
-        let large = MemoryTier::Large.defaults();
+        // 32 GB host → Large → proportional limit = 8 GB.
+        let large = MemoryTier::Large.defaults(compute_memory_limit_mb(32 * 1024));
         assert_eq!(large.memory_limit_mb, 8_192);
+        // max_chunks = clamp(8192 * 50, 50_000, 800_000) = 409_600
+        assert_eq!(large.max_chunks, 409_600);
         // max_batch_size = floor(8192 * 0.75 / 200) = floor(30.72) = 30
         assert_eq!(large.max_batch_size, 30);
 
-        let xl = MemoryTier::XLarge.defaults();
+        // 64 GB host → XLarge → proportional limit = 16 GB.
+        let xl = MemoryTier::XLarge.defaults(compute_memory_limit_mb(64 * 1024));
         assert_eq!(xl.memory_limit_mb, 16_384);
+        // max_chunks = clamp(16384 * 50, 50_000, 800_000) = 800_000 (ceiling)
         assert_eq!(xl.max_chunks, 800_000);
         assert_eq!(xl.embedding_cache, 20_000);
         assert_eq!(xl.max_kg_nodes, 500_000);
         // max_batch_size = floor(16384 * 0.75 / 200) = floor(61.44) = 61
         assert_eq!(xl.max_batch_size, 61);
+
+        // 128 GB host → XLarge → proportional limit = 32 GB (previously
+        // capped at 16 GB regardless of host size — issue #120).
+        let huge = MemoryTier::XLarge.defaults(compute_memory_limit_mb(128 * 1024));
+        assert_eq!(huge.memory_limit_mb, 32 * 1024);
+
+        // 256 GB host → XLarge → proportional limit = 64 GB (ceiling).
+        let max_host = MemoryTier::XLarge.defaults(compute_memory_limit_mb(256 * 1024));
+        assert_eq!(max_host.memory_limit_mb, MEMORY_LIMIT_CEIL_MB as usize);
+    }
+
+    #[test]
+    fn test_compute_memory_limit_from_ram() {
+        // Issue #120: memory_limit_mb is 25% of system RAM, clamped to
+        // [1 GB, 64 GB]. Examples for the tier table:
+        assert_eq!(compute_memory_limit_mb(16 * 1024), 4 * 1024); // 16 GB → 4 GB
+        assert_eq!(compute_memory_limit_mb(32 * 1024), 8 * 1024); // 32 GB → 8 GB
+        assert_eq!(compute_memory_limit_mb(64 * 1024), 16 * 1024); // 64 GB → 16 GB
+        assert_eq!(compute_memory_limit_mb(128 * 1024), 32 * 1024); // 128 GB → 32 GB
+        assert_eq!(compute_memory_limit_mb(192 * 1024), 48 * 1024); // 192 GB → 48 GB
+
+        // Ceiling clamp at 64 GB.
+        assert_eq!(compute_memory_limit_mb(256 * 1024), 64 * 1024);
+        assert_eq!(compute_memory_limit_mb(1024 * 1024), 64 * 1024); // 1 TB host
+
+        // Floor clamp at 1 GB.
+        assert_eq!(compute_memory_limit_mb(0), 1_024);
+        assert_eq!(compute_memory_limit_mb(2 * 1024), 1_024); // 2 GB → floored at 1 GB
+        assert_eq!(compute_memory_limit_mb(4 * 1024), 1_024); // 4 GB → exactly 1 GB
+    }
+
+    #[test]
+    fn test_compute_max_chunks_from_limit() {
+        // max_chunks = clamp(memory_limit_mb * 50, 50_000, 800_000).
+        assert_eq!(compute_max_chunks(4_096), 204_800);
+        assert_eq!(compute_max_chunks(8_192), 409_600);
+        assert_eq!(compute_max_chunks(16_384), 800_000); // ceiling
+        assert_eq!(compute_max_chunks(32_768), 800_000); // ceiling
+        assert_eq!(compute_max_chunks(65_536), 800_000); // ceiling
+                                                         // Floor clamp: tiny limits still produce a usable chunk capacity.
+        assert_eq!(compute_max_chunks(0), MAX_CHUNKS_FLOOR);
+        assert_eq!(compute_max_chunks(500), MAX_CHUNKS_FLOOR);
+    }
+
+    #[test]
+    fn test_memory_limit_scales_proportionally_across_xlarge_hosts() {
+        // Regression test for issue #120: two XLarge hosts of different sizes
+        // must produce different memory limits (the old code returned 16 GB
+        // for both 64 GB and 128 GB boxes).
+        //
+        // Hold ENV_LOCK because `from_total_ram_mb` writes the resolved values
+        // back into the process env via `apply_to_env`. Without the lock,
+        // other tests in this module can stomp on TRUSTY_MEMORY_LIMIT_MB
+        // between the two calls below.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Save & clear TRUSTY_MEMORY_LIMIT_MB so an earlier test's
+        // `apply_to_env` write doesn't override the proportional defaults.
+        let prior = std::env::var("TRUSTY_MEMORY_LIMIT_MB").ok();
+        // SAFETY: tests run single-threaded within this module's env block.
+        unsafe {
+            std::env::remove_var("TRUSTY_MEMORY_LIMIT_MB");
+        }
+        let p64 = MemoryPolicy::from_total_ram_mb(64 * 1024);
+        // The 64 GB call wrote TRUSTY_MEMORY_LIMIT_MB=16384 back into the env;
+        // clear it again so the 128 GB call sees a clean slate.
+        // SAFETY: same as above.
+        unsafe {
+            std::env::remove_var("TRUSTY_MEMORY_LIMIT_MB");
+        }
+        let p128 = MemoryPolicy::from_total_ram_mb(128 * 1024);
+        // Restore prior value.
+        // SAFETY: same as above.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRUSTY_MEMORY_LIMIT_MB", v),
+                None => std::env::remove_var("TRUSTY_MEMORY_LIMIT_MB"),
+            }
+        }
+        assert_eq!(p64.tier, MemoryTier::XLarge);
+        assert_eq!(p128.tier, MemoryTier::XLarge);
+        assert!(
+            p128.memory_limit_mb > p64.memory_limit_mb,
+            "128 GB host ({} MB) should have a larger memory_limit_mb than \
+             a 64 GB host ({} MB) — see issue #120",
+            p128.memory_limit_mb,
+            p64.memory_limit_mb,
+        );
+        // Specifically: 128 GB → 32 GB limit; 64 GB → 16 GB limit.
+        assert_eq!(p64.memory_limit_mb, 16 * 1024);
+        assert_eq!(p128.memory_limit_mb, 32 * 1024);
     }
 
     #[test]
@@ -578,10 +766,14 @@ mod tests {
         // Save & override.
         let prior = std::env::var("TRUSTY_MAX_BATCH_SIZE").ok();
         let prior_explicit = std::env::var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT").ok();
+        let prior_mem = std::env::var("TRUSTY_MEMORY_LIMIT_MB").ok();
         // SAFETY: tests run single-threaded within this module's env block.
         unsafe {
             std::env::set_var("TRUSTY_MAX_BATCH_SIZE", "512");
             std::env::set_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT", "1");
+            // Clear leftover memory-limit env from sibling tests so the
+            // proportional default for 16 GB host applies cleanly.
+            std::env::remove_var("TRUSTY_MEMORY_LIMIT_MB");
         }
 
         // 16 GB → Medium tier, hard cap = 16. With EXPLICIT=1 the operator's
@@ -603,6 +795,10 @@ mod tests {
             match prior_explicit {
                 Some(v) => std::env::set_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT", v),
                 None => std::env::remove_var("TRUSTY_MAX_BATCH_SIZE_EXPLICIT"),
+            }
+            match prior_mem {
+                Some(v) => std::env::set_var("TRUSTY_MEMORY_LIMIT_MB", v),
+                None => std::env::remove_var("TRUSTY_MEMORY_LIMIT_MB"),
             }
         }
     }
