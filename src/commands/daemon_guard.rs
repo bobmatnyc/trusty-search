@@ -65,23 +65,37 @@ async fn probe_health(base: &str) -> bool {
     }
 }
 
-/// Spawn `trusty-search start` as a detached background process.
+/// Spawn `trusty-search start --foreground` as a detached background process.
 ///
 /// Why: we want the daemon to outlive this CLI invocation. We use the
 /// currently-running executable so a `cargo run` debugging session boots its
 /// own debug daemon and a production install boots the production binary.
-fn spawn_daemon() -> Result<()> {
+///
+/// We pass `--foreground` to the spawned child so it runs `run_daemon` inline
+/// rather than recursively self-spawning again (which would fork-bomb on every
+/// `trusty-search start` invocation). The child process is fully detached from
+/// the parent terminal via `Stdio::null()` for all three fds — this is what
+/// prevents SIGHUP from a closing tmux pane / terminal from killing the
+/// daemon.
+pub(crate) fn spawn_daemon() -> Result<u32> {
     let exe = std::env::current_exe().map_err(|e| anyhow!("could not resolve current_exe: {e}"))?;
     // Detach stdio — we don't want the daemon's logs streaming into the
-    // user's terminal session while they're waiting on a `query` result.
-    std::process::Command::new(&exe)
+    // user's terminal session while they're waiting on a `query` result,
+    // and we need the daemon to survive the parent shell closing.
+    let child = std::process::Command::new(&exe)
         .arg("start")
+        .arg("--foreground")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| anyhow!("could not spawn `{} start`: {e}", exe.display()))?;
-    Ok(())
+        .map_err(|e| {
+            anyhow!(
+                "could not spawn `{} start --foreground`: {e}",
+                exe.display()
+            )
+        })?;
+    Ok(child.id())
 }
 
 /// Ensure the daemon at `base` is running and ready. Spawns `trusty-search

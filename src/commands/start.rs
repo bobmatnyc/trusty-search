@@ -184,6 +184,51 @@ fn tune_batch_size_for_provider(provider: trusty_embedder::ExecutionProvider) {
 /// Test: run twice in a row — the second invocation must exit 1 with the
 /// "another daemon is already running" message.
 pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<()> {
+    // Background self-spawn path: when invoked without `--foreground`, fork a
+    // detached copy of ourselves with `--foreground` and return immediately.
+    //
+    // Why: prior to this, `run_daemon().await` blocked the current process
+    // forever and held the controlling terminal. Running `trusty-search start`
+    // from inside a tmux pane (e.g. via `make patch`) meant a SIGHUP on pane
+    // close would kill the daemon and tear down the whole tmux session. By
+    // detaching stdio to `/dev/null` and returning, we let the caller (shell,
+    // make, tmux) continue without owning the daemon's lifetime.
+    //
+    // launchd/systemd/Docker users (and `trusty-search service`) always pass
+    // `--foreground` and stay on the inline path so the supervisor can manage
+    // the process lifecycle.
+    if !foreground {
+        // Validate `--device` here too so a typo doesn't silently spawn a
+        // child that will then immediately exit non-zero.
+        match device {
+            "auto" | "cpu" | "gpu" => {}
+            other => {
+                anyhow::bail!("invalid --device value '{other}'; expected one of: auto, cpu, gpu")
+            }
+        }
+        let exe = std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("could not resolve current_exe: {e}"))?;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("start")
+            .arg("--foreground")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--device")
+            .arg(device)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("could not spawn detached daemon: {e}"))?;
+        let pid = child.id();
+        eprintln!(
+            "{} Daemon starting in background (pid {pid}). Run `trusty-search status` to verify readiness.",
+            "✓".green()
+        );
+        return Ok(());
+    }
+
     // Translate the `--device` CLI flag into the `TRUSTY_DEVICE` env var that
     // `trusty-embedder` reads at session-init time. An explicit shell-level
     // `TRUSTY_DEVICE` always wins so launchd/systemd unit files can set the
@@ -244,11 +289,9 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<(
     }
 
     policy.log_summary();
-    // `foreground` is currently a no-op: `run_daemon` already runs inline
-    // and never forks. The flag is accepted so launchd/systemd plists can
-    // declare the supervised contract explicitly in ProgramArguments
-    // (see ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist).
-    // If a background-fork path is ever added, gate it on `!foreground`.
+    // We arrive here only when `foreground == true` (the background path
+    // returned earlier via self-spawn). The flag is consumed by the spawn
+    // branch above, so it is unused from this point onward.
     let _ = foreground;
     // Fast-path: bail before loading the 86 MB embedding model when
     // another daemon is already running.  The lock check is ~1 ms;

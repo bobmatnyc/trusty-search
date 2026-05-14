@@ -255,10 +255,12 @@ enum Commands {
     // ── Service commands ──────────────────────────────────────────────────
     /// Start the HTTP daemon
     ///
-    /// By default, runs the daemon inline in the current process (blocks until
-    /// SIGTERM/SIGINT). The `--foreground` flag is accepted for clarity when the
-    /// process is supervised by launchd, systemd, or Docker — these supervisors
-    /// require the managed binary to remain in the foreground rather than forking.
+    /// By default, self-spawns a detached background copy of itself (with
+    /// `--foreground`) and returns immediately, so the daemon survives the
+    /// caller's terminal closing (e.g. tmux pane SIGHUP, `make patch`).
+    /// Use `--foreground` when the process is supervised by launchd, systemd,
+    /// or Docker — those supervisors require the managed binary to stay in
+    /// the foreground rather than forking.
     ///
     /// Examples:
     ///   trusty-search start
@@ -272,10 +274,11 @@ enum Commands {
 
         /// Run in the foreground instead of forking a background daemon.
         ///
-        /// Use this when the process is managed by launchd, systemd, or Docker.
-        /// Note: the daemon already runs inline by default (no fork is performed),
-        /// so this flag is currently a no-op accepted for forward-compatibility
-        /// and to make the launchd/systemd contract explicit in ProgramArguments.
+        /// Default (`trusty-search start`): self-spawns a detached child with
+        /// `--foreground` and returns immediately, so the daemon survives the
+        /// caller's terminal closing (e.g. tmux pane SIGHUP). Use this flag
+        /// when the process is managed by launchd, systemd, or Docker — those
+        /// supervisors require the managed binary to stay in the foreground.
         #[arg(long, default_value_t = false)]
         foreground: bool,
 

@@ -57,6 +57,10 @@ install:
 ## workflow (.github/workflows/publish.yml matches on `v*` tags).
 ## Version is read in the SAME shell as the bump (shell var, not Make eval)
 ## to avoid Make's parse-time expansion of $(eval $(shell ...)).
+## `trusty-search start` (no --foreground) self-spawns a detached daemon and
+## returns immediately, so this target does not hijack the caller's terminal
+## (important when invoked from inside a tmux pane — prior to the self-spawn
+## fix, a SIGHUP on pane close would kill the daemon and the tmux session).
 patch:
 	cargo set-version --bump patch
 	@VERSION=$$(cargo metadata --no-deps --format-version 1 \
@@ -73,6 +77,8 @@ patch:
 ## Stop daemon, install new binary from source, restart (closes #87)
 ## Why: replacing the binary while the daemon is running causes macOS to
 ## SIGKILL the process; stopping first ensures a clean handoff.
+## `trusty-search start` self-spawns a detached daemon and returns
+## immediately, so this target does not block the caller.
 reinstall:
 	trusty-search stop 2>/dev/null || true
 	sleep 2
