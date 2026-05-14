@@ -14,7 +14,7 @@ UI_DIR      := ui
 UI_DIST     := $(UI_DIR)/dist
 UI_EMBED    := ui-dist
 
-.PHONY: ui build-ui sync-ui release-prep install patch reinstall check clippy test smoke
+.PHONY: ui build-ui sync-ui release-prep install patch reinstall deploy check clippy test smoke
 
 ## Build Svelte UI (pnpm preferred, npm fallback)
 build-ui:
@@ -70,9 +70,18 @@ patch:
 	git tag "v$$VERSION" && \
 	git push origin main && \
 	git push origin "v$$VERSION" && \
-	(trusty-search stop 2>/dev/null || true) && \
-	cargo install --path . --locked && \
-	trusty-search start
+	echo ">> pushed v$$VERSION — CI will publish to crates.io automatically" && \
+	echo ">> run 'make deploy' once CI finishes to install the new binary locally"
+
+## Install the locally-built binary with reduced parallelism to avoid OOM.
+## Why: `cargo install --path . --locked` with default parallelism consumes
+## 10–20 GB RAM during compilation and has triggered the OOM killer against
+## tmux sessions on this machine. CARGO_BUILD_JOBS=2 caps compile threads.
+## Use this target instead of bare `cargo install` for local dev installs.
+deploy:
+	(trusty-search stop 2>/dev/null || true)
+	CARGO_BUILD_JOBS=2 cargo install --path . --locked
+	launchctl load ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null || trusty-search start
 
 ## Stop daemon, install new binary from source, restart (closes #87)
 ## Why: replacing the binary while the daemon is running causes macOS to
@@ -82,7 +91,7 @@ patch:
 reinstall:
 	trusty-search stop 2>/dev/null || true
 	sleep 2
-	cargo install --path . --locked
+	CARGO_BUILD_JOBS=2 cargo install --path . --locked
 	trusty-search start
 
 ## Quick local quality gate
