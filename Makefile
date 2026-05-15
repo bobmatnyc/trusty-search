@@ -77,20 +77,25 @@ patch:
 	echo ">> run 'make deploy' once CI finishes to install the new binary locally"
 
 ## Install the locally-built binary with reduced parallelism to avoid OOM.
-## Stops ALL running trusty-search instances (launchd + manual) before
+## Stops running trusty-search instances (launchd + manual) before
 ## compiling so the compiler doesn't compete with the daemon for RAM.
 ##
-## Why kill ALL processes: `launchctl unload` only stops launchd-managed
-## daemons. A daemon started manually (e.g. in a tmux session via
-## `trusty-search start`) keeps running, and the combined RSS of the daemon
-## + Rust compiler easily triggers the OOM killer, which terminates tmux.
-## `pkill -f "trusty-search start"` catches those manual instances.
+## Stop strategy (surgical — cannot affect tmux or claude-mpm):
+##   1. `trusty-search stop` — reads the PID lockfile and SIGTERMs exactly
+##      the process that wrote it; never matches by command-line string.
+##   2. `pkill -TERM -x trusty-search` — matches the process NAME exactly
+##      (not a substring of the full command line), so it only hits processes
+##      whose argv[0] is literally "trusty-search". The `-x` flag is POSIX
+##      "exact name match"; it cannot match tmux, claude, or any script that
+##      merely contains the string "trusty-search" somewhere in its arguments.
+##
 ## Both known plist paths are tried on unload and load because the launchd
 ## label has varied across installs (com.bobmatnyc vs com.trusty).
 deploy:
 	-launchctl unload ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null
 	-launchctl unload ~/Library/LaunchAgents/com.trusty.trusty-search.plist 2>/dev/null
-	-pkill -f "trusty-search start" 2>/dev/null
+	-trusty-search stop 2>/dev/null
+	-pkill -TERM -x trusty-search 2>/dev/null
 	sleep 2
 	CARGO_BUILD_JOBS=2 cargo install --path . --locked
 	launchctl load ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null || \
