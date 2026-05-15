@@ -324,6 +324,8 @@ enum Commands {
     ///   trusty-search serve --with-http           # MCP stdio + HTTP on :0
     ///   trusty-search serve --with-http --port 7878  # MCP stdio + HTTP on :7878
     ///   trusty-search serve --http 0.0.0.0:8080   # legacy: explicit bind addr
+    ///
+    /// `--no-http` is accepted but ignored — HTTP is already off by default.
     #[command(display_order = 22)]
     Serve {
         /// Enable the HTTP/SSE listener in addition to MCP stdio.
@@ -334,6 +336,12 @@ enum Commands {
         /// HTTP transport (e.g. for the browser admin panel).
         #[arg(long, default_value_t = false)]
         with_http: bool,
+
+        /// Deprecated no-op: HTTP is now OFF by default (issue #123), so
+        /// `--no-http` does nothing. Kept as a hidden, accepted flag so
+        /// existing `.mcp.json` configs that still pass it don't break.
+        #[arg(long, hide = true, default_value_t = false)]
+        no_http: bool,
 
         /// Port for the HTTP/SSE MCP transport (default: 0 = OS picks).
         ///
@@ -555,6 +563,7 @@ async fn run() -> Result<()> {
 
         Commands::Serve {
             with_http,
+            no_http: _, // deprecated no-op (issue #123): HTTP is opt-in now
             port,
             http,
         } => {
