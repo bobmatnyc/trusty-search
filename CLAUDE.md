@@ -470,16 +470,20 @@ values; precedence is **shell env > `daemon.env` > tier default**.
 
 ### Auto-tuned defaults (per tier)
 
+> **Note:** `MEMORY_LIMIT_MB` is now computed dynamically as
+> `clamp(system_RAM × 25%, 1 GiB, 64 GiB)`. The table shows representative
+> values per tier. Set `TRUSTY_MEMORY_LIMIT_MB` to override.
+
 `MemoryPolicy::detect()` reads `hw.memsize` (macOS) or `/proc/meminfo`
 (Linux) at daemon startup and selects one of five tiers:
 
 | Tier | Total RAM | `MEMORY_LIMIT_MB` | `MAX_CHUNKS` | `EMBEDDING_CACHE` | `MAX_BATCH_SIZE` | `BM25_CORPUS_CAP` | `MAX_KG_NODES` |
 |------|-----------|-------------------|--------------|-------------------|------------------|-------------------|----------------|
-| Tiny | < 8 GB | 1 024 | 50 000 | 500 | 64 | 20 000 | 30 000 |
-| Small | 8–15 GB | 2 048 | 100 000 | 1 000 | 128 | 50 000 | 75 000 |
-| Medium | 16–31 GB | 4 096 | 200 000 | 5 000 | 256 | 100 000 | 150 000 |
-| Large | 32–63 GB | 8 192 | 400 000 | 10 000 | 512 | 200 000 | 300 000 |
-| XLarge | ≥ 64 GB | 16 384 | 800 000 | 20 000 | 512 | 400 000 | 500 000 |
+| Tiny | < 8 GB | ~2 048 (25% of RAM, min 1 024) | 50 000 | 500 | 64 | 20 000 | 30 000 |
+| Small | 8–15 GB | ~2 048–3 840 (25% of RAM) | 100 000 | 1 000 | 128 | 50 000 | 75 000 |
+| Medium | 16–31 GB | ~4 096–8 192 (25% of RAM) | 200 000 | 5 000 | 256 | 100 000 | 150 000 |
+| Large | 32–63 GB | ~8 192–16 384 (25% of RAM) | 400 000 | 10 000 | 512 | 200 000 | 300 000 |
+| XLarge | ≥ 64 GB | 65 536 (capped at 64 GiB) | 800 000 | 20 000 | 512 | 400 000 | 500 000 |
 
 The resolved policy is logged at daemon startup so operators can confirm
 which tier was selected. If RAM detection fails on an unsupported OS, the
