@@ -77,25 +77,25 @@ patch:
 	echo ">> run 'make deploy' once CI finishes to install the new binary locally"
 
 ## Install the locally-built binary with reduced parallelism to avoid OOM.
-## Why: `cargo install --path . --locked` with default parallelism consumes
-## 10–20 GB RAM during compilation and has triggered the OOM killer against
-## tmux sessions on this machine. CARGO_BUILD_JOBS=2 caps compile threads.
-## Use this target instead of bare `cargo install` for local dev installs.
+## Stops ALL running trusty-search instances (launchd + manual) before
+## compiling so the compiler doesn't compete with the daemon for RAM.
 ##
-## Why launchctl unload (not `trusty-search stop`): the daemon is managed by
-## launchd with KeepAlive=true, which respawns the process within ~30s of a
-## SIGTERM. That meant `cargo install` ran while the daemon was already back
-## up (and possibly mid-reindex), and the trailing `launchctl load` then
-## no-op'd because the plist was still loaded — occasionally falling through
-## to `trusty-search start` and double-starting the daemon. `launchctl
-## unload` cleanly deregisters the job so KeepAlive can't fight us, and the
-## paired `launchctl load` at the end is the single source of truth for
-## restart.
+## Why kill ALL processes: `launchctl unload` only stops launchd-managed
+## daemons. A daemon started manually (e.g. in a tmux session via
+## `trusty-search start`) keeps running, and the combined RSS of the daemon
+## + Rust compiler easily triggers the OOM killer, which terminates tmux.
+## `pkill -f "trusty-search start"` catches those manual instances.
+## Both known plist paths are tried on unload and load because the launchd
+## label has varied across installs (com.bobmatnyc vs com.trusty).
 deploy:
 	-launchctl unload ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null
+	-launchctl unload ~/Library/LaunchAgents/com.trusty.trusty-search.plist 2>/dev/null
+	-pkill -f "trusty-search start" 2>/dev/null
 	sleep 2
 	CARGO_BUILD_JOBS=2 cargo install --path . --locked
-	launchctl load ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist
+	launchctl load ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null || \
+	  launchctl load ~/Library/LaunchAgents/com.trusty.trusty-search.plist 2>/dev/null || \
+	  trusty-search start
 
 ## Stop daemon, install new binary from source, restart (closes #87)
 ## Why: replacing the binary while the daemon is running causes macOS to
