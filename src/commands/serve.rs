@@ -7,26 +7,28 @@ use colored::Colorize;
 /// Why: extracted from `main()`. The HTTP path involves a discovery file
 /// (`~/.trusty-search/mcp_http_addr`) and cleanup-on-exit logic that's easier
 /// to follow in isolation.
-/// What: routes between three modes: explicit `--http <addr>`, port-based
-/// HTTP, or stdio-only via `--no-http`.
-/// Test: `cargo run -- serve --no-http` runs MCP over stdio; with HTTP, the
-/// discovery file appears at `~/.trusty-search/mcp_http_addr` then is removed
-/// on shutdown. Note: the MCP SSE listener writes its address to
-/// `mcp_http_addr` (distinct from the daemon's `http_addr`) so a crashed
-/// `serve` cannot clobber the daemon's discovery file (issue #117).
-pub async fn handle_serve(no_http: bool, port: u16, http: Option<String>) -> Result<()> {
+/// What: routes between stdio-only (the default — issue #123) and HTTP modes;
+/// HTTP is opt-in via `--with-http` (or the legacy explicit `--http <addr>`).
+/// Test: `cargo run -- serve` runs MCP over stdio only; `serve --with-http`
+/// additionally binds HTTP and the discovery file appears at
+/// `~/.trusty-search/mcp_http_addr` then is removed on shutdown. Note: the
+/// MCP SSE listener writes its address to `mcp_http_addr` (distinct from the
+/// daemon's `http_addr`) so a crashed `serve` cannot clobber the daemon's
+/// discovery file (issue #117).
+pub async fn handle_serve(with_http: bool, port: u16, http: Option<String>) -> Result<()> {
     let daemon_url = daemon_base_url();
 
-    // Resolve the HTTP bind address. Precedence:
-    //   1. `--no-http`              → disabled
-    //   2. legacy `--http <addr>`   → explicit bind
-    //   3. `--port <p>`             → 127.0.0.1:p (p=0 → OS picks)
-    let bind_addr: Option<String> = if no_http {
-        None
-    } else if let Some(addr) = http {
+    // Resolve the HTTP bind address. HTTP is OFF by default (issue #123) —
+    // Claude Code MCP hooks only need stdio. Precedence:
+    //   1. legacy `--http <addr>`   → explicit bind (implies HTTP on)
+    //   2. `--with-http`            → 127.0.0.1:port (port 0 → OS picks)
+    //   3. neither                  → stdio only
+    let bind_addr: Option<String> = if let Some(addr) = http {
         Some(addr)
-    } else {
+    } else if with_http {
         Some(format!("127.0.0.1:{port}"))
+    } else {
+        None
     };
 
     let server = crate::mcp::McpServer::new(daemon_url.clone());

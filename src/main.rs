@@ -308,34 +308,36 @@ enum Commands {
     #[command(display_order = 21)]
     Stop,
 
-    /// Start MCP server (HTTP by default; add --no-http for stdio-only)
+    /// Start MCP server (stdio by default; add --with-http for an HTTP listener)
     ///
-    /// HTTP/SSE binds to 127.0.0.1:<port> (port 0 = OS-chosen free port) and
-    /// the bound address is written to `~/.trusty-search/http_addr` so
-    /// `trusty-search dashboard` and other clients can discover it. Stdio
-    /// MCP is always served on the process's stdin/stdout for Claude Code.
+    /// Stdio MCP is always served on the process's stdin/stdout for Claude
+    /// Code, which pipes JSON-RPC directly and needs nothing more — so the
+    /// HTTP listener is OFF by default (issue #123).
     ///
-    /// Use `--no-http` to skip the HTTP listener (Claude Code MCP hook path
-    /// — Claude Code pipes JSON-RPC directly and doesn't need a panel).
+    /// Pass `--with-http` to additionally bind an HTTP/SSE transport on
+    /// 127.0.0.1:<port> (port 0 = OS-chosen free port). The bound address is
+    /// written to `~/.trusty-search/mcp_http_addr` so admin clients can
+    /// discover it.
     ///
     /// Examples:
-    ///   trusty-search serve                       # MCP stdio + HTTP on :0
-    ///   trusty-search serve --port 7878           # MCP stdio + HTTP on :7878
-    ///   trusty-search serve --no-http             # MCP stdio only (Claude hook)
+    ///   trusty-search serve                       # MCP stdio only (Claude hook)
+    ///   trusty-search serve --with-http           # MCP stdio + HTTP on :0
+    ///   trusty-search serve --with-http --port 7878  # MCP stdio + HTTP on :7878
     ///   trusty-search serve --http 0.0.0.0:8080   # legacy: explicit bind addr
     #[command(display_order = 22)]
     Serve {
-        /// Disable the HTTP listener (MCP stdio only).
+        /// Enable the HTTP/SSE listener in addition to MCP stdio.
         ///
-        /// Use this when wired into a Claude Code MCP hook: Claude Code pipes
-        /// JSON-RPC over stdin/stdout, so the HTTP admin panel is unnecessary
-        /// and binding it just wastes a port.
+        /// Off by default: Claude Code MCP hooks pipe JSON-RPC over
+        /// stdin/stdout and never need the HTTP admin panel, so binding it
+        /// would just waste a port. Opt in with this flag when you want the
+        /// HTTP transport (e.g. for the browser admin panel).
         #[arg(long, default_value_t = false)]
-        no_http: bool,
+        with_http: bool,
 
         /// Port for the HTTP/SSE MCP transport (default: 0 = OS picks).
         ///
-        /// Ignored when `--no-http` is set.
+        /// Only used when `--with-http` is set.
         #[arg(long, default_value_t = 0)]
         port: u16,
 
@@ -552,11 +554,11 @@ async fn run() -> Result<()> {
         }
 
         Commands::Serve {
-            no_http,
+            with_http,
             port,
             http,
         } => {
-            commands::serve::handle_serve(no_http, port, http).await?;
+            commands::serve::handle_serve(with_http, port, http).await?;
         }
 
         Commands::Service { action } => {
