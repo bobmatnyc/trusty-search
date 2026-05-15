@@ -356,10 +356,7 @@ impl SearchAppState {
     /// Snapshot the current embedder-init error, if any. `None` means the
     /// background init task is still running or completed successfully.
     pub fn current_embedder_error(&self) -> Option<String> {
-        self.embedder_error
-            .try_read()
-            .ok()
-            .and_then(|g| g.clone())
+        self.embedder_error.try_read().ok().and_then(|g| g.clone())
     }
 
     /// Snapshot the currently-installed embedder (post-init) or `None` when
@@ -963,6 +960,9 @@ async fn global_search_handler(
         top_k: req.top_k,
         expand_graph: true,
         compact: !req.full_content,
+        branch_files: None,
+        branch_boost: SearchQuery::default_branch_boost(),
+        branch: None,
     };
 
     // Run all per-index searches concurrently. Any index that errors is
@@ -1905,8 +1905,7 @@ mod tests {
         let body_bytes = to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("read body");
-        let body: serde_json::Value =
-            serde_json::from_slice(&body_bytes).expect("valid json");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid json");
         let err_str = body
             .get("error")
             .and_then(|v| v.as_str())

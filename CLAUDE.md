@@ -173,13 +173,28 @@ Hybrid search (BM25 + vector + KG expansion + RRF fusion).
     "text": "fn authenticate",
     "top_k": 10,
     "expand_graph": true,
-    "compact": true
+    "compact": true,
+    "branch_files": ["src/auth.rs", "src/middleware.rs"],
+    "branch_boost": 1.5,
+    "branch": "feature/new-auth"
   }
   ```
   - `text` (required): the query string.
   - `top_k` (optional, default `10`): max results to return.
   - `expand_graph` (optional, default `true`): perform 1–2 hop KG expansion on top hits.
   - `compact` (optional, default `true`): include `compact_snippet` (7-line) in each chunk.
+  - `branch_files` (optional): files modified on the current git branch
+    (relative to the index `root_path`). Chunks whose `file` appears here have
+    their RRF score multiplied by `branch_boost`. Leading `./` is stripped
+    before comparison. Issue #122.
+  - `branch_boost` (optional, default `1.5`, range `[1.0, 3.0]`): score
+    multiplier applied to branch-modified chunks. `1.0` disables boosting.
+    Values outside the range are clamped server-side. Issue #122.
+  - `branch` (optional): branch name hint. When `branch_files` is absent, the
+    daemon shells out to `git merge-base HEAD <branch>` followed by
+    `git diff --name-only <base>..HEAD` inside the index `root_path` to
+    derive the file list. Failure is non-fatal: a `tracing::warn!` is logged
+    and search proceeds with no boost. Issue #122.
 - **Response 200**:
   ```json
   {
@@ -193,7 +208,8 @@ Hybrid search (BM25 + vector + KG expansion + RRF fusion).
         "function_name": "authenticate",
         "score": 0.0184,
         "compact_snippet": "fn authenticate(...) {\n  ...\n}",
-        "match_reason": "hybrid+kg"
+        "match_reason": "hybrid+kg",
+        "on_branch": true
       }
     ],
     "intent": "Definition",
@@ -202,6 +218,11 @@ Hybrid search (BM25 + vector + KG expansion + RRF fusion).
   ```
   - `intent`: one of `"Definition" | "Usage" | "Conceptual" | "BugDebt" | "Unknown"`.
   - `match_reason`: one of `"hybrid" | "hybrid+kg" | "bm25" | "vector" | "fallback:ripgrep"`.
+  - `on_branch` (issue #122): `true` when the chunk's file appears in the
+    branch-modified file set resolved for this query (either explicitly via
+    `branch_files` or derived from `branch`). Always `false` when no branch
+    context was provided. Lets clients highlight branch work in the UI
+    without re-doing the lookup.
 
 ##### `POST /indexes/:id/search_similar`
 

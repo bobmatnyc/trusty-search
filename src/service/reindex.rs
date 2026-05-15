@@ -1096,6 +1096,7 @@ mod tests {
                 top_k: 5,
                 expand_graph: false,
                 compact: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1106,6 +1107,7 @@ mod tests {
                 top_k: 5,
                 expand_graph: false,
                 compact: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1163,6 +1165,7 @@ mod tests {
                 top_k: 5,
                 expand_graph: false,
                 compact: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1173,6 +1176,7 @@ mod tests {
                 top_k: 5,
                 expand_graph: false,
                 compact: false,
+                ..Default::default()
             })
             .await
             .unwrap();

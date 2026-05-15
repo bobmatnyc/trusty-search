@@ -181,6 +181,7 @@ async fn run_bench(label: &str, indexer: &CodeIndexer, queries: &[(&str, &str)])
             top_k: 10,
             expand_graph: true,
             compact: false,
+            ..Default::default()
         };
         let started = Instant::now();
         let results = indexer

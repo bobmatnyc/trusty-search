@@ -200,6 +200,19 @@ impl McpServer {
                         if let Some(k) = args.get("top_k").and_then(Value::as_u64) {
                             b["top_k"] = Value::from(k);
                         }
+                        // Issue #122 — branch-aware search: forward optional
+                        // branch context fields through to the daemon body so
+                        // MCP callers can boost on-branch matches without
+                        // building the `{query: object}` shape themselves.
+                        if let Some(bf) = args.get("branch_files") {
+                            b["branch_files"] = bf.clone();
+                        }
+                        if let Some(bb) = args.get("branch_boost") {
+                            b["branch_boost"] = bb.clone();
+                        }
+                        if let Some(br) = args.get("branch").and_then(Value::as_str) {
+                            b["branch"] = Value::String(br.to_string());
+                        }
                         b
                     }
                     _ => {
@@ -452,14 +465,27 @@ pub fn tool_descriptors() -> Value {
         },
         {
             "name": "search_code",
-            "description": "Hybrid code search (BM25+vector+KG)",
+            "description": "Hybrid code search (BM25+vector+KG). Supports branch-aware scoring via branch_files/branch_boost/branch (issue #122).",
             "inputSchema": {
                 "type": "object",
                 "required": ["index_id", "query"],
                 "properties": {
                     "index_id": { "type": "string" },
                     "query": { "type": "string" },
-                    "top_k": { "type": "integer", "default": 10 }
+                    "top_k": { "type": "integer", "default": 10 },
+                    "branch_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Files modified on current git branch (relative to index root). Boosted in results."
+                    },
+                    "branch_boost": {
+                        "type": "number",
+                        "description": "Score multiplier for branch files (default 1.5, range 1.0-3.0)."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name; daemon will compute branch_files via git if branch_files is absent."
+                    }
                 }
             }
         },

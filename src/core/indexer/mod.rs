@@ -184,6 +184,12 @@ pub struct CodeChunk {
     // search responses so older clients round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_id: Option<String>,
+
+    // Issue #122 — branch-aware search: true if this chunk's file appears in
+    // the branch-modified file set for this query. Always false when no
+    // branch context was provided.
+    #[serde(default)]
+    pub on_branch: bool,
 }
 
 /// Query parameters for hybrid search.
@@ -196,6 +202,54 @@ pub struct SearchQuery {
     pub expand_graph: bool,
     #[serde(default = "default_true")]
     pub compact: bool,
+
+    // Issue #122 — branch-aware search.
+    /// Files modified on the current git branch (relative to index `root_path`).
+    /// Chunks whose `file` appears here receive a `branch_boost` multiplier on
+    /// their RRF score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_files: Option<Vec<String>>,
+
+    /// RRF score multiplier for branch-modified chunks. Default `1.5`, range
+    /// `[1.0, 3.0]`. `1.0` disables boosting. Values outside the range are
+    /// clamped by the search pipeline.
+    #[serde(default = "SearchQuery::default_branch_boost")]
+    pub branch_boost: f32,
+
+    /// Optional branch name hint (e.g. "feature/foo"). If `branch_files` is
+    /// absent, the daemon will shell out to
+    /// `git diff --name-only $(git merge-base HEAD <branch>)..HEAD` in the
+    /// index `root_path` to compute the file list. Best-effort: failure logs
+    /// a warning and falls back to no boost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+impl SearchQuery {
+    /// Default RRF score multiplier for branch-modified chunks (issue #122).
+    /// `1.5` is a gentle nudge that surfaces branch work without smothering
+    /// stronger off-branch matches.
+    pub fn default_branch_boost() -> f32 {
+        1.5_f32
+    }
+}
+
+impl Default for SearchQuery {
+    /// Why: with the addition of branch-aware fields (issue #122), call
+    /// sites that previously built a 4-field `SearchQuery` would otherwise
+    /// all need to spell out three new None/default fields. `Default`
+    /// keeps those sites readable via `..Default::default()`.
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            top_k: default_top_k(),
+            expand_graph: true,
+            compact: true,
+            branch_files: None,
+            branch_boost: SearchQuery::default_branch_boost(),
+            branch: None,
+        }
+    }
 }
 
 fn default_top_k() -> usize {
@@ -256,6 +310,7 @@ pub(crate) fn raw_to_code_chunk(
         inherits_from: raw.inherits_from.clone(),
         chunk_depth,
         index_id: None,
+        on_branch: false,
     }
 }
 

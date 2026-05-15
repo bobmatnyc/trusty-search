@@ -10,18 +10,69 @@
 //! Test: covered by every `test_search_*`, `test_kg_*`, and intent-routing test
 //! in `indexer::tests`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
 use crate::core::classifier::{QueryClassifier, QueryIntent};
 use crate::core::entity::EdgeKind;
+use crate::core::git::{normalize_path, resolve_branch_files};
 use crate::core::search::rrf::{rrf_fuse, RRF_K};
 
 use super::{
     build_compact_snippet, compute_match_reason, file_type_score_multiplier, hash_query,
     raw_to_code_chunk, CodeChunk, CodeIndexer, SearchQuery, HNSW_OVERSAMPLE, KG_EXPAND_HOPS,
 };
+
+/// Lower bound for the branch-modified file score multiplier (issue #122).
+/// `1.0` disables boosting and is the floor.
+pub(crate) const BRANCH_BOOST_MIN: f32 = 1.0;
+/// Upper bound for the branch-modified file score multiplier (issue #122).
+/// `3.0` keeps the boost gentle enough that strong off-branch matches still
+/// outrank weak on-branch ones.
+pub(crate) const BRANCH_BOOST_MAX: f32 = 3.0;
+
+/// Resolve the effective branch-modified file set + clamped multiplier for a
+/// search query (issue #122).
+///
+/// Why: extracted from `search` so the resolution rules — explicit
+/// `branch_files` wins over `branch`, missing both → no boost, clamp the
+/// multiplier — are easy to read and to unit-test.
+/// What: returns `(Some(set), boost)` when there is a non-empty file list and
+/// the resolved boost is strictly greater than `1.0`; `(None, _)` otherwise.
+/// Test: covered by `test_branch_boost_clamped_to_3x`,
+/// `test_no_boost_when_branch_files_absent`, and the integration tests.
+pub(crate) fn resolve_branch_set(
+    query: &SearchQuery,
+    root_path: &std::path::Path,
+) -> (Option<HashSet<String>>, f32) {
+    let boost = query.branch_boost.clamp(BRANCH_BOOST_MIN, BRANCH_BOOST_MAX);
+
+    let files: Option<Vec<String>> = match &query.branch_files {
+        Some(v) if !v.is_empty() => Some(v.clone()),
+        _ => match &query.branch {
+            Some(name) => resolve_branch_files(root_path, name),
+            None => None,
+        },
+    };
+
+    let set = files.and_then(|v| {
+        let s: HashSet<String> = v.iter().map(|p| normalize_path(p).to_owned()).collect();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    });
+
+    // If the resolved multiplier is the no-op floor, drop the set so we skip
+    // the per-chunk lookup work entirely in the hot path.
+    if (boost - 1.0).abs() < f32::EPSILON {
+        (None, boost)
+    } else {
+        (set, boost)
+    }
+}
 
 impl CodeIndexer {
     /// Retrieve a cached chunk embedding by `chunk_id`.
@@ -262,11 +313,25 @@ impl CodeIndexer {
         //     when the user is looking for a symbol definition, prefer source
         //     files over docs/configs whose BM25 TF can spuriously rank them
         //     above the canonical .rs/.py/.go declaration.
-        let all = self.apply_score_adjustments(all, &intent).await;
+        // 4c) Apply a branch-modified file multiplier (issue #122): chunks
+        //     whose file is part of the current branch's diff against its
+        //     merge-base are nudged upward so feature-branch work is surfaced
+        //     ahead of equivalent off-branch matches.
+        let (branch_set, branch_boost) = resolve_branch_set(query, &self.root_path);
+        let all = self
+            .apply_score_adjustments(all, &intent, branch_set.as_ref(), branch_boost)
+            .await;
 
         // 5) Materialise the top-k IDs into `CodeChunk`s.
         let result = self
-            .materialize_search_results(all, &hnsw_results, &bm25_results, &kg_ids, query)
+            .materialize_search_results(
+                all,
+                &hnsw_results,
+                &bm25_results,
+                &kg_ids,
+                branch_set.as_ref(),
+                query,
+            )
             .await;
         Ok(result)
     }
@@ -289,20 +354,29 @@ impl CodeIndexer {
         &self,
         candidates: Vec<(String, f32)>,
         intent: &QueryIntent,
+        branch_files: Option<&HashSet<String>>,
+        branch_boost: f32,
     ) -> Vec<(String, f32)> {
         let demote_docs = matches!(intent, QueryIntent::Definition);
         let chunks = self.chunks.read().await;
         let mut adjusted: Vec<(String, f32)> = candidates
             .into_iter()
             .map(|(id, score)| {
-                let multiplier = if demote_docs {
-                    chunks
-                        .get(&id)
-                        .map(|raw| file_type_score_multiplier(&raw.file))
-                        .unwrap_or(1.0)
-                } else {
-                    1.0
-                };
+                let mut multiplier = 1.0_f32;
+                let raw = chunks.get(&id);
+                if demote_docs {
+                    if let Some(r) = raw {
+                        multiplier *= file_type_score_multiplier(&r.file);
+                    }
+                }
+                // Branch-modified file boost (issue #122). Apply after the
+                // file-type multiplier so doc-on-branch never out-ranks
+                // source-on-branch when both files are in the diff.
+                if let (Some(set), Some(r)) = (branch_files, raw) {
+                    if set.contains(normalize_path(&r.file)) {
+                        multiplier *= branch_boost;
+                    }
+                }
                 (id, score * multiplier)
             })
             .collect();
@@ -417,13 +491,12 @@ impl CodeIndexer {
         all: Vec<(String, f32)>,
         hnsw_results: &[(String, f32)],
         bm25_results: &[(String, f32)],
-        kg_ids: &std::collections::HashSet<String>,
+        kg_ids: &HashSet<String>,
+        branch_files: Option<&HashSet<String>>,
         query: &SearchQuery,
     ) -> Vec<CodeChunk> {
-        let in_hnsw: std::collections::HashSet<&String> =
-            hnsw_results.iter().map(|(id, _)| id).collect();
-        let in_bm25: std::collections::HashSet<&String> =
-            bm25_results.iter().map(|(id, _)| id).collect();
+        let in_hnsw: HashSet<&String> = hnsw_results.iter().map(|(id, _)| id).collect();
+        let in_bm25: HashSet<&String> = bm25_results.iter().map(|(id, _)| id).collect();
 
         let chunks = self.chunks.read().await;
         let mut out = Vec::with_capacity(all.len().min(query.top_k));
@@ -442,7 +515,11 @@ impl CodeIndexer {
             } else {
                 None
             };
-            out.push(raw_to_code_chunk(raw, score, match_reason, snippet));
+            let mut chunk = raw_to_code_chunk(raw, score, match_reason, snippet);
+            if let Some(set) = branch_files {
+                chunk.on_branch = set.contains(normalize_path(&raw.file));
+            }
+            out.push(chunk);
         }
         out
     }

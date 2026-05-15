@@ -405,6 +405,9 @@ async fn search_for_context(
         top_k,
         expand_graph: true,
         compact: true,
+        branch_files: None,
+        branch_boost: SearchQuery::default_branch_boost(),
+        branch: None,
     };
     let indexer = handle.indexer.read().await;
     let results = indexer.search(&q).await.map_err(|e| e.to_string())?;

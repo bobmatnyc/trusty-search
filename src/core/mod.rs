@@ -5,6 +5,7 @@ pub mod classifier;
 pub mod concept_cluster;
 pub mod embed;
 pub mod entity;
+pub mod git;
 pub mod indexer;
 pub mod memguard;
 pub mod memory_policy;

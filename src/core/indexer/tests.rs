@@ -196,6 +196,7 @@ async fn test_search_integration_returns_relevant_chunk_first() {
         top_k: 3,
         expand_graph: false,
         compact: true,
+        ..Default::default()
     };
     let results = idx.search(&q).await.expect("search");
     assert!(!results.is_empty(), "search should return at least one hit");
@@ -255,6 +256,7 @@ async fn test_search_with_no_embedder_falls_back_to_bm25() {
         top_k: 5,
         expand_graph: false,
         compact: false,
+        ..Default::default()
     };
     let r = idx.search(&q).await.unwrap();
     assert_eq!(r[0].id, "f.rs:1:1");
@@ -277,6 +279,7 @@ async fn test_remove_chunk_removes_from_results() {
         top_k: 5,
         expand_graph: false,
         compact: false,
+        ..Default::default()
     };
     let r = idx.search(&q).await.unwrap();
     assert!(!r.iter().any(|c| c.id == "a:1:1"));
@@ -341,6 +344,7 @@ async fn test_kg_expansion_marks_neighbours_with_hybrid_kg() {
         top_k: 10,
         expand_graph: true,
         compact: false,
+        ..Default::default()
     };
     let results = idx.search(&q).await.unwrap();
     let login = results
@@ -419,6 +423,7 @@ async fn test_kg_expansion_disabled_by_expand_graph_false() {
         top_k: 10,
         expand_graph: false,
         compact: false,
+        ..Default::default()
     };
     let results = idx.search(&q).await.unwrap();
     assert!(
@@ -486,6 +491,7 @@ async fn test_entity_exact_match_struct_ranks_first() {
         top_k: 5,
         expand_graph: false,
         compact: false,
+        ..Default::default()
     };
     let results = idx.search(&q).await.expect("search");
     assert!(!results.is_empty(), "search must return at least one hit");
@@ -608,6 +614,7 @@ async fn test_index_files_batch_indexes_all_chunks_once() {
         top_k: 5,
         expand_graph: false,
         compact: false,
+        ..Default::default()
     };
     let r = idx.search(&q).await.unwrap();
     assert!(r.iter().any(|c| c.file == "src/a.rs"));
@@ -638,6 +645,7 @@ async fn test_index_files_batch_bm25_only_mode() {
             top_k: 5,
             expand_graph: false,
             compact: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -685,6 +693,7 @@ async fn search_uses_domain_terms_when_provided() {
             top_k: 5,
             expand_graph: false,
             compact: false,
+            ..Default::default()
         })
         .await
         .expect("search ok");
@@ -745,6 +754,7 @@ async fn test_definition_demotes_markdown_below_source() {
         top_k: 10,
         expand_graph: false,
         compact: false,
+        ..Default::default()
     };
     let results = idx.search(&q).await.unwrap();
     assert!(!results.is_empty(), "search must return results");
@@ -786,6 +796,7 @@ async fn test_conceptual_does_not_demote_docs() {
         top_k: 10,
         expand_graph: false,
         compact: false,
+        ..Default::default()
     };
     let results = idx.search(&q).await.unwrap();
     assert!(
@@ -851,6 +862,7 @@ async fn test_kg_results_survive_top_k_truncation() {
         top_k: 10,
         expand_graph: true,
         compact: false,
+        ..Default::default()
     };
     let results = idx.search(&q).await.unwrap();
     assert!(
@@ -934,4 +946,186 @@ async fn test_enumerate_chunks_paginates_stable_order() {
     let (total_z, z) = idx.enumerate_chunks(0, 0).await;
     assert_eq!(total_z, 4);
     assert!(z.is_empty());
+}
+
+// ---- Branch-aware search (issue #122) ----------------------------------
+
+fn make_branch_query(text: &str, files: Vec<String>, boost: f32) -> SearchQuery {
+    SearchQuery {
+        text: text.to_string(),
+        top_k: 10,
+        expand_graph: false,
+        compact: false,
+        branch_files: Some(files),
+        branch_boost: boost,
+        branch: None,
+    }
+}
+
+#[tokio::test]
+async fn test_branch_boost_applied_to_matching_chunks() {
+    // Why: chunks whose file is in `branch_files` must out-rank otherwise
+    // equivalent chunks. We use two files with the same BM25-relevant
+    // content so the baseline ranking is a stable tie broken by the boost.
+    // What: build a corpus with two chunks ("on-branch" and "off-branch"),
+    // run a query with `branch_files=[on-branch path]`, assert the
+    // on-branch chunk ranks first and carries `on_branch: true`.
+    // Test: this test.
+    let idx = make_indexer();
+    idx.add_chunk(raw(
+        "src/on.rs:1:1",
+        "src/on.rs",
+        "fn authenticate(user: &str) -> bool { true }",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "src/off.rs:1:1",
+        "src/off.rs",
+        "fn authenticate(user: &str) -> bool { true }",
+    ))
+    .await
+    .unwrap();
+
+    let q = make_branch_query("fn authenticate", vec!["src/on.rs".to_string()], 1.5);
+    let results = idx.search(&q).await.unwrap();
+    assert!(!results.is_empty(), "branch-aware search must return hits");
+    let on_branch = results
+        .iter()
+        .find(|c| c.file == "src/on.rs")
+        .expect("on-branch chunk in results");
+    let off_branch = results.iter().find(|c| c.file == "src/off.rs");
+
+    assert!(on_branch.on_branch, "on_branch must be true for on.rs");
+    if let Some(off) = off_branch {
+        assert!(!off.on_branch, "on_branch must be false for off.rs");
+        assert!(
+            on_branch.score >= off.score,
+            "branch boost must make on.rs >= off.rs (got {} vs {})",
+            on_branch.score,
+            off.score
+        );
+    }
+    assert_eq!(
+        results[0].file,
+        "src/on.rs",
+        "on-branch chunk must rank first; got {:?}",
+        results.iter().map(|c| &c.file).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_branch_boost_clamped_to_3x() {
+    // Why: callers must not be able to drown out all off-branch results by
+    // passing wild multipliers (e.g. 10x). The pipeline must clamp.
+    // What: feed a query with `branch_boost = 10.0` and a single on-branch
+    // chunk; verify the resolved boost equals 3.0 via `resolve_branch_set`.
+    // Test: this test (direct helper) + the integration test above.
+    let q = make_branch_query("foo", vec!["src/on.rs".to_string()], 10.0);
+    let root = std::path::PathBuf::from("/tmp/test");
+    let (set, boost) = super::search::resolve_branch_set(&q, &root);
+    assert!(set.is_some(), "branch set must be present");
+    assert!(
+        (boost - 3.0).abs() < f32::EPSILON,
+        "branch_boost=10.0 must clamp to 3.0, got {boost}"
+    );
+
+    // Floor: 0.0 must clamp up to 1.0 (no-op).
+    let q_low = make_branch_query("foo", vec!["src/on.rs".to_string()], 0.0);
+    let (set_low, boost_low) = super::search::resolve_branch_set(&q_low, &root);
+    assert!(
+        (boost_low - 1.0).abs() < f32::EPSILON,
+        "branch_boost=0.0 must clamp to 1.0, got {boost_low}"
+    );
+    // 1.0 disables boosting → the set is dropped to skip per-chunk work.
+    assert!(
+        set_low.is_none(),
+        "branch_boost=1.0 must drop the set (no-op)"
+    );
+}
+
+#[tokio::test]
+async fn test_on_branch_set_correctly() {
+    // Why: every returned chunk must carry an accurate `on_branch` flag so
+    // clients can highlight branch work in UI without re-doing the lookup.
+    // What: index two chunks, query with branch_files=[one], assert each
+    // result's flag matches set membership.
+    // Test: this test.
+    let idx = make_indexer();
+    idx.add_chunk(raw(
+        "src/on.rs:1:1",
+        "src/on.rs",
+        "fn authenticate() -> bool { true }",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "src/off.rs:1:1",
+        "src/off.rs",
+        "fn authenticate() -> bool { true }",
+    ))
+    .await
+    .unwrap();
+
+    let q = make_branch_query("fn authenticate", vec!["src/on.rs".to_string()], 1.5);
+    let results = idx.search(&q).await.unwrap();
+    for c in &results {
+        if c.file == "src/on.rs" {
+            assert!(c.on_branch, "on.rs must be flagged on_branch=true");
+        } else if c.file == "src/off.rs" {
+            assert!(!c.on_branch, "off.rs must be flagged on_branch=false");
+        }
+    }
+
+    // Normalize leading "./" — branch_files entries with "./src/on.rs" must
+    // still match a chunk whose file is "src/on.rs".
+    let q2 = make_branch_query("fn authenticate", vec!["./src/on.rs".to_string()], 1.5);
+    let results2 = idx.search(&q2).await.unwrap();
+    let on2 = results2
+        .iter()
+        .find(|c| c.file == "src/on.rs")
+        .expect("on-branch chunk in results");
+    assert!(on2.on_branch, "leading './' must be normalized away");
+}
+
+#[tokio::test]
+async fn test_no_boost_when_branch_files_absent() {
+    // Why: a vanilla query with no branch context must not pay any branch
+    // overhead and must report `on_branch: false` on every result.
+    // What: run the baseline search query and confirm scores match the
+    // pre-#122 behavior (i.e. on_branch is always false, no panic).
+    // Test: this test.
+    let idx = make_indexer();
+    idx.add_chunk(raw(
+        "src/auth.rs:1:5",
+        "src/auth.rs",
+        "fn authenticate(user: &str, password: &str) -> bool { true }",
+    ))
+    .await
+    .unwrap();
+    idx.add_chunk(raw(
+        "src/render.rs:1:3",
+        "src/render.rs",
+        "fn render_ui_components() { /* svelte */ }",
+    ))
+    .await
+    .unwrap();
+
+    let q = SearchQuery {
+        text: "fn authenticate".to_string(),
+        top_k: 5,
+        expand_graph: false,
+        compact: false,
+        branch_files: None,
+        branch_boost: SearchQuery::default_branch_boost(),
+        branch: None,
+    };
+    let results = idx.search(&q).await.unwrap();
+    assert!(!results.is_empty());
+    for c in &results {
+        assert!(
+            !c.on_branch,
+            "on_branch must default to false when no branch context provided"
+        );
+    }
 }
