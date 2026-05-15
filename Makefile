@@ -89,18 +89,21 @@ patch:
 ##      "exact name match"; it cannot match tmux, claude, or any script that
 ##      merely contains the string "trusty-search" somewhere in its arguments.
 ##
-## Both known plist paths are tried on unload and load because the launchd
-## label has varied across installs (com.bobmatnyc vs com.trusty).
+## Canonical launchd label: com.bobmatnyc.trusty-search (matches GitHub username).
+## The legacy com.trusty.trusty-search label is unloaded and its plist removed
+## during deploy to consolidate to a single plist.
+PLIST_CANONICAL := $(HOME)/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist
+PLIST_LEGACY    := $(HOME)/Library/LaunchAgents/com.trusty.trusty-search.plist
+
 deploy:
-	-launchctl unload ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null
-	-launchctl unload ~/Library/LaunchAgents/com.trusty.trusty-search.plist 2>/dev/null
+	-launchctl unload $(PLIST_CANONICAL) 2>/dev/null
+	-launchctl unload $(PLIST_LEGACY) 2>/dev/null
+	-rm -f $(PLIST_LEGACY)
 	-trusty-search stop 2>/dev/null
 	-pkill -TERM -x trusty-search 2>/dev/null
 	sleep 2
 	CARGO_BUILD_JOBS=2 cargo install --path . --locked
-	launchctl load ~/Library/LaunchAgents/com.bobmatnyc.trusty-search.plist 2>/dev/null || \
-	  launchctl load ~/Library/LaunchAgents/com.trusty.trusty-search.plist 2>/dev/null || \
-	  trusty-search start
+	launchctl load $(PLIST_CANONICAL) 2>/dev/null || trusty-search start
 
 ## Stop daemon, install new binary from source, restart (closes #87)
 ## Why: replacing the binary while the daemon is running causes macOS to
