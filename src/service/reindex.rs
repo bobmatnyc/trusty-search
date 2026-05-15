@@ -158,6 +158,12 @@ const BROADCAST_CAPACITY: usize = 256;
 pub enum ReindexStatus {
     Running,
     Complete,
+    /// Issue #120: the reindex aborted because the soft RSS ceiling
+    /// (`TRUSTY_MEMORY_LIMIT_MB`) was breached. Distinguished from `Complete`
+    /// so external callers can apply a cooldown before retrying — re-running
+    /// immediately would just hit the limit again, producing an infinite
+    /// reindex loop.
+    AbortedMemory,
     Failed,
 }
 
@@ -228,7 +234,7 @@ impl Default for ReindexProgress {
 /// progress entries while still letting late SSE subscribers read the final
 /// state for a short window).
 pub fn spawn_reindex(handle: Arc<IndexHandle>, progress: Arc<ReindexProgress>, force: bool) {
-    spawn_reindex_with_cleanup(handle, progress, force, None);
+    spawn_reindex_with_cleanup(handle, progress, force, None, None);
 }
 
 /// Walk every configured subtree under `handle.root_path`, apply repo-config
@@ -793,9 +799,18 @@ async fn emit_complete_event(
         .checked_div(elapsed_ms)
         .unwrap_or(0);
     let indexed_final = progress.indexed.load(Ordering::Acquire);
+    // Issue #120: surface the terminal status string in the SSE payload so
+    // external callers (CLI, dashboard, open-mpm) can distinguish a clean
+    // completion from a memory-abort without reading the daemon log.
+    let status_str = if totals.mem_limit_hit {
+        "aborted_memory"
+    } else {
+        "complete"
+    };
     progress
         .push(serde_json::json!({
             "event": "complete",
+            "status": status_str,
             "indexed": indexed_final,
             "total_chunks": total_chunks,
             "skipped": progress.skipped.load(Ordering::Acquire),
@@ -826,6 +841,7 @@ pub fn spawn_reindex_with_cleanup(
     progress: Arc<ReindexProgress>,
     force: bool,
     cleanup_map: Option<Arc<DashMap<IndexId, Arc<ReindexProgress>>>>,
+    aborted_map: Option<Arc<DashMap<IndexId, Instant>>>,
 ) {
     let cleanup_id = handle.id.clone();
     tokio::spawn(async move {
@@ -982,7 +998,19 @@ pub fn spawn_reindex_with_cleanup(
         // Best-effort: don't fail completion if the poller is wedged.
         let _ = poller_handle.await;
 
-        progress.status.store(ReindexStatus::Complete);
+        // Issue #120: distinguish memory-abort from clean completion so the
+        // HTTP reindex_handler can apply a cooldown before honouring the next
+        // reindex request. Also record the abort timestamp on the shared map
+        // so the cooldown survives across handler invocations.
+        let aborted_memory = mem_limit_hit || mem_abort.load(AtomicOrdering::Acquire);
+        if aborted_memory {
+            progress.status.store(ReindexStatus::AbortedMemory);
+            if let Some(map) = aborted_map.as_ref() {
+                map.insert(index_id.clone(), Instant::now());
+            }
+        } else {
+            progress.status.store(ReindexStatus::Complete);
+        }
 
         // Final synchronous RSS poll so the peak reflects post-KG memory
         // (the symbol graph rebuild may itself push RSS higher than any

@@ -94,6 +94,22 @@ pub struct SearchAppState {
     /// by `POST /indexes/:id/reindex`, consumed by
     /// `GET /indexes/:id/reindex/stream`. Lazily populated.
     pub reindex_progress: Arc<DashMap<IndexId, Arc<ReindexProgress>>>,
+    /// Issue #120: per-index timestamp of the most recent reindex that
+    /// aborted at the memory limit. Used by `reindex_handler` to apply a
+    /// cooldown (`TRUSTY_REINDEX_COOLDOWN_SECS`, default 300 s) before
+    /// honouring another reindex request — re-running immediately would
+    /// hit the same limit and produce a tight loop.
+    ///
+    /// Why: when a reindex aborts at the memory limit, some files have no
+    /// content-hash entry yet, so a follow-up reindex sees them as "new"
+    /// and re-processes them — hitting the limit again. The cooldown gives
+    /// operators time to lower batch size / raise the limit before another
+    /// attempt.
+    /// What: written by `spawn_reindex_with_cleanup` when `mem_limit_hit`
+    /// is true; read by `reindex_handler` before queuing.
+    /// Test: covered by `reindex_handler_rejects_within_cooldown` in
+    /// `src/service/server.rs#tests`.
+    pub last_reindex_aborted_at: Arc<DashMap<IndexId, std::time::Instant>>,
     /// Process-wide embedder shared across every index so the (expensive)
     /// fastembed ONNX session is initialized once. `None` keeps the daemon
     /// in BM25-only mode — useful for tests that don't want to download the
@@ -200,6 +216,7 @@ impl SearchAppState {
         Self {
             registry,
             reindex_progress: Arc::new(DashMap::new()),
+            last_reindex_aborted_at: Arc::new(DashMap::new()),
             embedder: None,
             embedder_slot: Arc::new(RwLock::new(None)),
             embedder_ready: ready_rx,
@@ -1395,9 +1412,56 @@ async fn reindex_handler(
     State(state): State<Arc<SearchAppState>>,
     Path(id): Path<String>,
     body: Option<Json<ReindexRequest>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let index_id = IndexId::new(id.clone());
-    let mut handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let mut handle = state.registry.get(&index_id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": format!("unknown index: {}", index_id.0),
+        })),
+    ))?;
+
+    // Issue #120: cooldown guard. If the most recent reindex for this index
+    // aborted at the memory limit, refuse to queue another one for
+    // `TRUSTY_REINDEX_COOLDOWN_SECS` (default 300 s). Re-running immediately
+    // would just hit the limit again because the un-processed files have no
+    // content-hash entries yet, producing an infinite reindex loop. Operators
+    // can lower batch size / raise the memory limit and try again after the
+    // cooldown elapses.
+    if let Some(aborted_at) = state.last_reindex_aborted_at.get(&index_id) {
+        let elapsed = aborted_at.elapsed();
+        let cooldown = std::time::Duration::from_secs(
+            std::env::var("TRUSTY_REINDEX_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+        );
+        if elapsed < cooldown {
+            let remaining_secs = (cooldown - elapsed).as_secs();
+            tracing::warn!(
+                "reindex_handler: refusing reindex for index {} — last run \
+                 aborted at memory limit {}s ago, cooldown {}s remaining",
+                index_id.0,
+                elapsed.as_secs(),
+                remaining_secs,
+            );
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "reindex cooldown active after memory-limit abort",
+                    "index_id": index_id.0,
+                    "retry_after_secs": remaining_secs,
+                    "cooldown_secs": cooldown.as_secs(),
+                    "hint": "lower TRUSTY_MAX_BATCH_SIZE or raise TRUSTY_MEMORY_LIMIT_MB before retrying",
+                })),
+            ));
+        }
+        // Cooldown elapsed — drop the stale entry so the next abort (if any)
+        // starts a fresh window. Done outside the `get()` guard to avoid
+        // holding a DashMap shard lock across the removal.
+        drop(aborted_at);
+        state.last_reindex_aborted_at.remove(&index_id);
+    }
 
     // If caller supplied a root_path and the stored handle doesn't have one
     // (or differs), re-register with the new path. We can't mutate the
@@ -1441,6 +1505,7 @@ async fn reindex_handler(
         progress,
         force,
         Some(Arc::clone(&state.reindex_progress)),
+        Some(Arc::clone(&state.last_reindex_aborted_at)),
     );
 
     Ok(Json(serde_json::json!({
@@ -1943,5 +2008,81 @@ mod tests {
         let Json(resp) = health_handler(State(state_arc)).await;
         assert_eq!(resp.embedder, "ready");
         assert!(resp.embedder_error.is_none());
+    }
+
+    /// Issue #120: when the previous reindex for an index aborted at the
+    /// memory limit, a follow-up `POST /indexes/:id/reindex` request must be
+    /// refused with `429 Too Many Requests` for the duration of the cooldown.
+    ///
+    /// Why: without the guard, an external caller (CLI watchdog, open-mpm)
+    /// that retries on abort would loop: each retry re-processes files that
+    /// had no content-hash entry yet, pushes RSS over the limit again, and
+    /// aborts again.
+    /// What: stages an index, records a memory-abort timestamp, calls
+    /// `reindex_handler` and asserts the 429 + JSON body shape. Then resets
+    /// the cooldown env to 0 s, removes the entry, and verifies the next
+    /// call queues successfully.
+    /// Test: this test.
+    #[tokio::test]
+    async fn reindex_handler_rejects_within_cooldown() {
+        use crate::core::{
+            indexer::CodeIndexer,
+            registry::{IndexHandle, IndexId, IndexRegistry},
+        };
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let registry = IndexRegistry::new();
+        let id = IndexId::new("cooldown-test");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        registry.register(IndexHandle::bare(
+            id.clone(),
+            Arc::new(RwLock::new(CodeIndexer::new("cooldown-test", tmp.path()))),
+            tmp.path().to_path_buf(),
+        ));
+        let state = Arc::new(SearchAppState::new(registry));
+
+        // Simulate a prior memory abort by writing a fresh timestamp.
+        state
+            .last_reindex_aborted_at
+            .insert(id.clone(), std::time::Instant::now());
+
+        // Default cooldown is 300 s — handler must refuse with 429.
+        let result = reindex_handler(
+            State(Arc::clone(&state)),
+            axum::extract::Path("cooldown-test".to_string()),
+            None,
+        )
+        .await;
+        let err = result.expect_err("expected 429 inside cooldown window");
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+        let body = err.1 .0;
+        assert!(body.get("retry_after_secs").is_some());
+        assert!(body.get("hint").is_some());
+        assert_eq!(body["index_id"], "cooldown-test");
+
+        // Drop the abort entry and verify the next call queues successfully.
+        state.last_reindex_aborted_at.remove(&id);
+        let ok = reindex_handler(
+            State(Arc::clone(&state)),
+            axum::extract::Path("cooldown-test".to_string()),
+            None,
+        )
+        .await
+        .expect("queued");
+        assert_eq!(ok.0["queued"], serde_json::Value::Bool(true));
+    }
+
+    /// Issue #120: the `AbortedMemory` variant must serialize to the
+    /// kebab-case-but-lowercase form (`"abortedmemory"`) consistent with the
+    /// existing `Complete`/`Failed`/`Running` variants. External callers
+    /// parse the status string off the SSE stream, so the wire format is
+    /// load-bearing.
+    /// Test: this test.
+    #[tokio::test]
+    async fn reindex_status_aborted_memory_serializes_lowercase() {
+        let status = crate::service::reindex::ReindexStatus::AbortedMemory;
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert_eq!(json, "\"abortedmemory\"");
     }
 }
