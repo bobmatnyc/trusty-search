@@ -6,12 +6,136 @@
 Machine-wide, blazingly fast hybrid code search service. One install per machine,
 one always-on daemon, unlimited named indexes.
 
-> **Note:** Code complexity, smell detection, and quality analysis have moved to
-> [trusty-analyzer](https://github.com/bobmatnyc/trusty-analyzer). `trusty-search`
-> focuses on hybrid code *search*; `trusty-analyzer` provides static analysis,
-> complexity hotspots, and code quality grades. As of v0.2.0 the
-> `complexity_hotspots`, `smells`, and `quality` HTTP endpoints are no longer
-> served from this binary.
+## System requirements
+
+- **Rust 1.75+** (for source builds)
+- **16 GB RAM minimum** — hard-checked at daemon startup; the daemon will not start on under-spec machines
+- **macOS 12+ or Linux** (Windows: not yet supported)
+- **~2 GB disk** for model cache (downloaded on first run to `~/Library/Caches/trusty-search/` on macOS or `$XDG_DATA_HOME/trusty-search/` on Linux)
+
+## Install
+
+### From crates.io (recommended)
+
+```bash
+cargo install trusty-search
+```
+
+### From source
+
+```bash
+git clone https://github.com/bobmatnyc/trusty-search
+cd trusty-search
+cargo install --path . --locked
+```
+
+### Apple Silicon
+
+CoreML GPU acceleration is enabled automatically on M1/M2/M3/M4. No flags or extra installs are needed. The startup log confirms the active provider:
+
+```
+embedder initialized: model=AllMiniLML6V2(Q) dim=384 provider=CoreML (Metal GPU / ANE)
+```
+
+### NVIDIA GPU (CUDA)
+
+```bash
+cargo install trusty-search --features cuda
+```
+
+Requires CUDA toolkit installed on the host. See [CLAUDE.md](./CLAUDE.md) for `ORT_DYLIB_PATH` setup on Amazon Linux 2023 and other glibc 2.34 hosts.
+
+## Quick start
+
+The following five steps take you from zero to a running search in under five minutes.
+
+**Step 1 — Start the daemon**
+
+```bash
+trusty-search start
+```
+
+Expected output:
+```
+trusty-search daemon starting on http://127.0.0.1:<port>
+embedder initialized: model=AllMiniLML6V2(Q) dim=384 provider=CoreML (Metal GPU / ANE)
+daemon ready
+```
+
+The daemon auto-selects a free port and writes it to `~/Library/Application Support/trusty-search/port.lock`.
+
+**Step 2 — Index a project**
+
+```bash
+trusty-search index ~/Projects/myproj --name myproj
+```
+
+Expected output:
+```
+Registered index "myproj" at /Users/me/Projects/myproj
+⟳ Indexing myproj [████████░░] 1204/1520 files — 12s remaining
+✓ Indexed 14 823 chunks in 142s
+```
+
+Re-running is safe — unchanged files are skipped via content fingerprints. Use `--force` to rebuild from scratch.
+
+**Step 3 — Run a search**
+
+```bash
+trusty-search query "fn authenticate" --index myproj
+```
+
+Expected output:
+```
+1. src/auth.rs:42 — authenticate (hybrid+kg, score=0.018)
+   fn authenticate(ctx: &Context) -> Result<Token> {
+2. src/middleware.rs:17 — verify_token (hybrid, score=0.011)
+   ...
+```
+
+Add `--json` for machine-readable output.
+
+**Step 4 — Open the admin UI**
+
+```bash
+trusty-search ui
+```
+
+Opens `http://127.0.0.1:<port>/ui` in your browser. The UI provides search, index management, and an OpenRouter-backed chat panel (requires `OPENROUTER_API_KEY`).
+
+**Step 5 — Check status at any time**
+
+```bash
+trusty-search status   # daemon version, port, per-index chunk counts
+trusty-search doctor   # 6-check diagnostic; add --fix to auto-repair
+```
+
+## Using with Claude Code
+
+Add trusty-search as an MCP server in your Claude Code config (`~/.claude/claude_desktop_config.json` or via `claude mcp add`):
+
+### stdio (recommended)
+
+```json
+{
+  "mcpServers": {
+    "trusty-search": {
+      "command": "trusty-search",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+### HTTP/SSE
+
+```bash
+trusty-search serve --http 127.0.0.1:7879
+```
+
+Then add `http://127.0.0.1:7879/sse` as an SSE MCP endpoint in your Claude Code config.
+
+Once connected, Claude Code can call `search_code`, `index_file`, `list_indexes`, and 9 other tools directly. The daemon must be running independently (`trusty-search start`) before Claude Code connects.
 
 ## Features
 
@@ -22,6 +146,9 @@ one always-on daemon, unlimited named indexes.
   Graph 1–2 hop expansion, fused via Reciprocal Rank Fusion (k = 60, always-on)
 - **Query intent routing** — sub-ms regex classifier routes every query to one
   of 5 intents and adjusts α / β weights and KG gating per query
+- **Branch-aware search** — pass `branch_files` (or just `branch: "feature/foo"`) to
+  `POST /indexes/:id/search`; chunks from your branch get a configurable score boost
+  (default 1.5×) and every result carries `on_branch: bool`
 - **KG symbol graph** — petgraph-backed `SymbolGraph` derived from tree-sitter
   parses, with `EdgeKind` (CALLS / IMPORTS / INHERITS / CONTAINS) score
   multipliers; KG expansion is intent-gated (Usage only)
@@ -46,77 +173,27 @@ one always-on daemon, unlimited named indexes.
 - **Migration path** — `trusty-search convert` reads `mcp-vector-search`
   configs and re-registers each project as a named index
 
-## Install
-
-### From crates.io (recommended)
-
-```bash
-# CPU-only (default, all platforms incl. macOS Intel + Apple Silicon)
-cargo install trusty-search
-
-# CUDA build (NVIDIA GPU, requires CUDA toolkit)
-cargo install trusty-search --features cuda
-```
-
-On Apple Silicon the CoreML execution provider is registered automatically;
-no opt-in flag is needed.
-
-### From source
-
-> **Note:** Source builds require the `trusty-common` workspace to be checked out as a sibling directory.
-
-```bash
-git clone https://github.com/bobmatnyc/trusty-common ../trusty-common
-git clone https://github.com/bobmatnyc/trusty-search
-cd trusty-search
-cargo install --path . --locked
-```
-
-Alternatively, comment out the `[patch.crates-io]` block in `Cargo.toml` and use the published crates:
-
-```bash
-git clone https://github.com/bobmatnyc/trusty-search
-cd trusty-search
-# Edit Cargo.toml to comment out the [patch.crates-io] block
-cargo install --path . --locked
-```
-
-**System requirement:** 16 GB RAM minimum. The daemon performs a hard RAM
-check on startup.
-
-## Quick start
-
-```bash
-# Start the machine-wide daemon (background)
-trusty-search start
-
-# Index a project (auto-registers, skips if already indexed)
-trusty-search index ~/Projects/myproj --name myproj
-
-# Hybrid search
-trusty-search query "fn authenticate" --index myproj
-
-# Run as MCP server for Claude Code (stdio)
-trusty-search serve
-
-# Open the admin UI in your browser
-trusty-search ui
-```
+> **Code quality analysis:** Complexity hotspots, smell detection, and quality grades
+> have moved to [trusty-analyzer](https://github.com/bobmatnyc/trusty-analyzer).
+> The `complexity_hotspots`, `smells`, and `quality` HTTP endpoints are not served
+> from this binary as of v0.2.0.
 
 ## Memory tiers (auto-tuned at startup)
 
-| Tier   | Total RAM  | `MEMORY_LIMIT_MB` | `MAX_CHUNKS` | `EMBEDDING_CACHE` | `MAX_BATCH_SIZE` | `BM25_CORPUS_CAP` | `MAX_KG_NODES` |
-|--------|------------|-------------------|--------------|-------------------|------------------|-------------------|----------------|
-| Tiny   | < 8 GB     | 1 024             | 50 000       | 500               | 64               | 20 000            | 30 000         |
-| Small  | 8–15 GB    | 2 048             | 100 000      | 1 000             | 128              | 50 000            | 75 000         |
-| Medium | 16–31 GB   | 4 096             | 200 000      | 5 000             | 256              | 100 000           | 150 000        |
-| Large  | 32–63 GB   | 8 192             | 400 000      | 10 000            | 512              | 200 000           | 300 000        |
-| XLarge | ≥ 64 GB    | 16 384            | 800 000      | 20 000            | 512              | 400 000           | 500 000        |
+`MEMORY_LIMIT_MB` is computed dynamically as **25% of detected system RAM, clamped to 1–64 GB**. It is not a fixed tier value. The env var `TRUSTY_MEMORY_LIMIT_MB` overrides it. All other limits below are tier-based.
+
+| Tier   | Total RAM  | `MEMORY_LIMIT_MB`     | `MAX_CHUNKS` | `EMBEDDING_CACHE` | `MAX_BATCH_SIZE` | `BM25_CORPUS_CAP` | `MAX_KG_NODES` |
+|--------|------------|-----------------------|--------------|-------------------|------------------|-------------------|----------------|
+| Tiny   | < 8 GB     | 25% of RAM (≥ 1 GB)   | 50 000       | 500               | 64               | 20 000            | 30 000         |
+| Small  | 8–15 GB    | 25% of RAM            | 100 000      | 1 000             | 128              | 50 000            | 75 000         |
+| Medium | 16–31 GB   | 25% of RAM            | 200 000      | 5 000             | 256              | 100 000           | 150 000        |
+| Large  | 32–63 GB   | 25% of RAM            | 400 000      | 10 000            | 512              | 200 000           | 300 000        |
+| XLarge | ≥ 64 GB    | 25% of RAM (≤ 64 GB)  | 800 000      | 20 000            | 512              | 400 000           | 500 000        |
 
 Env vars (`TRUSTY_MAX_CHUNKS`, `TRUSTY_EMBEDDING_CACHE`, `TRUSTY_MAX_BATCH_SIZE`,
 `TRUSTY_BM25_CORPUS_CAP`, `TRUSTY_MAX_KG_NODES`, `TRUSTY_MEMORY_LIMIT_MB`)
 always override the tier default. Precedence: shell env > `daemon.env` >
-tier default. The resolved tier is logged at daemon startup.
+tier default. The resolved tier and all limits are logged at daemon startup.
 
 ## Query intent → routing weights
 
@@ -129,7 +206,7 @@ tier default. The resolved tier is logged at daemon startup.
 | Unknown    | 0.6        | 0.4      | false    |
 
 The classifier is a sub-ms regex over the query text. KG expansion is gated
-to `Usage` intent only — caller/callee chains are scored at 70 % of the
+to `Usage` intent only — caller/callee chains are scored at 70% of the
 trigger chunk's RRF score.
 
 ## CLI
@@ -149,48 +226,6 @@ trusty-search serve [--http <addr>]                  # MCP stdio (default) or HT
 trusty-search init [path]                            # alias for index
 trusty-search reindex [path]                         # alias for index --force
 ```
-
-## Comparison with mcp-vector-search
-
-Migrating from `mcp-vector-search`? Here's how trusty-search compares:
-
-**Performance (Apple Silicon, 1,282-chunk Rust repo):**
-- trusty-search warm query: **13–16 ms**
-- mcp-vector-search warm query: **40–85 ms** (as MCP server)
-- Cold start: trusty-search amortized (daemon always warm); mcp-vector-search CLI: **4–9 seconds per invocation**
-
-**Architecture:**
-
-| | trusty-search | mcp-vector-search |
-|---|---|---|
-| Language | Rust | Python |
-| Deployment | Machine-wide daemon | Per-project service |
-| Vector store | In-memory HNSW (usearch) | LanceDB IVF-PQ (disk) |
-| Search | BM25 + HNSW + KG, always RRF-fused | BM25, vector, or hybrid (separate tools) |
-| Query routing | Intent classifier adjusts α/β weights | Static weights |
-| MCP tools | 11 focused search tools | 28 (includes complexity, code review, KG) |
-| Admin UI | Embedded Svelte 5 | D3.js visualization |
-| Cold start penalty | Zero (pre-loaded daemon) | 4–9 s (Python + model) |
-| RAM requirement | 16 GB (hard-checked) | None enforced |
-| Concurrency | HTTP/2 + reader-priority RwLock | asyncio |
-
-**Choose trusty-search if:**
-- You want sub-20 ms warm queries with zero cold-start overhead
-- You manage multiple projects on one machine (one daemon serves all)
-- You're already using Rust/compiled tooling
-- Query-intent-aware ranking matters (Definition / Usage / Conceptual / BugDebt)
-
-**Consider mcp-vector-search if:**
-- You need complexity analysis, code review, or broader KG features
-  (complexity/quality analysis have moved to [trusty-analyzer](https://github.com/bobmatnyc/trusty-analyzer))
-- You're on a Python-first stack
-- You need the broader MCP tool surface
-
-**Migrate easily:** `trusty-search convert project|all` reads your existing
-`mcp-vector-search` configs and re-registers each project as a named index.
-
-For a detailed technical comparison, see
-[docs/research/trusty-search-vs-mcp-vector-search-2026-05-12.md](./docs/research/trusty-search-vs-mcp-vector-search-2026-05-12.md).
 
 ## MCP tools
 
@@ -222,17 +257,56 @@ For a detailed technical comparison, see
 | KV store        | redb 2.6                                            |
 | Knowledge graph | petgraph 0.6 (`SymbolGraph`)                        |
 | File watching   | notify 6 + notify-debouncer-mini 0.4 (500 ms)       |
-| Code parsing    | tree-sitter 0.24 (14 grammars)                      |
+| Code parsing    | tree-sitter 0.26 (14 grammars)                      |
 | Concurrency     | dashmap 5, lru 0.12, rayon 1                        |
 | HTTP client     | reqwest 0.12 (rustls-tls)                           |
 | CLI             | clap 4 (derive)                                     |
 | UI              | Svelte 5, embedded via `include_dir!`               |
 | Hashing         | sha2 (incremental reindex fingerprints)             |
 
+## Troubleshooting
+
+**Daemon won't start**
+
+Run `trusty-search doctor` for a 6-check diagnostic. Common causes:
+- Another daemon already running: `trusty-search stop` then `trusty-search start`
+- Stale PID lockfile: `trusty-search doctor --fix` removes it automatically
+- Less than 16 GB RAM: the daemon performs a hard RAM check and exits with an error
+
+**Embedder stuck on "initializing"**
+
+The ONNX Runtime initializes the model on first start and may take 30–60 seconds on slower machines. If it hangs indefinitely, increase the timeout:
+
+```bash
+TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS=120 trusty-search start
+```
+
+**High memory usage during reindex**
+
+The daemon has a soft RSS ceiling (`TRUSTY_MEMORY_LIMIT_MB`). When hit, it skips remaining batches and logs a warning. Already-committed chunks stay searchable. To lower pressure:
+
+```bash
+TRUSTY_MEMORY_LIMIT_MB=2048 trusty-search start
+```
+
+Or wait for the soft cap to trip — the partial index is usable immediately.
+
+**Port conflict**
+
+The daemon auto-selects a free port on each start. The live port is written to:
+- macOS: `~/Library/Application Support/trusty-search/port.lock`
+- Linux: `$XDG_DATA_HOME/trusty-search/port.lock`
+
+If `trusty-search status` reports the wrong port, stop and restart the daemon.
+
+**Device flag not persisting across restarts**
+
+Use `trusty-search start --device cpu` to force CPU mode. The flag is persisted to `daemon.env` so it survives daemon restarts.
+
 ## Architecture and HTTP API
 
 See [CLAUDE.md](./CLAUDE.md) for the full HTTP endpoint catalogue, query
-pipeline, multi-request design, and release process.
+pipeline, multi-request design, memory tuning reference, and release process.
 
 ## Documentation
 

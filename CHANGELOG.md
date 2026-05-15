@@ -13,6 +13,105 @@ _(no unreleased changes)_
 
 ---
 
+## [0.3.36] — 2026-05-15
+
+### Added
+- **#122** Branch-aware scoring: `branch_files` request field boosts chunks from the current branch by a configurable multiplier (default 1.5×, clamped to `[1.0, 3.0]`); results carry `on_branch: bool`; when `branch_files` is absent, the daemon shells out to `git merge-base` + `git diff --name-only` to derive the file list automatically
+
+### Fixed
+- **#121** Embedder init hang: ORT initialization now runs on a blocking thread with a configurable timeout (`TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS`); a timeout surfaces as an error state rather than hanging forever
+- **#120** `MEMORY_LIMIT_MB` recomputed as 25% of system RAM instead of a fixed tier cap; `TRUSTY_MEMORY_LIMIT_MB` still overrides
+
+### Changed
+- Makefile: `CLOSES` variable support in `patch` target; surgical daemon stop in `deploy` (PID lockfile + `pkill -x`) instead of broad pattern match; `kill` before deploy prevents OOM during compile; `launchctl unload` in deploy target prevents dual-daemon OOM
+- Workflow: `closes #N` now required in all resolution commits
+
+---
+
+## [0.3.35] — 2026-05-14
+
+### Fixed
+- **#119** CoreML jetsam crash on Apple Silicon (via trusty-embedder v0.1.5 bump)
+- **#118** `DELETE /indexes/:id` now persisted to `indexes.toml` so removals survive daemon restart
+- Daemon now detaches from terminal when started without `--foreground`, fixing crash when the parent tmux session is killed
+- ORT batch size default lowered from 200 MB/slot estimate; clamp changed to `[8, 64]` to prevent 94 GB reindex spikes
+
+### Changed
+- `TRUSTY_DEVICE` persisted to `daemon.env` so `--device cpu` survives daemon restarts
+- Makefile: `deploy` target added with `CARGO_BUILD_JOBS=2` to prevent OOM kills; `cargo install` removed from `patch` target
+
+---
+
+## [0.3.34] — 2026-05-13
+
+_(version bump only; internal release pipeline fix)_
+
+---
+
+## [0.3.33] — 2026-05-13
+
+### Added
+- OpenRPC `rpc.discover` endpoint exposed via trusty-mcp-core helpers
+- `SearchMcpService` implements `ServiceDescriptor` (#115)
+- Migration script for mcp-vector-search → trusty-search
+
+### Fixed
+- **#117** `serve --http` no longer clobbers the daemon's `http_addr` discovery file
+- **#116** tree-sitter upgraded to 0.26 for direct linking compatibility with open-mpm
+- **#114** glibc 2.34 compatibility for CUDA builds on Amazon Linux 2023
+- Test flakiness in file-watcher test on macOS (stray tmpdir events)
+
+### Changed
+- trusty-mcp-core bumped to v0.1.1 for OpenRPC support
+- trusty-embedder bumped to v0.1.4 for bundled-ort support
+
+---
+
+## [0.3.32] — 2026-05-12
+
+### Fixed
+- **#117** `serve --http` flag no longer overwrites the daemon's HTTP address discovery file, preventing the CLI from connecting to the wrong process
+
+---
+
+## [0.3.31] — 2026-05-12
+
+### Added
+- **#112** Index context inference and smart fan-out routing: queries against unknown or multi-index contexts are routed to the best-matching indexes automatically
+- **#113** Runtime CUDA auto-detection with GPU batch size tuning: when a CUDA-capable GPU is detected, `TRUSTY_MAX_BATCH_SIZE` is auto-bumped to 512; set `TRUSTY_MAX_BATCH_SIZE_EXPLICIT=1` to keep a manually configured value
+
+---
+
+## [0.3.30] — 2026-05-12
+
+### Added
+- **#110** `POST /search` fan-out endpoint: search across all registered indexes in a single call, results merged by RRF score
+- **#111** `path_filter` field on index registration: restrict which file paths are indexed for a given `IndexId`
+- **#91** Classifier extended to match leading-acronym identifiers (`BM25Index`, `IOError`, `URLParser`)
+
+---
+
+## [0.3.29] — 2026-05-12
+
+### Fixed
+- `colored::Colorize` import gated to macOS only, fixing compilation on Linux
+
+---
+
+## [0.3.28] — 2026-05-12
+
+### Changed
+- **#97** Extracted 52 functions from `main.rs` into `commands/` modules for improved maintainability
+- **#98, #109** Extracted helpers in `build.rs` and `spawn_reindex` into focused async helpers
+- **#98** Reindex phases extracted into focused async helpers
+- **#103** `symbol_graph` helpers extracted to reduce cyclomatic complexity
+- **#101, #104** Replaced `unwrap`/`panic`/`process::exit` with proper error handling throughout
+
+### Tests
+- **#99** Unit tests added for CLI command handlers and daemon-guard paths
+
+---
+
 ## [0.3.27] - 2026-05-12
 
 ### Fixed
@@ -434,7 +533,16 @@ _(no unreleased changes)_
 - `IndexRegistry` with `DashMap` + `Arc<RwLock<CodeIndexer>>`
 - axum router skeleton
 
-[Unreleased]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.27...HEAD
+[Unreleased]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.36...HEAD
+[0.3.36]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.35...v0.3.36
+[0.3.35]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.34...v0.3.35
+[0.3.34]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.33...v0.3.34
+[0.3.33]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.32...v0.3.33
+[0.3.32]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.31...v0.3.32
+[0.3.31]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.30...v0.3.31
+[0.3.30]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.29...v0.3.30
+[0.3.29]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.28...v0.3.29
+[0.3.28]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.27...v0.3.28
 [0.3.27]: https://github.com/bobmatnyc/trusty-search/compare/v0.3.26...v0.3.27
 [0.1.46]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.45...v0.1.46
 [0.1.45]: https://github.com/bobmatnyc/trusty-search/compare/v0.1.44...v0.1.45
