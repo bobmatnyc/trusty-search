@@ -10,6 +10,7 @@
 # prerequisite for `cargo publish`.
 # Test: `make release-prep` populates `ui-dist/index.html` and the `assets/` tree.
 
+CLOSES      ?=
 UI_DIR      := ui
 UI_DIST     := $(UI_DIR)/dist
 UI_EMBED    := ui-dist
@@ -66,7 +67,9 @@ patch:
 	@VERSION=$$(cargo metadata --no-deps --format-version 1 \
 	  | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])") && \
 	git add Cargo.toml Cargo.lock && \
-	git commit -m "chore(release): bump trusty-search to v$$VERSION" && \
+	COMMIT_MSG="chore(release): bump trusty-search to v$$VERSION"; \
+	if [ -n "$(CLOSES)" ]; then COMMIT_MSG="$$COMMIT_MSG (closes #$(CLOSES))"; fi; \
+	git commit -m "$$COMMIT_MSG" && \
 	git tag "v$$VERSION" && \
 	git push origin main && \
 	git push origin "v$$VERSION" && \
