@@ -3,6 +3,7 @@
 use anyhow::Result;
 use colored::Colorize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::core::registry::{IndexHandle, IndexId};
 use crate::service::persistence::load_index_registry;
@@ -407,26 +408,86 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<(
     // log loudly but leave the daemon running in BM25-only mode — operators
     // can `/health`-check `embedder: "unavailable"` and intervene. We can't
     // exit the process here without racing the HTTP server's shutdown path.
+    // Why (issue #121): on Intel Xeon AVX-512 hosts, `ort-2.0.0-rc.12`'s CPU
+    // session init can block the calling thread indefinitely with no error,
+    // no timeout, and no panic. Running `build_embedder().await` on a normal
+    // Tokio task means the blocking native code parks a Tokio worker thread
+    // forever, and the surrounding `tokio::spawn` future never makes progress.
+    //
+    // Fix has two parts:
+    //   1. Run the ORT/fastembed init on a dedicated `spawn_blocking` thread
+    //      so a hung init only consumes one blocking-pool thread instead of
+    //      starving the async executor.
+    //   2. Race the init against `TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS` (default
+    //      60 s). If init does not complete in time, transition the embedder
+    //      to an `"error"` state (visible via `/health`) so callers stop
+    //      polling and `POST /indexes` fails fast instead of dangling forever.
+    //
+    // The dedicated thread is intentionally NOT joined on timeout — the ORT
+    // call is hung in native code we cannot abort safely, so we leak the
+    // thread rather than risk an unsound abort. The daemon keeps running in
+    // BM25-only mode; the operator is expected to restart with a working ORT
+    // configuration after seeing the error.
+    let init_timeout_secs: u64 = std::env::var("TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+
     let install_state = state.clone();
     tokio::spawn(async move {
-        match build_embedder().await {
-            Ok(embedder) => {
+        let runtime_handle = tokio::runtime::Handle::current();
+        let init_handle = tokio::task::spawn_blocking(move || {
+            // `build_embedder` is async only because `FastEmbedder::new()` is;
+            // the heavy lifting (ONNX session init) happens in synchronous
+            // native code inside ORT, so isolating it on a blocking thread is
+            // both correct and necessary.
+            runtime_handle.block_on(build_embedder())
+        });
+
+        let init_result = tokio::time::timeout(
+            Duration::from_secs(init_timeout_secs),
+            init_handle,
+        )
+        .await;
+
+        match init_result {
+            Ok(Ok(Ok(embedder))) => {
                 install_state.install_embedder(Arc::clone(&embedder)).await;
                 tracing::info!("embedder ready — vector lane online");
-                // Issue #85: now that the embedder is ready, restore every
-                // index recorded in `indexes.toml`. We do this after embedder
-                // init so the restored indexes get a fully-wired hybrid
-                // pipeline (HNSW vectors + BM25), not a BM25-only fallback.
+                // Issue #85: restore every index recorded in `indexes.toml`
+                // now that we have a fully-wired hybrid pipeline.
                 restore_indexes(&install_state, &embedder).await;
             }
-            Err(e) => {
-                tracing::error!(
-                    "embedder failed to initialize: {e:#} — daemon will continue in BM25-only mode"
-                );
+            Ok(Ok(Err(e))) => {
+                let msg = format!("FastEmbedder init failed: {e}");
+                install_state.install_embedder_error(msg.clone()).await;
                 eprintln!(
                     "{} embedder failed to initialize: {e}\n\
                      Daemon is up but running BM25-only. Check the model cache at \
                      ~/Library/Caches/trusty-search/models/ and network access.",
+                    "✗".red()
+                );
+            }
+            Ok(Err(join_err)) => {
+                let msg = format!("embedder init task panicked: {join_err}");
+                install_state.install_embedder_error(msg).await;
+            }
+            Err(_elapsed) => {
+                // Timeout fired. The blocking init thread is intentionally
+                // leaked — we cannot safely cancel native ORT code that is
+                // already stuck. The daemon keeps serving HTTP in
+                // BM25-only mode and surfaces the error via `/health`.
+                tracing::error!(
+                    "embedder init timed out after {init_timeout_secs}s — \
+                     ONNX session did not start (try \
+                     TRUSTY_EMBEDDER_INIT_TIMEOUT_SECS=120 or check ORT \
+                     compatibility, see GitHub #121)"
+                );
+                let msg = format!("init timed out after {init_timeout_secs}s");
+                install_state.install_embedder_error(msg).await;
+                eprintln!(
+                    "{} embedder init timed out after {init_timeout_secs}s — \
+                     see GitHub #121. Daemon is up in BM25-only mode.",
                     "✗".red()
                 );
             }

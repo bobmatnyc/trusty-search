@@ -132,6 +132,22 @@ pub struct SearchAppState {
     /// thread a sender through every helper. The Arc lets `start.rs` clone
     /// it into the background task.
     pub embedder_ready_tx: Arc<watch::Sender<bool>>,
+    /// Last error message captured by the embedder background-init task, or
+    /// `None` when init is still in flight or succeeded.
+    ///
+    /// Why (issue #121): on Intel Xeon AVX-512 hosts, `ort-2.0.0-rc.12`'s
+    /// CPU session init can block forever — the daemon stays alive but every
+    /// `POST /indexes` hangs (or returns "initializing" indefinitely). With
+    /// no visible error, operators waste hours debugging. Surfacing the
+    /// init-task error here lets `/health` report `embedder: "error"` with a
+    /// human-readable message and lets `POST /indexes` fail fast with a 503
+    /// instead of dangling forever.
+    /// What: an `Arc<RwLock<Option<String>>>` set by `install_embedder_error`
+    /// when `build_embedder()` returns `Err`, or when the init task times out.
+    /// Test: `health_reports_embedder_error_when_init_fails` verifies the
+    /// `/health` response includes `embedder: "error"` and an `embedder_error`
+    /// string after the init task sets an error.
+    pub embedder_error: Arc<RwLock<Option<String>>>,
     /// Port the daemon ended up listening on. Injected into the served
     /// `index.html` as `window.__DAEMON_PORT__` so the SPA knows which host
     /// to call when opened directly. `None` falls back to 7878 in the UI.
@@ -188,6 +204,7 @@ impl SearchAppState {
             embedder_slot: Arc::new(RwLock::new(None)),
             embedder_ready: ready_rx,
             embedder_ready_tx: Arc::new(ready_tx),
+            embedder_error: Arc::new(RwLock::new(None)),
             daemon_port: None,
             openrouter_enabled: !openrouter_api_key.is_empty(),
             started_at: Instant::now(),
@@ -305,7 +322,44 @@ impl SearchAppState {
         let mut slot = self.embedder_slot.write().await;
         *slot = Some(embedder);
         drop(slot);
+        // Clear any previously recorded init error — the embedder is now ready.
+        {
+            let mut err = self.embedder_error.write().await;
+            *err = None;
+        }
         let _ = self.embedder_ready_tx.send(true);
+    }
+
+    /// Record a fatal embedder-init error so `/health` can surface it and
+    /// `POST /indexes` can fail fast with a useful message instead of hanging
+    /// on "initializing" forever.
+    ///
+    /// Why (issue #121): the background init task may abort because (a) ORT
+    /// session init returned `Err` or (b) the init-timeout fired. In either
+    /// case the embedder slot stays empty AND `embedder_ready` stays `false`;
+    /// previously this was indistinguishable from "still loading", so callers
+    /// retried forever. Capturing the error lets handlers and `/health`
+    /// distinguish "transient" from "broken".
+    /// What: writes the error message into `embedder_error`. Does NOT flip
+    /// `embedder_ready` — `is_embedder_ready()` still returns `false`, so
+    /// hybrid-pipeline code paths keep returning 503 rather than producing a
+    /// BM25-only index by accident.
+    /// Test: `install_embedder_error_surfaces_in_health` verifies the message
+    /// is visible via `/health`.
+    pub async fn install_embedder_error(&self, message: impl Into<String>) {
+        let msg = message.into();
+        tracing::error!("embedder init failed: {msg}");
+        let mut err = self.embedder_error.write().await;
+        *err = Some(msg);
+    }
+
+    /// Snapshot the current embedder-init error, if any. `None` means the
+    /// background init task is still running or completed successfully.
+    pub fn current_embedder_error(&self) -> Option<String> {
+        self.embedder_error
+            .try_read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     /// Snapshot the currently-installed embedder (post-init) or `None` when
@@ -337,6 +391,11 @@ struct HealthResponse {
     /// What: `"ready"` if `state.embedder.is_some()` else `"unavailable"`.
     /// Test: start daemon, GET /health, assert `embedder == "ready"`.
     embedder: &'static str,
+    /// Human-readable error message captured from a failed embedder-init task,
+    /// surfaced alongside `embedder == "error"` (issue #121). `None` when the
+    /// embedder is healthy or still warming up. Omitted from JSON when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedder_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -476,28 +535,35 @@ async fn health_handler(State(state): State<Arc<SearchAppState>>) -> Json<Health
     // and `uptime_secs` is wall-clock seconds since AppState construction.
     // Test: register N indexes, GET /health, assert `indexes == N` and
     // `uptime_secs >= 0`.
+    let embedder_error = state.current_embedder_error();
+    let embedder_status = if state.is_embedder_ready() {
+        "ready"
+    } else if state.embedder.is_some()
+        || state
+            .embedder_slot
+            .try_read()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    {
+        // Slot populated but readiness flag not yet flipped — treat as ready.
+        "ready"
+    } else if embedder_error.is_some() {
+        // Init task failed or timed out (issue #121). Callers must not retry
+        // forever — report a terminal error state so operators can intervene.
+        "error"
+    } else {
+        // Daemon is up but embedder still loading. Callers should retry
+        // mutating endpoints; `/health` itself always returns 200 so
+        // `trusty-search start`'s readiness probe succeeds quickly.
+        "initializing"
+    };
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         indexes: state.registry.list().len(),
         uptime_secs: state.started_at.elapsed().as_secs(),
-        embedder: if state.is_embedder_ready() {
-            "ready"
-        } else if state.embedder.is_some()
-            || state
-                .embedder_slot
-                .try_read()
-                .map(|g| g.is_some())
-                .unwrap_or(false)
-        {
-            // Slot populated but readiness flag not yet flipped — treat as ready.
-            "ready"
-        } else {
-            // Daemon is up but embedder still loading. Callers should retry
-            // mutating endpoints; `/health` itself always returns 200 so
-            // `trusty-search start`'s readiness probe succeeds quickly.
-            "initializing"
-        },
+        embedder: embedder_status,
+        embedder_error,
     })
 }
 
@@ -588,6 +654,13 @@ async fn create_index_handler(
     // retries instead of producing a BM25-only index that will quietly miss
     // the vector lane forever.
     let Some(embedder) = state.current_embedder().await else {
+        // Issue #121: distinguish "still warming up" from "init failed
+        // permanently". When the background task has recorded an error,
+        // surface it in the 503 so callers stop polling and operators see
+        // a useful message in logs / dashboards.
+        if let Some(err) = state.current_embedder_error() {
+            return embedder_error_response(&err);
+        }
         return embedder_initializing_response();
     };
     // Bug A fix: when an embedder is attached to the shared state, wire the
@@ -689,6 +762,26 @@ fn embedder_initializing_response() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "error": "embedder initializing, retry in a few seconds"
+        })),
+    )
+        .into_response()
+}
+
+/// Build a `503 Service Unavailable` response when the embedder background
+/// init task has recorded a permanent failure (issue #121).
+///
+/// Why: previously a hung/failed init left the daemon stuck in
+/// `"initializing"` forever, so retry loops in `trusty-search index` and
+/// downstream clients spun indefinitely. Returning a typed error body with
+/// the recorded message lets callers fail fast and surfaces the root cause
+/// (e.g. "init timed out after 60s") in logs and CLI output.
+/// What: returns `(503, {"error": "embedder init failed: <message>"})`.
+/// Test: `create_index_returns_503_with_error_when_embedder_failed`.
+fn embedder_error_response(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": format!("embedder init failed: {message}"),
         })),
     )
         .into_response()
@@ -1758,5 +1851,98 @@ mod tests {
             RoutingMode::Threshold(t) => assert!((t - 0.7).abs() < 1e-6),
             _ => panic!("expected Threshold"),
         }
+    }
+
+    /// Issue #121: after `install_embedder_error` records a hang/timeout,
+    /// `/health` must report `embedder: "error"` plus a human-readable
+    /// `embedder_error` field so operators don't waste hours debugging a
+    /// daemon stuck in `"initializing"`.
+    #[tokio::test]
+    async fn install_embedder_error_surfaces_in_health() {
+        use crate::core::registry::IndexRegistry;
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        state
+            .install_embedder_error("init timed out after 60s")
+            .await;
+        let state_arc = Arc::new(state);
+        let Json(resp) = health_handler(State(state_arc)).await;
+        assert_eq!(resp.embedder, "error");
+        assert_eq!(
+            resp.embedder_error.as_deref(),
+            Some("init timed out after 60s"),
+        );
+    }
+
+    /// Issue #121: when the embedder init task recorded a permanent error,
+    /// `POST /indexes` must return a 503 carrying the error message rather
+    /// than the generic "initializing" reason. Callers (CLI, MCP) rely on
+    /// the message to surface the underlying cause to operators.
+    #[tokio::test]
+    async fn create_index_returns_503_with_error_when_embedder_failed() {
+        use crate::core::registry::IndexRegistry;
+        use axum::body::to_bytes;
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        state
+            .install_embedder_error("init timed out after 60s")
+            .await;
+        let state_arc = Arc::new(state);
+        let resp = create_index_handler(
+            State(state_arc),
+            Json(CreateIndexRequest {
+                id: "demo".to_string(),
+                root_path: std::path::PathBuf::from("/tmp/demo"),
+                include_paths: None,
+                exclude_globs: None,
+                extensions: None,
+                domain_terms: None,
+                path_filter: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("valid json");
+        let err_str = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            err_str.contains("embedder init failed"),
+            "expected error message to mention init failure, got: {err_str}",
+        );
+        assert!(
+            err_str.contains("init timed out after 60s"),
+            "expected recorded timeout message to be surfaced, got: {err_str}",
+        );
+    }
+
+    /// Issue #121: after the embedder is installed successfully, a previously
+    /// recorded error must be cleared so `/health` reports `"ready"` and not
+    /// `"error"` (e.g. if a retry succeeded after a transient failure).
+    #[tokio::test]
+    async fn install_embedder_clears_previous_error() {
+        use crate::core::embed::MockEmbedder;
+        use crate::core::registry::IndexRegistry;
+
+        let state = SearchAppState::new(IndexRegistry::new());
+        state.install_embedder_error("transient hang").await;
+        // Verify the error is recorded.
+        assert!(state.current_embedder_error().is_some());
+
+        // Install a healthy embedder — the error must clear.
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(8));
+        state.install_embedder(embedder).await;
+        assert!(state.current_embedder_error().is_none());
+        assert!(state.is_embedder_ready());
+
+        let state_arc = Arc::new(state);
+        let Json(resp) = health_handler(State(state_arc)).await;
+        assert_eq!(resp.embedder, "ready");
+        assert!(resp.embedder_error.is_none());
     }
 }
