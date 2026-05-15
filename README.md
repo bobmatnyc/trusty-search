@@ -48,6 +48,8 @@ one always-on daemon, unlimited named indexes.
 
 ## Install
 
+### From crates.io (recommended)
+
 ```bash
 # CPU-only (default, all platforms incl. macOS Intel + Apple Silicon)
 cargo install trusty-search
@@ -58,6 +60,26 @@ cargo install trusty-search --features cuda
 
 On Apple Silicon the CoreML execution provider is registered automatically;
 no opt-in flag is needed.
+
+### From source
+
+> **Note:** Source builds require the `trusty-common` workspace to be checked out as a sibling directory.
+
+```bash
+git clone https://github.com/bobmatnyc/trusty-common ../trusty-common
+git clone https://github.com/bobmatnyc/trusty-search
+cd trusty-search
+cargo install --path . --locked
+```
+
+Alternatively, comment out the `[patch.crates-io]` block in `Cargo.toml` and use the published crates:
+
+```bash
+git clone https://github.com/bobmatnyc/trusty-search
+cd trusty-search
+# Edit Cargo.toml to comment out the [patch.crates-io] block
+cargo install --path . --locked
+```
 
 **System requirement:** 16 GB RAM minimum. The daemon performs a hard RAM
 check on startup.
@@ -127,6 +149,48 @@ trusty-search serve [--http <addr>]                  # MCP stdio (default) or HT
 trusty-search init [path]                            # alias for index
 trusty-search reindex [path]                         # alias for index --force
 ```
+
+## Comparison with mcp-vector-search
+
+Migrating from `mcp-vector-search`? Here's how trusty-search compares:
+
+**Performance (Apple Silicon, 1,282-chunk Rust repo):**
+- trusty-search warm query: **13–16 ms**
+- mcp-vector-search warm query: **40–85 ms** (as MCP server)
+- Cold start: trusty-search amortized (daemon always warm); mcp-vector-search CLI: **4–9 seconds per invocation**
+
+**Architecture:**
+
+| | trusty-search | mcp-vector-search |
+|---|---|---|
+| Language | Rust | Python |
+| Deployment | Machine-wide daemon | Per-project service |
+| Vector store | In-memory HNSW (usearch) | LanceDB IVF-PQ (disk) |
+| Search | BM25 + HNSW + KG, always RRF-fused | BM25, vector, or hybrid (separate tools) |
+| Query routing | Intent classifier adjusts α/β weights | Static weights |
+| MCP tools | 11 focused search tools | 28 (includes complexity, code review, KG) |
+| Admin UI | Embedded Svelte 5 | D3.js visualization |
+| Cold start penalty | Zero (pre-loaded daemon) | 4–9 s (Python + model) |
+| RAM requirement | 16 GB (hard-checked) | None enforced |
+| Concurrency | HTTP/2 + reader-priority RwLock | asyncio |
+
+**Choose trusty-search if:**
+- You want sub-20 ms warm queries with zero cold-start overhead
+- You manage multiple projects on one machine (one daemon serves all)
+- You're already using Rust/compiled tooling
+- Query-intent-aware ranking matters (Definition / Usage / Conceptual / BugDebt)
+
+**Consider mcp-vector-search if:**
+- You need complexity analysis, code review, or broader KG features
+  (complexity/quality analysis have moved to [trusty-analyzer](https://github.com/bobmatnyc/trusty-analyzer))
+- You're on a Python-first stack
+- You need the broader MCP tool surface
+
+**Migrate easily:** `trusty-search convert project|all` reads your existing
+`mcp-vector-search` configs and re-registers each project as a named index.
+
+For a detailed technical comparison, see
+[docs/research/trusty-search-vs-mcp-vector-search-2026-05-12.md](./docs/research/trusty-search-vs-mcp-vector-search-2026-05-12.md).
 
 ## MCP tools
 
