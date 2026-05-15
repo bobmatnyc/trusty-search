@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/bobmatnyc/trusty-search/actions/workflows/ci.yml/badge.svg)](https://github.com/bobmatnyc/trusty-search/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/trusty-search.svg)](https://crates.io/crates/trusty-search)
+[![License: ELv2](https://img.shields.io/badge/License-Elastic%20License%202.0-blue.svg)](./LICENSE)
 
 Machine-wide, blazingly fast hybrid code search service. One install per machine,
 one always-on daemon, unlimited named indexes.
@@ -317,4 +318,6 @@ pipeline, multi-request design, memory tuning reference, and release process.
 
 ## License
 
-MIT
+[Elastic License 2.0 (ELv2)](./LICENSE) — free for internal use; you may not
+provide trusty-search as a hosted or managed service to third parties without
+a commercial agreement. See [LICENSE](./LICENSE) for the full terms.
