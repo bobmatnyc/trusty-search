@@ -492,6 +492,7 @@ pub fn build_router(state: SearchAppState) -> Router {
         .route("/indexes/{id}/search", post(search_handler))
         .route("/indexes/{id}/search_similar", post(search_similar_handler))
         .route("/indexes/{id}/status", get(index_status_handler))
+        .route("/indexes/{id}/graph", get(graph_handler))
         .route("/indexes/{id}/index-file", post(index_file_handler))
         .route("/indexes/{id}/remove-file", post(remove_file_handler))
         .route("/indexes/{id}/reindex", post(reindex_handler))
@@ -1315,6 +1316,154 @@ async fn index_status_handler(
     })))
 }
 
+/// Optional query parameters for `GET /indexes/{id}/graph` (issue #128).
+///
+/// Why: a full KG export on a large repo can be tens of thousands of nodes;
+/// D3/Cytoscape clients usually want a filtered subgraph. These let the caller
+/// narrow the export server-side instead of shipping the whole graph.
+/// What: all fields optional; absent params apply no filter.
+/// Test: covered by `test_graph_handler_filters` in `tests/integration_tests.rs`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct GraphQueryParams {
+    /// Comma-separated node `type` values to keep (e.g. `Symbol,File`).
+    types: Option<String>,
+    /// Comma-separated `EdgeKind` display names to keep (e.g.
+    /// `CallsFunction,Implements`).
+    edge_types: Option<String>,
+    /// Minimum edge weight; edges below this are dropped.
+    min_weight: Option<f32>,
+}
+
+/// Parse a comma-separated filter param into a trimmed, lower-cased set.
+///
+/// Why: both the node-type and edge-type filters accept comma lists and are
+/// matched case-insensitively; this keeps the parsing in one place.
+/// What: returns `None` when the param is absent or empty (meaning "no
+/// filter"), otherwise the set of non-empty lower-cased tokens.
+/// Test: exercised via `graph_handler` integration tests.
+fn parse_filter_set(raw: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    let raw = raw?;
+    let set: std::collections::HashSet<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+/// Derive the D3/Cytoscape node `type` from a symbol name.
+///
+/// Why: `SymbolNode` carries no richer type metadata yet (issue #128 note), so
+/// the endpoint infers a coarse type from the name shape.
+/// What: returns `"File"` when the symbol looks like a file path (contains a
+/// `/` and has a file extension), otherwise `"Symbol"`.
+/// Test: covered indirectly by `graph_handler` integration tests.
+fn node_type_for_symbol(symbol: &str) -> &'static str {
+    let looks_like_path = symbol.contains('/')
+        && std::path::Path::new(symbol)
+            .extension()
+            .is_some_and(|e| !e.is_empty());
+    if looks_like_path {
+        "File"
+    } else {
+        "Symbol"
+    }
+}
+
+/// `GET /indexes/{id}/graph` — export the full SymbolGraph as D3/Cytoscape JSON.
+///
+/// Why: issue #128 — external visualisers (and the admin UI) need the whole
+/// knowledge graph, not just the BFS-scoped neighbours the search pipeline
+/// uses. This endpoint snapshots the graph and serialises every node and edge.
+/// What: snapshots the symbol graph (lock-free after the `Arc` clone), applies
+/// the optional `types` / `edge_types` / `min_weight` filters, and returns
+/// `{ nodes, edges, stats, generated_at }`. A 1-hour `Cache-Control` header is
+/// attached since the graph only changes on reindex.
+/// Test: covered by `test_graph_handler_*` in `tests/integration_tests.rs`.
+async fn graph_handler(
+    State(state): State<Arc<SearchAppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<GraphQueryParams>,
+) -> Result<Response, StatusCode> {
+    let index_id = IndexId::new(id);
+    let handle = state.registry.get(&index_id).ok_or(StatusCode::NOT_FOUND)?;
+    let graph = {
+        let indexer = handle.indexer.read().await;
+        indexer.snapshot_symbol_graph().await
+    };
+
+    let type_filter = parse_filter_set(params.types.as_deref());
+    let edge_filter = parse_filter_set(params.edge_types.as_deref());
+    let min_weight = params.min_weight.unwrap_or(f32::MIN);
+
+    // Build node list, tracking which symbols survive the type filter so we
+    // can drop edges that reference filtered-out endpoints.
+    let mut kept_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut nodes: Vec<serde_json::Value> = Vec::new();
+    for (symbol, chunk_id, file) in graph.all_nodes() {
+        let node_type = node_type_for_symbol(&symbol);
+        if let Some(ref filter) = type_filter {
+            if !filter.contains(&node_type.to_ascii_lowercase()) {
+                continue;
+            }
+        }
+        kept_symbols.insert(symbol.clone());
+        nodes.push(serde_json::json!({
+            "id": chunk_id,
+            "type": node_type,
+            "label": symbol,
+            "metadata": { "file": file, "symbol": symbol },
+        }));
+    }
+
+    let mut edges: Vec<serde_json::Value> = Vec::new();
+    for (source, target, kind) in graph.all_edges() {
+        // Drop edges whose endpoints were filtered out by the type filter.
+        if type_filter.is_some()
+            && (!kept_symbols.contains(&source) || !kept_symbols.contains(&target))
+        {
+            continue;
+        }
+        let kind_name = format!("{kind:?}");
+        if let Some(ref filter) = edge_filter {
+            if !filter.contains(&kind_name.to_ascii_lowercase()) {
+                continue;
+            }
+        }
+        let weight = kind.score_multiplier();
+        if weight < min_weight {
+            continue;
+        }
+        edges.push(serde_json::json!({
+            "source": source,
+            "target": target,
+            "type": kind_name,
+            "weight": weight,
+        }));
+    }
+
+    let body = serde_json::json!({
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "node_count": graph.node_count(),
+            "edge_count": graph.edge_count(),
+        },
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let mut response = Json(body).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("max-age=3600"),
+    );
+    Ok(response)
+}
+
 async fn index_file_handler(
     State(state): State<Arc<SearchAppState>>,
     Path(id): Path<String>,
@@ -1621,6 +1770,147 @@ mod tests {
         // "unavailable". "unavailable" is reserved for the post-failure
         // case where the init task explicitly errored.
         assert_eq!(resp.embedder, "initializing");
+    }
+
+    /// Issue #128 — `GET /indexes/{id}/graph` exports the full SymbolGraph.
+    /// With a registered index holding inter-calling functions, the response
+    /// must carry node/edge lists, a `stats` block, a `generated_at` stamp,
+    /// and a 1-hour `Cache-Control` header.
+    #[tokio::test]
+    async fn graph_handler_exports_nodes_and_edges() {
+        use crate::core::{
+            indexer::CodeIndexer,
+            registry::{IndexHandle, IndexId, IndexRegistry},
+        };
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let registry = IndexRegistry::new();
+        let id = IndexId::new("graph-test");
+        let indexer = CodeIndexer::new("graph-test", "/tmp/graph-test");
+        // Two functions where `caller` calls `callee` — yields one node per
+        // function and one CallsFunction edge.
+        indexer
+            .index_file(
+                "graph-test/lib.rs",
+                "fn callee() {}\nfn caller() { callee(); }\n",
+            )
+            .await
+            .expect("index_file ok");
+        registry.register(IndexHandle::bare(
+            id.clone(),
+            Arc::new(RwLock::new(indexer)),
+            "/tmp/graph-test".into(),
+        ));
+        let state = Arc::new(SearchAppState::new(registry));
+
+        let response = graph_handler(
+            State(state),
+            Path("graph-test".to_string()),
+            Query(GraphQueryParams::default()),
+        )
+        .await
+        .expect("handler ok");
+
+        // 1-hour cache header is present.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("max-age=3600"),
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+
+        let nodes = value["nodes"].as_array().expect("nodes array");
+        assert_eq!(nodes.len(), 2, "two function symbols expected");
+        for node in nodes {
+            assert_eq!(node["type"].as_str(), Some("Symbol"));
+            assert!(node["id"].is_string());
+            assert!(node["label"].is_string());
+            assert!(node["metadata"]["file"].is_string());
+        }
+
+        let edges = value["edges"].as_array().expect("edges array");
+        assert_eq!(edges.len(), 1, "one CallsFunction edge expected");
+        assert_eq!(edges[0]["source"].as_str(), Some("caller"));
+        assert_eq!(edges[0]["target"].as_str(), Some("callee"));
+        assert_eq!(edges[0]["type"].as_str(), Some("CallsFunction"));
+        assert!(edges[0]["weight"].as_f64().is_some());
+
+        assert_eq!(value["stats"]["node_count"].as_u64(), Some(2));
+        assert_eq!(value["stats"]["edge_count"].as_u64(), Some(1));
+        assert!(value["generated_at"].is_string());
+    }
+
+    /// Issue #128 — unknown index id returns 404 from `graph_handler`.
+    #[tokio::test]
+    async fn graph_handler_unknown_index_returns_404() {
+        use crate::core::registry::IndexRegistry;
+        let state = Arc::new(SearchAppState::new(IndexRegistry::new()));
+        let err = graph_handler(
+            State(state),
+            Path("does-not-exist".to_string()),
+            Query(GraphQueryParams::default()),
+        )
+        .await
+        .expect_err("missing index must 404");
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #128 — `edge_types` filter drops edges of other kinds.
+    #[tokio::test]
+    async fn graph_handler_filters_by_edge_type() {
+        use crate::core::{
+            indexer::CodeIndexer,
+            registry::{IndexHandle, IndexId, IndexRegistry},
+        };
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let registry = IndexRegistry::new();
+        let id = IndexId::new("graph-filter");
+        let indexer = CodeIndexer::new("graph-filter", "/tmp/graph-filter");
+        indexer
+            .index_file(
+                "graph-filter/lib.rs",
+                "fn callee() {}\nfn caller() { callee(); }\n",
+            )
+            .await
+            .expect("index_file ok");
+        registry.register(IndexHandle::bare(
+            id.clone(),
+            Arc::new(RwLock::new(indexer)),
+            "/tmp/graph-filter".into(),
+        ));
+        let state = Arc::new(SearchAppState::new(registry));
+
+        // Filter to Implements only — the lone CallsFunction edge must drop.
+        let response = graph_handler(
+            State(state),
+            Path("graph-filter".to_string()),
+            Query(GraphQueryParams {
+                types: None,
+                edge_types: Some("Implements".to_string()),
+                min_weight: None,
+            }),
+        )
+        .await
+        .expect("handler ok");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert!(
+            value["edges"].as_array().expect("edges").is_empty(),
+            "CallsFunction edge must be filtered out",
+        );
+        // Nodes are unaffected by an edge-type filter.
+        assert_eq!(value["nodes"].as_array().expect("nodes").len(), 2);
     }
 
     /// Issue #10 — `POST /search` fan-out: with two registered indexes each

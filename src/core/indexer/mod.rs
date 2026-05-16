@@ -584,6 +584,21 @@ impl CodeIndexer {
         self.domain_terms = terms;
     }
 
+    /// Returns a cheap `Arc` snapshot of the current symbol graph.
+    ///
+    /// Why: the `GET /indexes/{id}/graph` endpoint (issue #128) needs to read
+    /// the whole symbol graph from `src/service/server.rs`, but the
+    /// `symbol_graph` field is `pub(super)` and guarded by a lock. This exposes
+    /// a public, lock-free-after-clone accessor: it holds the read lock only
+    /// long enough to bump the `Arc` refcount, then hands the caller an
+    /// independent snapshot that won't block indexing.
+    /// What: clones the inner `Arc<SymbolGraph>` while holding the read lock.
+    /// Test: covered by the `graph_handler` integration path; the underlying
+    /// `SymbolGraph` accessors are unit-tested in `core::symbol_graph::tests`.
+    pub async fn snapshot_symbol_graph(&self) -> Arc<SymbolGraph> {
+        Arc::clone(&*self.symbol_graph.read().await)
+    }
+
     /// Attach the embedder and vector store so the full hybrid pipeline can run.
     /// Builder-style; returns `self` for chaining.
     pub fn with_components(

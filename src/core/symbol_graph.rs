@@ -439,6 +439,42 @@ impl SymbolGraph {
         self.chunk_to_symbol.get(chunk_id).map(|s| s.as_str())
     }
 
+    /// Iterate all nodes, returning `(symbol, chunk_id, file)` tuples.
+    ///
+    /// Why: the `GET /indexes/{id}/graph` endpoint (issue #128) needs to export
+    /// the entire graph as JSON, but every existing accessor is BFS-scoped to a
+    /// single seed symbol. This is the only whole-graph node enumeration.
+    /// What: clones the three string fields of every `SymbolNode` in node-index
+    /// order (petgraph's `node_weights` iteration order; stable for a built
+    /// graph).
+    /// Test: covered by `test_all_nodes_enumerates_every_symbol`.
+    pub fn all_nodes(&self) -> Vec<(String, String, String)> {
+        self.graph
+            .node_weights()
+            .map(|n| (n.symbol.clone(), n.chunk_id.clone(), n.file.clone()))
+            .collect()
+    }
+
+    /// Iterate all edges, returning `(source_symbol, target_symbol, edge_kind)`
+    /// tuples.
+    ///
+    /// Why: companion to [`Self::all_nodes`] for the issue #128 graph export —
+    /// D3/Cytoscape clients need the full edge list, not just BFS neighbours.
+    /// What: walks every edge reference, resolving both endpoints back to their
+    /// symbol names; an edge whose endpoint node is somehow missing is skipped
+    /// (defensive — should not happen on a graph built via `build_from_chunks`).
+    /// Test: covered by `test_all_edges_enumerates_every_edge`.
+    pub fn all_edges(&self) -> Vec<(String, String, EdgeKind)> {
+        self.graph
+            .edge_references()
+            .filter_map(|e| {
+                let src = self.graph.node_weight(e.source())?;
+                let tgt = self.graph.node_weight(e.target())?;
+                Some((src.symbol.clone(), tgt.symbol.clone(), e.weight().clone()))
+            })
+            .collect()
+    }
+
     /// BFS up to `hops` levels: symbols that (transitively) call `symbol`.
     /// Returns `Vec<(symbol, chunk_id)>` excluding `symbol` itself.
     pub fn callers_of(&self, symbol: &str, hops: usize) -> Vec<(String, String)> {
@@ -950,6 +986,60 @@ mod tests {
         let impls = g.neighbors_by_edge("Alpha", &[EdgeKind::Implements], 1);
         assert!(impls.iter().any(|(n, _, _)| n == "BaseAlpha"));
         assert!(impls.iter().all(|(_, _, k)| k == &EdgeKind::Implements));
+    }
+
+    #[test]
+    fn test_all_nodes_enumerates_every_symbol() {
+        // Issue #128: all_nodes must return one tuple per defining symbol.
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("main"), &["foo"]),
+            chunk("a:2", "a.rs", Some("foo"), &[]),
+            chunk("b:1", "b.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let nodes = g.all_nodes();
+        assert_eq!(nodes.len(), 3);
+        let names: HashSet<&str> = nodes.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(names.contains("main"));
+        assert!(names.contains("foo"));
+        assert!(names.contains("bar"));
+        // chunk_id + file are carried through.
+        let main = nodes.iter().find(|(s, _, _)| s == "main").unwrap();
+        assert_eq!(main.1, "a:1");
+        assert_eq!(main.2, "a.rs");
+    }
+
+    #[test]
+    fn test_all_edges_enumerates_every_edge() {
+        // Issue #128: all_edges must return one tuple per edge with both
+        // endpoints resolved to symbol names.
+        let chunks = vec![
+            chunk("a:1", "a.rs", Some("main"), &["foo", "bar"]),
+            chunk("a:2", "a.rs", Some("foo"), &["bar"]),
+            chunk("a:3", "a.rs", Some("bar"), &[]),
+        ];
+        let g = SymbolGraph::build_from_chunks(&chunks);
+        let edges = g.all_edges();
+        // main→foo, main→bar, foo→bar.
+        assert_eq!(edges.len(), 3);
+        assert!(edges
+            .iter()
+            .all(|(_, _, k)| matches!(k, EdgeKind::CallsFunction)));
+        let pairs: HashSet<(&str, &str)> = edges
+            .iter()
+            .map(|(s, t, _)| (s.as_str(), t.as_str()))
+            .collect();
+        assert!(pairs.contains(&("main", "foo")));
+        assert!(pairs.contains(&("main", "bar")));
+        assert!(pairs.contains(&("foo", "bar")));
+    }
+
+    #[test]
+    fn test_all_nodes_and_edges_empty_graph() {
+        // Issue #128: an empty graph yields empty exports, not a panic.
+        let g = SymbolGraph::new();
+        assert!(g.all_nodes().is_empty());
+        assert!(g.all_edges().is_empty());
     }
 
     #[test]
