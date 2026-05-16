@@ -221,8 +221,37 @@ impl McpServer {
                         ))
                     }
                 };
-                self.post(&format!("/indexes/{index_id}/search"), &body)
-                    .await
+                let resp = self
+                    .post(&format!("/indexes/{index_id}/search"), &body)
+                    .await?;
+                // Mirror the daemon's per-query INFO log (issue #125) so the
+                // MCP transport surfaces the same query/intent/latency line.
+                let query_text = body
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let log_intent = resp
+                    .get("intent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown");
+                let log_latency = resp
+                    .get("latency_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let log_results = resp
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                tracing::info!(
+                    index_id = %index_id,
+                    intent = %log_intent,
+                    latency_ms = log_latency,
+                    results = log_results,
+                    query = %&query_text[..query_text.len().min(80)],
+                    "search"
+                );
+                Ok(resp)
             }
             "index_file" => {
                 let index_id = require_str(args, "index_id")?;

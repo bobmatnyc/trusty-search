@@ -847,6 +847,14 @@ async fn search_handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let latency_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(
+        index_id = %index_id,
+        intent = %format!("{intent:?}"),
+        latency_ms = latency_ms,
+        results = results.len(),
+        query = %&query.text[..query.text.len().min(80)],
+        "search"
+    );
     Ok(Json(serde_json::json!({
         "results": results,
         "intent": format!("{:?}", intent),
