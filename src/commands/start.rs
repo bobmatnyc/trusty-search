@@ -498,17 +498,20 @@ pub async fn handle_start(port: u16, foreground: bool, device: &str) -> Result<(
         Err(crate::service::DaemonError::AlreadyRunning(p)) => {
             // `acquire_lock` returns AlreadyRunning only after confirming the
             // recorded PID is alive (it removes stale lockfiles automatically).
-            // Exit 0 so launchd does not treat this as a crash and re-spawn.
-            tracing::info!(
-                "daemon already running (lock at {}), exiting cleanly",
+            //
+            // Issue #126: launchd respawns `start` every ~30 s while the
+            // daemon is up (KeepAlive + SuccessfulExit=false). The previous
+            // exit(0) here meant launchd treated every respawn as a clean
+            // run and immediately tried again, flooding stderr.log. Exit
+            // non-zero instead — `SuccessfulExit=false` only restarts on
+            // exit 0, so a non-zero exit stops the respawn loop. Suppress
+            // the stderr message entirely (demote to debug) so it does not
+            // accumulate in the launchd log.
+            tracing::debug!(
+                "daemon already running (lock at {}), exiting non-zero to stop launchd respawn",
                 p.display()
             );
-            eprintln!(
-                "{} trusty-search daemon already running (lock at {}); nothing to do",
-                "✓".green(),
-                p.display()
-            );
-            return Ok(());
+            std::process::exit(1);
         }
         Err(e) => anyhow::bail!("daemon failed: {e}"),
     }
