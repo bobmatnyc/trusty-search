@@ -317,6 +317,38 @@ pub async fn check_port_reachable(port: u16) -> CheckResult {
     }
 }
 
+/// Check whether `stderr.log` rotation is configured (issue #127).
+///
+/// Why: launchd writes the daemon's stderr to
+/// `~/Library/Logs/trusty-search/stderr.log` and never truncates it, so the
+/// file grows unbounded. `doctor --fix` can install a newsyslog config + a
+/// daily LaunchAgent that caps it at 1 MB × 7 archives; this check tells the
+/// operator whether that is already in place.
+/// What: on macOS, returns Ok when a rotation config exists, Warn otherwise.
+/// On other platforms returns Ok with a "not applicable" note — Linux service
+/// managers (systemd/journald) handle log rotation themselves.
+/// Test: `cargo test --workspace` — exercised by the doctor integration tests.
+pub fn check_log_rotation() -> CheckResult {
+    #[cfg(target_os = "macos")]
+    {
+        if super::log_rotation::rotation_configured() {
+            CheckResult::Ok("Log rotation configured for stderr.log (1 MB × 7 archives)".into())
+        } else {
+            CheckResult::Warn(
+                "stderr.log has no rotation policy — it will grow unbounded; \
+                 run `trusty-search doctor --fix` to install one"
+                    .into(),
+            )
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CheckResult::Ok(
+            "Log rotation: handled by the platform service manager (systemd/journald)".into(),
+        )
+    }
+}
+
 /// Remove a stale lock file and report the outcome.
 pub fn fix_stale_lock(data_dir: &std::path::Path) {
     let lock_path = data_dir.join("daemon.lock");

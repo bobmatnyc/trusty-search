@@ -215,6 +215,21 @@ fn service_install() -> Result<()> {
         LAUNCHD_LABEL,
         domain
     );
+
+    // Issue #127: install log rotation for the launchd-managed stderr.log so
+    // it never grows unbounded. Non-fatal — a failure here still leaves a
+    // working service; `trusty-search doctor --fix` can install it later.
+    match crate::commands::log_rotation::install_rotation() {
+        Ok(()) => println!(
+            "{} Installed stderr.log rotation (1 MB × 7 archives, daily check)",
+            "✓".green()
+        ),
+        Err(e) => eprintln!(
+            "{} Could not install log rotation ({e}) — run `trusty-search doctor --fix` later",
+            "⚠".yellow()
+        ),
+    }
+
     println!(
         "  Logs:    {}\n  Status:  {}",
         log_dir.display().to_string().dimmed(),
@@ -240,6 +255,21 @@ fn service_uninstall() -> Result<()> {
             "✓".green(),
             plist_path.display()
         );
+
+        // Issue #127: also tear down the log-rotation LaunchAgent + config so
+        // an uninstall leaves no orphaned launchd job behind.
+        if let Ok(rot_plist) = crate::commands::log_rotation::rotation_plist_path() {
+            if rot_plist.exists() {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["bootout", &domain])
+                    .arg(&rot_plist)
+                    .status();
+                let _ = std::fs::remove_file(&rot_plist);
+            }
+        }
+        if let Ok(conf) = crate::commands::log_rotation::newsyslog_conf_path() {
+            let _ = std::fs::remove_file(&conf);
+        }
     } else {
         println!(
             "{} {} not installed — nothing to do",

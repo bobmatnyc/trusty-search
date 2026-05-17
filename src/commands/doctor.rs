@@ -109,9 +109,60 @@ async fn apply_fixes(checks: &[CheckResult], empty_indexes: &[EmptyIndex]) {
     if has_model_warn {
         if !fixed_any {
             println!("\nFixing issues...");
+            fixed_any = true;
         }
         println!(
             "  {} Model downloads automatically on `trusty-search start` — no manual action needed",
+            "·".dimmed()
+        );
+    }
+
+    // Fix 4: stderr.log has no rotation policy — install one (issue #127).
+    let has_rotation_warn = checks.iter().any(|c| {
+        matches!(c, CheckResult::Warn(msg) if msg.contains("no rotation policy"))
+    });
+    if has_rotation_warn {
+        if !fixed_any {
+            println!("\nFixing issues...");
+        }
+        fix_log_rotation();
+    }
+}
+
+/// Install the newsyslog config + daily rotation LaunchAgent for `stderr.log`.
+///
+/// Why: the doctor's log-rotation check warns when the launchd-managed
+/// `stderr.log` has no size cap; `--fix` repairs it without requiring sudo by
+/// installing a user-level newsyslog config and a `LaunchAgent` that runs
+/// `newsyslog` daily (see `commands::log_rotation`).
+/// What: on macOS, calls `install_rotation()` and reports success/failure.
+/// On other platforms it is a no-op (the rotation check is always Ok there).
+/// Test: `trusty-search doctor --fix` on macOS prints the install confirmation
+/// and a follow-up `doctor` reports the rotation check as OK.
+fn fix_log_rotation() {
+    #[cfg(target_os = "macos")]
+    {
+        match crate::commands::log_rotation::install_rotation() {
+            Ok(()) => {
+                let conf = crate::commands::log_rotation::newsyslog_conf_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                println!(
+                    "  {} Installed log rotation for stderr.log (1 MB × 7 archives, daily check)",
+                    "✓".green()
+                );
+                println!("    {} {}", "·".dimmed(), conf.dimmed());
+            }
+            Err(e) => println!(
+                "  {} Could not install log rotation: {e}",
+                "✗".red()
+            ),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!(
+            "  {} Log rotation is managed by the platform service manager — nothing to do",
             "·".dimmed()
         );
     }

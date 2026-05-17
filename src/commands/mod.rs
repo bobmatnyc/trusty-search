@@ -23,6 +23,7 @@ pub mod doctor_checks;
 pub(crate) mod doctor_pipeline;
 pub mod format;
 pub mod index_resolve;
+pub mod log_rotation;
 pub mod reindex_engine;
 
 // Per-subcommand handlers

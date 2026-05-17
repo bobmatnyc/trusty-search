@@ -16,9 +16,10 @@
 
 use super::daemon_utils::daemon_base_url;
 use super::doctor_checks::{
-    check_daemon_running, check_data_dir, check_lock_file, check_model_cache, check_port_reachable,
-    doctor_data_dir, fetch_index_names, fetch_index_statuses, print_index_breakdown,
-    probe_daemon_health, read_daemon_port, summarize_indexes, CheckResult, EmptyIndex,
+    check_daemon_running, check_data_dir, check_lock_file, check_log_rotation, check_model_cache,
+    check_port_reachable, doctor_data_dir, fetch_index_names, fetch_index_statuses,
+    print_index_breakdown, probe_daemon_health, read_daemon_port, summarize_indexes, CheckResult,
+    EmptyIndex,
 };
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -191,6 +192,19 @@ impl DoctorCheck for PortReachableCheck {
     }
 }
 
+pub(crate) struct LogRotationCheck;
+
+#[async_trait]
+impl DoctorCheck for LogRotationCheck {
+    fn name(&self) -> &str {
+        "log_rotation"
+    }
+
+    async fn run(&self, _state: &DoctorState) -> Vec<CheckResult> {
+        vec![check_log_rotation()]
+    }
+}
+
 // ── Orchestrator ──────────────────────────────────────────────────────────
 
 fn default_checks() -> Vec<Box<dyn DoctorCheck>> {
@@ -201,6 +215,7 @@ fn default_checks() -> Vec<Box<dyn DoctorCheck>> {
         Box::new(LockFileCheck),
         Box::new(IndexesCheck),
         Box::new(PortReachableCheck),
+        Box::new(LogRotationCheck),
     ]
 }
 
