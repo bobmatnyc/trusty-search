@@ -93,6 +93,17 @@ pub const SKIP_DIRS: &[&str] = &[
     ".aider",
     ".continue",
     ".obsidian",
+    // Test fixtures / static test data — SQL dumps, sample payloads, golden
+    // files. High-volume, machine-shaped data that bloats the index without
+    // adding source-code signal. Matched on basename only, so `src/test/
+    // resources` stays indexed (we don't skip bare `resources`).
+    "fixtures",
+    "__fixtures__",
+    "testdata",
+    "test-data",
+    "test_data",
+    "testresources",
+    "test_resources",
 ];
 
 /// File names (full basename) to skip unconditionally.
@@ -576,6 +587,100 @@ mod tests {
         assert!(
             !names.contains(&"vendored.py".to_string()),
             "files inside cdk.out / .aws-sam / .turbo / .mvn must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_walker_skips_fixture_and_test_data_dirs() {
+        // Issue #130: test fixtures / static test data must be pruned by
+        // default — SQL dumps and sample payloads bloat the index.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in [
+            "fixtures",
+            "__fixtures__",
+            "testdata",
+            "test-data",
+            "test_data",
+            "testresources",
+            "test_resources",
+        ] {
+            let d = root.join(dir);
+            fs::create_dir_all(&d).unwrap();
+            // .sql is already excluded by the SOURCE_EXTS allowlist; use a
+            // source extension to prove the directory itself is pruned.
+            fs::write(d.join("sample.py"), "x = 1").unwrap();
+        }
+        // Basename matching keeps src/test/resources indexed (no bare
+        // `resources` entry), so a file there must survive the walk.
+        let kept_resources = root.join("src/test/resources");
+        fs::create_dir_all(&kept_resources).unwrap();
+        fs::write(kept_resources.join("config.py"), "y = 2").unwrap();
+        fs::write(root.join("handler.py"), "def handler(): pass").unwrap();
+
+        let result = walk_source_files(root);
+        let names: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"handler.py".to_string()),
+            "real source must be kept"
+        );
+        assert!(
+            names.contains(&"config.py".to_string()),
+            "src/test/resources must stay indexed (basename `resources` not skipped)"
+        );
+        assert!(
+            !names.contains(&"sample.py".to_string()),
+            "files inside fixture / test-data dirs must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_skip_dirs_contains_fixture_entries() {
+        // Issue #130 acceptance: fixture / test-data dirs are default exclusions.
+        for required in [
+            "fixtures",
+            "__fixtures__",
+            "testdata",
+            "test-data",
+            "test_data",
+            "testresources",
+            "test_resources",
+        ] {
+            assert!(
+                SKIP_DIRS.contains(&required),
+                "SKIP_DIRS missing required fixture entry: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_extension_excluded_by_allowlist() {
+        // Issue #130: .sql files carry no source-code signal. They are
+        // excluded by the SOURCE_EXTS allowlist — `sql` is intentionally
+        // absent — so no explicit SKIP_FILES / extension entry is needed.
+        assert!(
+            !SOURCE_EXTS.iter().any(|e| e.eq_ignore_ascii_case("sql")),
+            "`sql` must not be in SOURCE_EXTS — SQL is excluded by the allowlist"
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("schema.sql"), "CREATE TABLE t (id INT);").unwrap();
+        fs::write(root.join("real.rs"), "fn main() {}").unwrap();
+
+        let result = walk_source_files(root);
+        let names: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"real.rs".to_string()));
+        assert!(
+            !names.contains(&"schema.sql".to_string()),
+            ".sql files must be excluded by the SOURCE_EXTS allowlist"
         );
     }
 
