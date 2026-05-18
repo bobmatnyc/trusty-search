@@ -36,6 +36,8 @@ pub const SOURCE_EXTS: &[&str] = &[
 ///
 /// Java/Gradle and JS/TS build outputs are aggressively pruned — these directories
 /// contain machine-generated code that bloats the index without adding signal.
+/// AWS CDK / SAM synth output (`cdk.out`, `.aws-sam`) is especially noisy: each
+/// Lambda asset is a full copy of a Python venv with vendored dependencies.
 pub const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -65,6 +67,7 @@ pub const SKIP_DIRS: &[&str] = &[
     ".ruff_cache",
     // Java / Gradle / Maven build artefacts
     ".gradle",
+    ".mvn",
     ".m2",
     "out",
     "bin",
@@ -72,6 +75,13 @@ pub const SKIP_DIRS: &[&str] = &[
     "generated",
     "generated-sources",
     "generated-test-sources",
+    // AWS CDK / SAM synthesized deployment bundles — contain full copies of
+    // Python venvs and vendored third-party packages, pure build artefacts.
+    "cdk.out",
+    "cdk.out2",
+    ".aws-sam",
+    // Monorepo task-runner caches
+    ".turbo",
     // IDE / metadata
     ".idea",
     ".vscode",
@@ -191,6 +201,24 @@ pub fn should_skip_path(path: &Path) -> bool {
     }
 
     false
+}
+
+/// Return `true` when any path component of `path` is an excluded directory
+/// name from [`SKIP_DIRS`].
+///
+/// Why: the recursive walker prunes excluded subtrees before descending, but
+/// the [`crate::service::watch_loop`] FileWatcher receives raw per-file events
+/// and never walks. Without this check a file modified inside `cdk.out/` (or
+/// any other build-artefact dir) would still be indexed incrementally,
+/// undoing the exclusion that the initial reindex honoured.
+/// What: scans every component of `path` against [`SKIP_DIRS`].
+/// Test: see `test_path_in_skipped_dir` below.
+pub fn path_in_skipped_dir(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|name| SKIP_DIRS.contains(&name))
+    })
 }
 
 /// Return `true` when the *contents* of a JS file look minified even though
@@ -523,6 +551,63 @@ mod tests {
     }
 
     #[test]
+    fn test_walker_skips_cdk_and_sam_dirs() {
+        // Issue #129: AWS CDK / SAM synth output must be pruned by default.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for dir in ["cdk.out", "cdk.out2", ".aws-sam", ".turbo", ".mvn"] {
+            // Nest a file deep inside, mimicking a synthesized Lambda venv.
+            let d = root.join(dir).join("asset.abc123/python/lib");
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("vendored.py"), "import boto3").unwrap();
+        }
+        fs::write(root.join("handler.py"), "def handler(): pass").unwrap();
+
+        let result = walk_source_files(root);
+        let names: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"handler.py".to_string()),
+            "real source must be kept"
+        );
+        assert!(
+            !names.contains(&"vendored.py".to_string()),
+            "files inside cdk.out / .aws-sam / .turbo / .mvn must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_skip_dirs_contains_build_artifact_entries() {
+        // Issue #129 acceptance: AWS CDK / SAM and common build dirs must be
+        // default exclusions (no per-project .trusty-search-ignore needed).
+        for required in [
+            "cdk.out",
+            "cdk.out2",
+            ".aws-sam",
+            ".turbo",
+            ".mvn",
+            ".gradle",
+            "node_modules",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".next",
+            "dist",
+            "build",
+            "target",
+            "vendor",
+        ] {
+            assert!(
+                SKIP_DIRS.contains(&required),
+                "SKIP_DIRS missing required build-artifact entry: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn test_skip_dirs_contains_required_entries() {
         // Issue #12 acceptance: these directory names must be in the skip list.
         for required in [
@@ -548,6 +633,22 @@ mod tests {
                 "SKIP_DIRS missing required entry: {required}"
             );
         }
+    }
+
+    #[test]
+    fn test_path_in_skipped_dir() {
+        // Issue #129: per-file watcher events must respect SKIP_DIRS.
+        assert!(path_in_skipped_dir(Path::new(
+            "project/cdk.out/asset.abc/python/handler.py"
+        )));
+        assert!(path_in_skipped_dir(Path::new(".aws-sam/build/app.py")));
+        assert!(path_in_skipped_dir(Path::new(
+            "repo/node_modules/lodash/x.js"
+        )));
+        assert!(path_in_skipped_dir(Path::new("repo/.turbo/cache/x.js")));
+        // Normal source paths are not flagged.
+        assert!(!path_in_skipped_dir(Path::new("src/handler.py")));
+        assert!(!path_in_skipped_dir(Path::new("project/src/main.rs")));
     }
 
     #[test]

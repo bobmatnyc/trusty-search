@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::service::indexed_files::IndexedFiles;
+use crate::service::walker::{path_in_skipped_dir, should_skip_path};
 use crate::service::watcher::{FileWatcher, WatchEvent};
 
 /// Handle for a running watch loop. Drop it to stop watching and join the
@@ -74,6 +75,14 @@ async fn handle_modified(
 ) {
     // Skip directories — the watcher fires on parent mtime updates too.
     if path.is_dir() {
+        return;
+    }
+
+    // Apply the same exclusions as the recursive walker: a file modified
+    // inside an excluded subtree (e.g. `cdk.out/`, `node_modules/`) or a
+    // minified/binary/large file must not enter the index incrementally.
+    if path_in_skipped_dir(path) || should_skip_path(path) {
+        tracing::debug!(?path, "skip excluded file");
         return;
     }
 
@@ -168,6 +177,51 @@ mod tests {
         assert!(
             tracker.len().await >= 1,
             "expected at least one tracked file"
+        );
+    }
+
+    /// Issue #129: a file created inside `cdk.out/` must NOT be indexed by the
+    /// watcher — the build-artefact subtree exclusion applies incrementally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cdk_out_file_is_not_indexed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let indexer = Arc::new(RwLock::new(CodeIndexer::new("test", dir.path())));
+        let tracker = IndexedFiles::new();
+
+        let _task = spawn_watch_loop(dir.path(), Arc::clone(&indexer), tracker.clone())
+            .expect("watch loop starts");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Write a real source file and a build-artefact file.
+        let cdk_dir = dir.path().join("cdk.out/asset.abc/python");
+        tokio::fs::create_dir_all(&cdk_dir).await.expect("mkdir");
+        tokio::fs::write(cdk_dir.join("vendored.py"), "import boto3\n")
+            .await
+            .expect("write vendored");
+        tokio::fs::write(dir.path().join("handler.py"), "def handler(): pass\n")
+            .await
+            .expect("write handler");
+
+        // Poll for the real file to be picked up.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if indexer.read().await.chunk_count() > 0 {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("real source was never indexed");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Give the watcher a moment to (not) process the cdk.out file.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Only handler.py should be tracked; vendored.py must be excluded.
+        let tracked = tracker.len().await;
+        assert_eq!(
+            tracked, 1,
+            "exactly one file (handler.py) should be tracked, got {tracked}"
         );
     }
 }
