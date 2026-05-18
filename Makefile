@@ -66,7 +66,8 @@ patch:
 	cargo set-version --bump patch
 	@VERSION=$$(cargo metadata --no-deps --format-version 1 \
 	  | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])") && \
-	git add Cargo.toml Cargo.lock && \
+	sed -i '' "s/version != [0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/version != $$VERSION/" .claude/commands/health.md && \
+	git add Cargo.toml Cargo.lock .claude/commands/health.md && \
 	COMMIT_MSG="chore(release): bump trusty-search to v$$VERSION"; \
 	if [ -n "$(CLOSES)" ]; then COMMIT_MSG="$$COMMIT_MSG (closes #$(CLOSES))"; fi; \
 	git commit -m "$$COMMIT_MSG" && \
