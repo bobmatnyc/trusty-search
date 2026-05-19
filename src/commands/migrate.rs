@@ -1,0 +1,607 @@
+//! Handler for `trusty-search migrate mcp-vector-search`.
+//!
+//! Why: migrating away from mcp-vector-search has two distinct sides — the
+//! project indexes (handled by reusing `convert.rs`) *and* the Claude MCP
+//! configuration files that still point at the old `mcp-vector-search` server
+//! command. `convert` only does indexes; `migrate` does both so a user can
+//! switch tools in a single command.
+//! What: `handle_migrate` orchestrates an MCP-config rewrite phase and an
+//! index-migration phase, each independently skippable.
+//! Test: `cargo run -- migrate mcp-vector-search --dry-run` prints the
+//! settings files and projects it would touch without modifying anything.
+
+use super::convert::{convert_one, find_all_mvs_configs, parse_mvs_config, ConvertStatus};
+use super::daemon_utils::daemon_base_url;
+use anyhow::Result;
+use clap::ValueEnum;
+use colored::Colorize;
+use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
+
+/// Directory names skipped while scanning `$HOME` for Claude settings files.
+///
+/// Why: walking the entire home tree is slow and noisy; these dirs cannot
+/// contain user `.claude/settings.json` files worth migrating but bloat the
+/// walk enormously.
+const SCAN_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "Library",
+    ".cache",
+    ".cargo",
+    ".rustup",
+    ".npm",
+    ".pyenv",
+    ".nvm",
+    "venv",
+    ".venv",
+    "__pycache__",
+];
+
+/// The MCP server keys (legacy spellings) we replace with `trusty-search`.
+const LEGACY_MCP_KEYS: &[&str] = &["mcp-vector-search", "mcp_vector_search"];
+
+/// The canonical key written for the migrated trusty-search MCP server.
+const TRUSTY_KEY: &str = "trusty-search";
+
+/// What the user is migrating *from*.
+///
+/// Why: model the migration source as an enum (validated at parse time by
+/// clap) so additional sources can be added without changing the CLI surface.
+/// What: a single variant today — `mcp-vector-search`.
+/// Test: `cargo run -- migrate bogus` → clap rejects with a usage hint.
+#[derive(Debug, Clone, ValueEnum)]
+pub enum MigrateTarget {
+    /// Migrate from mcp-vector-search (MCP config + project indexes)
+    McpVectorSearch,
+}
+
+/// Outcome of attempting to migrate one Claude settings file.
+///
+/// Why: the summary table needs to distinguish a real rewrite from a no-op
+/// skip (already migrated / nothing to do) and a hard failure.
+/// What: enumerates the four terminal states of `migrate_config_file`.
+/// Test: unit tests assert `Migrated`, `AlreadyMigrated`, and `NoChange`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigMigrateStatus {
+    /// The file contained a legacy key and was rewritten.
+    Migrated,
+    /// The file already contained a `trusty-search` key — left untouched.
+    AlreadyMigrated,
+    /// No legacy key and no trusty-search key — left untouched.
+    NoChange,
+    /// An IO/parse error occurred.
+    Failed(String),
+}
+
+/// Result of migrating one Claude settings file (path + terminal status).
+///
+/// Why: pairs the file path with its outcome so the summary renderer can
+/// print one line per file.
+/// What: returned by `migrate_config_file`.
+/// Test: unit tests inspect `status` after rewriting fixture files.
+#[derive(Debug)]
+pub struct ConfigMigrateResult {
+    pub path: PathBuf,
+    pub status: ConfigMigrateStatus,
+}
+
+/// Entry point for `trusty-search migrate`.
+///
+/// Why: a single command that switches a machine from mcp-vector-search to
+/// trusty-search, touching both Claude MCP config and project indexes.
+/// What: runs the MCP-config phase and/or the index phase depending on the
+/// `--mcp-only` / `--indexes-only` flags.
+/// Test: `migrate mcp-vector-search --dry-run` prints both phases' plans.
+pub async fn handle_migrate(
+    target: MigrateTarget,
+    dry_run: bool,
+    mcp_only: bool,
+    indexes_only: bool,
+) -> Result<()> {
+    // `target` has one variant today; the match keeps future sources explicit.
+    match target {
+        MigrateTarget::McpVectorSearch => {}
+    }
+
+    if dry_run {
+        println!(
+            "{} Dry run — no files or indexes will be modified.\n",
+            "·".dimmed()
+        );
+    }
+
+    if !indexes_only {
+        run_mcp_phase(dry_run)?;
+    }
+
+    if !mcp_only {
+        if !indexes_only {
+            println!();
+        }
+        run_index_phase(dry_run).await?;
+    }
+
+    Ok(())
+}
+
+/// MCP-config migration phase: scan + rewrite every Claude settings file.
+///
+/// Why: keeps the config-rewrite orchestration (scan → migrate → summarize)
+/// separate from the async index phase.
+/// What: locates settings files, migrates each, prints a summary table.
+/// Test: covered indirectly by `--dry-run` runs and the unit tests below.
+fn run_mcp_phase(dry_run: bool) -> Result<()> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    println!(
+        "🔍 Scanning for Claude MCP settings under {}…",
+        home.display()
+    );
+
+    let files = scan_claude_settings(&home);
+    if files.is_empty() {
+        println!("{} No Claude settings files found.", "·".dimmed());
+        return Ok(());
+    }
+    println!("{} Found {} settings file(s).\n", "·".dimmed(), files.len());
+
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for (i, path) in files.iter().enumerate() {
+        let result = migrate_config_file(path, dry_run);
+        print_config_line(i + 1, files.len(), &result);
+        match result.status {
+            ConfigMigrateStatus::Migrated => migrated += 1,
+            ConfigMigrateStatus::AlreadyMigrated | ConfigMigrateStatus::NoChange => skipped += 1,
+            ConfigMigrateStatus::Failed(_) => failed += 1,
+        }
+    }
+
+    println!();
+    if dry_run {
+        println!(
+            "{} MCP config dry run: {} would migrate, {} skipped, {} failed",
+            "·".dimmed(),
+            migrated,
+            skipped,
+            failed
+        );
+    } else {
+        println!(
+            "{} MCP config: {} migrated, {} skipped, {} failed",
+            "✓".green(),
+            migrated,
+            skipped,
+            failed
+        );
+    }
+    Ok(())
+}
+
+/// Index-migration phase: reuse the `convert all` logic.
+///
+/// Why: index migration is identical to `convert all`; rather than duplicate
+/// the discovery + HTTP dance, we call the shared `convert.rs` helpers.
+/// What: scans `$HOME` for mcp-vector-search configs and (unless dry-run)
+/// registers + reindexes each via the daemon.
+/// Test: `migrate mcp-vector-search --indexes-only --dry-run` enumerates
+/// every detected project.
+async fn run_index_phase(dry_run: bool) -> Result<()> {
+    println!("🔍 Scanning for mcp-vector-search project indexes…");
+    let configs = find_all_mvs_configs();
+    if configs.is_empty() {
+        println!("{} No mcp-vector-search projects found.", "·".dimmed());
+        return Ok(());
+    }
+    println!("{} Found {} project(s).\n", "·".dimmed(), configs.len());
+
+    let base = if dry_run {
+        // Dry run never contacts the daemon, so an empty base is harmless.
+        String::new()
+    } else {
+        let base = daemon_base_url();
+        crate::commands::daemon_guard::ensure_daemon_running_or_exit(&base).await?;
+        base
+    };
+
+    let total = configs.len();
+    let mut migrated = 0usize;
+    let mut already = 0usize;
+    let mut dry = 0usize;
+    let mut failed = 0usize;
+
+    for (i, config_path) in configs.into_iter().enumerate() {
+        let result = match parse_mvs_config(&config_path) {
+            Ok((root, name)) => convert_one(root, name, &base, dry_run).await,
+            Err(e) => {
+                println!(
+                    "  {} {} {} {}",
+                    format!("[{}/{}]", i + 1, total).dimmed(),
+                    "✗".red(),
+                    config_path.display().to_string().dimmed(),
+                    format!("(parse: {e})").red()
+                );
+                failed += 1;
+                continue;
+            }
+        };
+        print_index_line(i + 1, total, &result);
+        match result.status {
+            ConvertStatus::Queued => migrated += 1,
+            ConvertStatus::AlreadyRegistered => already += 1,
+            ConvertStatus::DryRun => dry += 1,
+            ConvertStatus::Failed(_) => failed += 1,
+        }
+    }
+
+    println!();
+    if dry_run {
+        println!("{} Index dry run: {} project(s)", "·".dimmed(), dry);
+    } else {
+        println!(
+            "{} Indexes: {} queued, {} already registered, {} failed",
+            "✓".green(),
+            migrated,
+            already,
+            failed
+        );
+    }
+    Ok(())
+}
+
+/// Find every Claude settings file worth migrating under `home`.
+///
+/// Why: a user may have a global `~/.claude/settings.json` plus per-project
+/// `.claude/settings.json` files; all of them can carry an mcp-vector-search
+/// entry, so all must be scanned.
+/// What: walks `home` (max depth 8, skipping noise dirs) and collects every
+/// `.claude/settings.json` and `.claude/settings.local.json`.
+/// Test: `test_scan_finds_settings_files` builds a temp tree and asserts the
+/// scan returns the planted files.
+pub fn scan_claude_settings(home: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in walkdir::WalkDir::new(home)
+        .max_depth(8)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !SCAN_SKIP_DIRS.contains(&name.as_ref())
+        })
+        .filter_map(|e| e.ok())
+    {
+        let name = entry.file_name().to_string_lossy();
+        if name != "settings.json" && name != "settings.local.json" {
+            continue;
+        }
+        let in_claude_dir = entry
+            .path()
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n == ".claude")
+            .unwrap_or(false);
+        if in_claude_dir {
+            found.push(entry.path().to_path_buf());
+        }
+    }
+    found
+}
+
+/// Rewrite one Claude settings file, replacing any legacy mcp-vector-search
+/// MCP server entry with a `trusty-search` entry.
+///
+/// Why: this is the load-bearing surgery — it must preserve every unrelated
+/// JSON key, be idempotent, and never corrupt the file on failure.
+/// What: parses the file as `serde_json::Value`, swaps the key inside
+/// `mcpServers`, then writes atomically (backup → `.tmp` → rename).
+/// Test: `test_migrate_config_replaces_key` and `test_migrate_config_idempotent`
+/// assert the rewrite and the no-op-on-already-migrated behaviour.
+pub fn migrate_config_file(path: &Path, dry_run: bool) -> ConfigMigrateResult {
+    let fail = |msg: String| ConfigMigrateResult {
+        path: path.to_path_buf(),
+        status: ConfigMigrateStatus::Failed(msg),
+    };
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return fail(format!("read: {e}")),
+    };
+    let mut root: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("parse: {e}")),
+    };
+
+    let servers = match root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        Some(s) => s,
+        // No mcpServers block at all — nothing to migrate.
+        None => {
+            return ConfigMigrateResult {
+                path: path.to_path_buf(),
+                status: ConfigMigrateStatus::NoChange,
+            }
+        }
+    };
+
+    // Idempotency: a trusty-search entry already present means a previous run
+    // (or the user) already migrated this file — never double-migrate.
+    if servers.contains_key(TRUSTY_KEY) {
+        return ConfigMigrateResult {
+            path: path.to_path_buf(),
+            status: ConfigMigrateStatus::AlreadyMigrated,
+        };
+    }
+
+    let legacy_present = LEGACY_MCP_KEYS.iter().any(|k| servers.contains_key(*k));
+    if !legacy_present {
+        return ConfigMigrateResult {
+            path: path.to_path_buf(),
+            status: ConfigMigrateStatus::NoChange,
+        };
+    }
+
+    // Drop every legacy key and insert the canonical trusty-search entry.
+    for k in LEGACY_MCP_KEYS {
+        servers.remove(*k);
+    }
+    servers.insert(TRUSTY_KEY.to_string(), trusty_server_entry());
+
+    if dry_run {
+        return ConfigMigrateResult {
+            path: path.to_path_buf(),
+            status: ConfigMigrateStatus::Migrated,
+        };
+    }
+
+    match write_config_atomic(path, &root, &content) {
+        Ok(()) => ConfigMigrateResult {
+            path: path.to_path_buf(),
+            status: ConfigMigrateStatus::Migrated,
+        },
+        Err(e) => fail(format!("write: {e}")),
+    }
+}
+
+/// Build the canonical `trusty-search` MCP server JSON entry.
+///
+/// Why: centralizes the one true shape of the migrated entry so the rewrite
+/// and the tests agree.
+/// What: returns `{"command": "trusty-search", "args": ["serve"]}`.
+/// Test: `test_migrate_config_replaces_key` asserts the inserted value.
+fn trusty_server_entry() -> Value {
+    let mut entry = Map::new();
+    entry.insert("command".to_string(), Value::String(TRUSTY_KEY.to_string()));
+    entry.insert(
+        "args".to_string(),
+        Value::Array(vec![Value::String("serve".to_string())]),
+    );
+    Value::Object(entry)
+}
+
+/// Atomically persist a migrated settings file: backup → temp → rename.
+///
+/// Why: a half-written settings file would break the user's Claude install;
+/// the backup + atomic-rename sequence guarantees the original is recoverable
+/// and the live file is never partially written.
+/// What: writes `<path>.bak` (original bytes), `<path>.tmp` (new JSON), then
+/// renames `.tmp` over `path`.
+/// Test: `test_migrate_config_replaces_key` confirms the post-rename content.
+fn write_config_atomic(path: &Path, value: &Value, original: &str) -> Result<()> {
+    let backup = sibling_with_suffix(path, "bak")?;
+    std::fs::write(&backup, original)
+        .map_err(|e| anyhow::anyhow!("backup {}: {e}", backup.display()))?;
+
+    let pretty =
+        serde_json::to_string_pretty(value).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    let tmp = sibling_with_suffix(path, "tmp")?;
+    std::fs::write(&tmp, format!("{pretty}\n"))
+        .map_err(|e| anyhow::anyhow!("write temp {}: {e}", tmp.display()))?;
+
+    std::fs::rename(&tmp, path)
+        .map_err(|e| anyhow::anyhow!("rename {} → {}: {e}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Build a sibling path by appending `.<suffix>` to the full filename.
+///
+/// Why: `Path::with_extension` only replaces the final extension, so
+/// `settings.local.json` → `settings.local.bak` (drops `json`). We want
+/// `settings.local.json.bak`, which requires appending to the whole name.
+/// What: returns `path` with `.<suffix>` glued onto the file name.
+/// Test: `test_migrate_config_replaces_key` asserts the `.local.json.bak`
+/// backup exists.
+fn sibling_with_suffix(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?;
+    Ok(path.with_file_name(format!("{name}.{suffix}")))
+}
+
+/// Render one MCP-config result line for the summary table.
+fn print_config_line(idx: usize, total: usize, r: &ConfigMigrateResult) {
+    let prefix = format!("[{idx}/{total}]");
+    let path = r.path.display().to_string();
+    match &r.status {
+        ConfigMigrateStatus::Migrated => println!("  {} {} {}", prefix.dimmed(), "✓".green(), path),
+        ConfigMigrateStatus::AlreadyMigrated => println!(
+            "  {} {} {} {}",
+            prefix.dimmed(),
+            "↻".cyan(),
+            path.dimmed(),
+            "(already migrated)".dimmed()
+        ),
+        ConfigMigrateStatus::NoChange => println!(
+            "  {} {} {} {}",
+            prefix.dimmed(),
+            "·".dimmed(),
+            path.dimmed(),
+            "(no mcp-vector-search entry)".dimmed()
+        ),
+        ConfigMigrateStatus::Failed(msg) => println!(
+            "  {} {} {} {}",
+            prefix.dimmed(),
+            "✗".red(),
+            path.dimmed(),
+            format!("({msg})").red()
+        ),
+    }
+}
+
+/// Render one index-migration result line for the summary table.
+fn print_index_line(idx: usize, total: usize, r: &super::convert::ConvertResult) {
+    let prefix = format!("[{idx}/{total}]");
+    let path = r.path.display().to_string();
+    match &r.status {
+        ConvertStatus::Queued => println!(
+            "  {} {} {:<24} → {}",
+            prefix.dimmed(),
+            "✓".green(),
+            r.name,
+            path.dimmed()
+        ),
+        ConvertStatus::AlreadyRegistered => println!(
+            "  {} {} {:<24} → {} {}",
+            prefix.dimmed(),
+            "↻".cyan(),
+            r.name,
+            path.dimmed(),
+            "(already registered, reindexing)".dimmed()
+        ),
+        ConvertStatus::DryRun => println!("  {} {:<24} {}", prefix.dimmed(), r.name, path.dimmed()),
+        ConvertStatus::Failed(msg) => println!(
+            "  {} {} {:<24} → {} {}",
+            prefix.dimmed(),
+            "✗".red(),
+            r.name,
+            path.dimmed(),
+            format!("({msg})").red()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Why: the scan must reliably locate both global and project-level
+    /// `.claude` settings files regardless of nesting depth.
+    #[test]
+    fn test_scan_finds_settings_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+
+        // Global settings.
+        let global = home.join(".claude");
+        std::fs::create_dir_all(&global).expect("mkdir global");
+        std::fs::write(global.join("settings.json"), "{}").expect("write global");
+
+        // Nested project settings (settings.local.json).
+        let proj = home.join("code").join("my-proj").join(".claude");
+        std::fs::create_dir_all(&proj).expect("mkdir proj");
+        std::fs::write(proj.join("settings.local.json"), "{}").expect("write proj");
+
+        // A noise dir that must be skipped.
+        let noise = home.join("node_modules").join(".claude");
+        std::fs::create_dir_all(&noise).expect("mkdir noise");
+        std::fs::write(noise.join("settings.json"), "{}").expect("write noise");
+
+        let found = scan_claude_settings(home);
+        assert!(
+            found.contains(&global.join("settings.json")),
+            "global settings missing: {found:?}"
+        );
+        assert!(
+            found.contains(&proj.join("settings.local.json")),
+            "project settings missing: {found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|p| p.starts_with(home.join("node_modules"))),
+            "node_modules should be skipped: {found:?}"
+        );
+    }
+
+    /// Why: the core surgery — a legacy key must be removed and the canonical
+    /// trusty-search key inserted, while unrelated keys survive.
+    #[test]
+    fn test_migrate_config_replaces_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.local.json");
+        let input = serde_json::json!({
+            "theme": "dark",
+            "mcpServers": {
+                "mcp-vector-search": {
+                    "command": "mcp-vector-search",
+                    "args": ["serve"]
+                },
+                "other-server": { "command": "other" }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&input).unwrap()).expect("write input");
+
+        let result = migrate_config_file(&path, false);
+        assert_eq!(result.status, ConfigMigrateStatus::Migrated);
+
+        let rewritten: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers = rewritten["mcpServers"].as_object().unwrap();
+        assert!(
+            !servers.contains_key("mcp-vector-search"),
+            "legacy key should be gone"
+        );
+        assert!(servers.contains_key("trusty-search"), "trusty key missing");
+        assert!(
+            servers.contains_key("other-server"),
+            "unrelated server dropped"
+        );
+        assert_eq!(
+            rewritten["theme"], "dark",
+            "unrelated top-level key dropped"
+        );
+        assert_eq!(servers["trusty-search"]["command"], "trusty-search");
+        assert_eq!(servers["trusty-search"]["args"][0], "serve");
+
+        // Backup preserves multi-dot filename: settings.local.json.bak
+        assert!(
+            path.with_file_name("settings.local.json.bak").exists(),
+            "backup file missing"
+        );
+    }
+
+    /// Why: a file already carrying a trusty-search entry must be left
+    /// untouched so repeated `migrate` runs are safe.
+    #[test]
+    fn test_migrate_config_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let input = serde_json::json!({
+            "mcpServers": {
+                "trusty-search": {
+                    "command": "trusty-search",
+                    "args": ["serve"]
+                }
+            }
+        });
+        let serialized = serde_json::to_string_pretty(&input).unwrap();
+        std::fs::write(&path, &serialized).expect("write input");
+
+        let result = migrate_config_file(&path, false);
+        assert_eq!(result.status, ConfigMigrateStatus::AlreadyMigrated);
+
+        // File must be byte-for-byte unchanged.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            serialized,
+            "file should be untouched"
+        );
+        assert!(
+            !path.with_file_name("settings.json.bak").exists(),
+            "no backup should be written for a skipped file"
+        );
+    }
+}

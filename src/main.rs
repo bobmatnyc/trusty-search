@@ -412,6 +412,34 @@ enum Commands {
         concurrency: usize,
     },
 
+    /// Migrate from mcp-vector-search (or other tools) to trusty-search
+    ///
+    /// Updates Claude MCP configuration files and migrates project indexes.
+    ///
+    /// Examples:
+    ///   trusty-search migrate mcp-vector-search           # migrate both MCP config + indexes
+    ///   trusty-search migrate mcp-vector-search --dry-run # preview changes
+    ///   trusty-search migrate mcp-vector-search --mcp-only
+    ///   trusty-search migrate mcp-vector-search --indexes-only
+    #[command(display_order = 26)]
+    Migrate {
+        /// Migration source: "mcp-vector-search"
+        #[arg(value_name = "FROM")]
+        target: commands::migrate::MigrateTarget,
+
+        /// Preview changes without modifying any files or contacting the daemon
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Only update Claude MCP config files; skip index migration
+        #[arg(long, conflicts_with = "indexes_only")]
+        mcp_only: bool,
+
+        /// Only migrate indexes; skip MCP config file updates
+        #[arg(long, conflicts_with = "mcp_only")]
+        indexes_only: bool,
+    },
+
     /// Diagnose configuration, model cache, and index health
     ///
     /// Checks each component and reports ✓ / ✗ / ⚠ for each. Exit code 0
@@ -584,6 +612,15 @@ async fn run() -> Result<()> {
             concurrency,
         } => {
             commands::convert::handle_convert(target, dry_run, concurrency).await?;
+        }
+
+        Commands::Migrate {
+            target,
+            dry_run,
+            mcp_only,
+            indexes_only,
+        } => {
+            commands::migrate::handle_migrate(target, dry_run, mcp_only, indexes_only).await?;
         }
 
         Commands::Doctor { fix } => {

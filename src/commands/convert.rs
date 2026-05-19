@@ -55,7 +55,13 @@ fn find_mvs_config(start: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// Find every `*/.mcp-vector-search/config.json` under the user's home dir.
-fn find_all_mvs_configs() -> Vec<std::path::PathBuf> {
+///
+/// Why: shared by both `convert all` and `migrate mcp-vector-search` so the
+/// discovery logic (home walk + noise-dir skipping) lives in exactly one
+/// place.
+/// What: walks `$HOME` (max depth 6) and returns every config path.
+/// Test: covered indirectly by `convert all --dry-run` enumerating projects.
+pub(crate) fn find_all_mvs_configs() -> Vec<std::path::PathBuf> {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -104,7 +110,14 @@ fn find_all_mvs_configs() -> Vec<std::path::PathBuf> {
 }
 
 /// Parse a mcp-vector-search config and derive `(project_root, index_name)`.
-fn parse_mvs_config(config_path: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
+///
+/// Why: shared by `convert` and `migrate` — both need the project root plus
+/// a daemon-safe index name derived from the directory basename.
+/// What: deserializes the JSON config and lowercases/de-spaces the basename.
+/// Test: `parse_mvs_config` on a config with extra fields still succeeds.
+pub(crate) fn parse_mvs_config(
+    config_path: &std::path::Path,
+) -> Result<(std::path::PathBuf, String)> {
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", config_path.display()))?;
     let config: MvsConfig = serde_json::from_str(&content)
@@ -117,24 +130,41 @@ fn parse_mvs_config(config_path: &std::path::Path) -> Result<(std::path::PathBuf
     Ok((config.project_root, name))
 }
 
+/// Outcome of attempting to convert a single project.
+///
+/// Why: shared with `migrate` so the index-migration phase can render the
+/// same status set without re-deriving it.
+/// What: enumerates the four terminal states of `convert_one`.
+/// Test: exercised by `convert all` integration runs.
 #[derive(Debug)]
-enum ConvertStatus {
+pub(crate) enum ConvertStatus {
     Queued,
     AlreadyRegistered,
     DryRun,
     Failed(String),
 }
 
+/// Result of converting one project (name + path + terminal status).
+///
+/// Why: shared return type for `convert_one`, consumed by both `convert` and
+/// `migrate` render paths.
+/// What: pairs the derived index name and root path with a `ConvertStatus`.
+/// Test: exercised by `convert all` integration runs.
 #[derive(Debug)]
-struct ConvertResult {
-    name: String,
-    path: std::path::PathBuf,
-    status: ConvertStatus,
+pub(crate) struct ConvertResult {
+    pub(crate) name: String,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) status: ConvertStatus,
 }
 
 /// Convert one project: register it with the daemon (idempotent) and trigger
 /// a reindex.
-async fn convert_one(
+///
+/// Why: the per-project HTTP dance (register → reindex) is reused verbatim by
+/// `migrate mcp-vector-search`, so it is exposed crate-wide.
+/// What: POSTs `/indexes` then `/indexes/:id/reindex`; returns a `ConvertResult`.
+/// Test: `convert project` against a running daemon yields a `Queued` status.
+pub(crate) async fn convert_one(
     project_root: std::path::PathBuf,
     index_name: String,
     base_url: &str,

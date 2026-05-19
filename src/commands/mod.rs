@@ -35,6 +35,7 @@ pub mod doctor;
 pub mod index;
 pub mod init;
 pub mod list;
+pub mod migrate;
 pub mod query;
 pub mod reindex;
 pub mod remove;
