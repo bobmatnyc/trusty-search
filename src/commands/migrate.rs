@@ -15,29 +15,11 @@ use super::daemon_utils::daemon_base_url;
 use anyhow::Result;
 use clap::ValueEnum;
 use colored::Colorize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
-
-/// Directory names skipped while scanning `$HOME` for Claude settings files.
-///
-/// Why: walking the entire home tree is slow and noisy; these dirs cannot
-/// contain user `.claude/settings.json` files worth migrating but bloat the
-/// walk enormously.
-const SCAN_SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    ".git",
-    "target",
-    "Library",
-    ".cache",
-    ".cargo",
-    ".rustup",
-    ".npm",
-    ".pyenv",
-    ".nvm",
-    "venv",
-    ".venv",
-    "__pycache__",
-];
+use trusty_common::claude_config::{
+    discover_claude_settings, mcp_server_entry, write_json_atomic,
+};
 
 /// The MCP server keys (legacy spellings) we replace with `trusty-search`.
 const LEGACY_MCP_KEYS: &[&str] = &["mcp-vector-search", "mcp_vector_search"];
@@ -140,7 +122,7 @@ fn run_mcp_phase(dry_run: bool) -> Result<()> {
         home.display()
     );
 
-    let files = scan_claude_settings(&home);
+    let files = discover_claude_settings(&home);
     if files.is_empty() {
         println!("{} No Claude settings files found.", "·".dimmed());
         return Ok(());
@@ -253,44 +235,6 @@ async fn run_index_phase(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Find every Claude settings file worth migrating under `home`.
-///
-/// Why: a user may have a global `~/.claude/settings.json` plus per-project
-/// `.claude/settings.json` files; all of them can carry an mcp-vector-search
-/// entry, so all must be scanned.
-/// What: walks `home` (max depth 8, skipping noise dirs) and collects every
-/// `.claude/settings.json` and `.claude/settings.local.json`.
-/// Test: `test_scan_finds_settings_files` builds a temp tree and asserts the
-/// scan returns the planted files.
-pub fn scan_claude_settings(home: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for entry in walkdir::WalkDir::new(home)
-        .max_depth(8)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !SCAN_SKIP_DIRS.contains(&name.as_ref())
-        })
-        .filter_map(|e| e.ok())
-    {
-        let name = entry.file_name().to_string_lossy();
-        if name != "settings.json" && name != "settings.local.json" {
-            continue;
-        }
-        let in_claude_dir = entry
-            .path()
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n == ".claude")
-            .unwrap_or(false);
-        if in_claude_dir {
-            found.push(entry.path().to_path_buf());
-        }
-    }
-    found
-}
-
 /// Rewrite one Claude settings file, replacing any legacy mcp-vector-search
 /// MCP server entry with a `trusty-search` entry.
 ///
@@ -347,7 +291,10 @@ pub fn migrate_config_file(path: &Path, dry_run: bool) -> ConfigMigrateResult {
     for k in LEGACY_MCP_KEYS {
         servers.remove(*k);
     }
-    servers.insert(TRUSTY_KEY.to_string(), trusty_server_entry());
+    servers.insert(
+        TRUSTY_KEY.to_string(),
+        mcp_server_entry(TRUSTY_KEY, &["serve"]),
+    );
 
     if dry_run {
         return ConfigMigrateResult {
@@ -356,69 +303,15 @@ pub fn migrate_config_file(path: &Path, dry_run: bool) -> ConfigMigrateResult {
         };
     }
 
-    match write_config_atomic(path, &root, &content) {
+    // `write_json_atomic` writes `<path>.bak` (prior bytes) → `<path>.tmp` →
+    // rename, so the user's live settings file is never partially written.
+    match write_json_atomic(path, &root) {
         Ok(()) => ConfigMigrateResult {
             path: path.to_path_buf(),
             status: ConfigMigrateStatus::Migrated,
         },
         Err(e) => fail(format!("write: {e}")),
     }
-}
-
-/// Build the canonical `trusty-search` MCP server JSON entry.
-///
-/// Why: centralizes the one true shape of the migrated entry so the rewrite
-/// and the tests agree.
-/// What: returns `{"command": "trusty-search", "args": ["serve"]}`.
-/// Test: `test_migrate_config_replaces_key` asserts the inserted value.
-fn trusty_server_entry() -> Value {
-    let mut entry = Map::new();
-    entry.insert("command".to_string(), Value::String(TRUSTY_KEY.to_string()));
-    entry.insert(
-        "args".to_string(),
-        Value::Array(vec![Value::String("serve".to_string())]),
-    );
-    Value::Object(entry)
-}
-
-/// Atomically persist a migrated settings file: backup → temp → rename.
-///
-/// Why: a half-written settings file would break the user's Claude install;
-/// the backup + atomic-rename sequence guarantees the original is recoverable
-/// and the live file is never partially written.
-/// What: writes `<path>.bak` (original bytes), `<path>.tmp` (new JSON), then
-/// renames `.tmp` over `path`.
-/// Test: `test_migrate_config_replaces_key` confirms the post-rename content.
-fn write_config_atomic(path: &Path, value: &Value, original: &str) -> Result<()> {
-    let backup = sibling_with_suffix(path, "bak")?;
-    std::fs::write(&backup, original)
-        .map_err(|e| anyhow::anyhow!("backup {}: {e}", backup.display()))?;
-
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-    let tmp = sibling_with_suffix(path, "tmp")?;
-    std::fs::write(&tmp, format!("{pretty}\n"))
-        .map_err(|e| anyhow::anyhow!("write temp {}: {e}", tmp.display()))?;
-
-    std::fs::rename(&tmp, path)
-        .map_err(|e| anyhow::anyhow!("rename {} → {}: {e}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-/// Build a sibling path by appending `.<suffix>` to the full filename.
-///
-/// Why: `Path::with_extension` only replaces the final extension, so
-/// `settings.local.json` → `settings.local.bak` (drops `json`). We want
-/// `settings.local.json.bak`, which requires appending to the whole name.
-/// What: returns `path` with `.<suffix>` glued onto the file name.
-/// Test: `test_migrate_config_replaces_key` asserts the `.local.json.bak`
-/// backup exists.
-fn sibling_with_suffix(path: &Path, suffix: &str) -> Result<PathBuf> {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?;
-    Ok(path.with_file_name(format!("{name}.{suffix}")))
 }
 
 /// Render one MCP-config result line for the summary table.
@@ -486,45 +379,6 @@ fn print_index_line(idx: usize, total: usize, r: &super::convert::ConvertResult)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Why: the scan must reliably locate both global and project-level
-    /// `.claude` settings files regardless of nesting depth.
-    #[test]
-    fn test_scan_finds_settings_files() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path();
-
-        // Global settings.
-        let global = home.join(".claude");
-        std::fs::create_dir_all(&global).expect("mkdir global");
-        std::fs::write(global.join("settings.json"), "{}").expect("write global");
-
-        // Nested project settings (settings.local.json).
-        let proj = home.join("code").join("my-proj").join(".claude");
-        std::fs::create_dir_all(&proj).expect("mkdir proj");
-        std::fs::write(proj.join("settings.local.json"), "{}").expect("write proj");
-
-        // A noise dir that must be skipped.
-        let noise = home.join("node_modules").join(".claude");
-        std::fs::create_dir_all(&noise).expect("mkdir noise");
-        std::fs::write(noise.join("settings.json"), "{}").expect("write noise");
-
-        let found = scan_claude_settings(home);
-        assert!(
-            found.contains(&global.join("settings.json")),
-            "global settings missing: {found:?}"
-        );
-        assert!(
-            found.contains(&proj.join("settings.local.json")),
-            "project settings missing: {found:?}"
-        );
-        assert!(
-            !found
-                .iter()
-                .any(|p| p.starts_with(home.join("node_modules"))),
-            "node_modules should be skipped: {found:?}"
-        );
-    }
 
     /// Why: the core surgery — a legacy key must be removed and the canonical
     /// trusty-search key inserted, while unrelated keys survive.

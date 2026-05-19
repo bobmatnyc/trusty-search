@@ -55,15 +55,6 @@ pub fn handle_service(action: &ServiceAction) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_plist_path() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve $HOME"))?;
-    Ok(home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist")))
-}
-
-#[cfg(target_os = "macos")]
 fn launchd_log_dir() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve $HOME"))?;
     let dir = home.join("Library").join("Logs").join("trusty-search");
@@ -71,7 +62,7 @@ fn launchd_log_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// Render the `<key>EnvironmentVariables</key>` plist fragment.
+/// Collect the environment variables embedded in the LaunchAgent plist.
 ///
 /// Why: launchd re-spawns the daemon without the user's shell environment.
 /// Embedding env vars directly in the plist provides a belt-and-suspenders
@@ -79,20 +70,15 @@ fn launchd_log_dir() -> Result<std::path::PathBuf> {
 /// Hugging Face cache directory so fastembed-rs never inherits a non-standard
 /// or read-only `HF_HOME` that was set in an earlier shell session (fixes #86).
 /// What: always emits an `HF_HOME` entry resolved at install time, plus any
-/// `PERSISTED_ENV_VARS` that are currently set.
-/// Test: call `launchd_env_vars_plist()` with HOME set; assert output contains
-/// `<key>HF_HOME</key>` and the resolved path ends in `.cache/huggingface`.
+/// `PERSISTED_ENV_VARS` that are currently set. XML escaping is handled by
+/// `LaunchdConfig::render_plist`.
+/// Test: covered indirectly by `service_install`; the canonical plist renderer
+/// is unit-tested in `trusty_common::launchd`.
 #[cfg(target_os = "macos")]
-fn launchd_env_vars_plist() -> String {
+fn launchd_env_vars() -> Vec<(String, String)> {
     use crate::service::PERSISTED_ENV_VARS;
 
-    let xml_escape = |s: &str| -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
-
-    let mut pairs: Vec<String> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
 
     // Always pin HF_HOME to $HOME/.cache/huggingface resolved at install time.
     // fastembed-rs follows HF_HOME when present; if it points at a read-only
@@ -101,91 +87,60 @@ fn launchd_env_vars_plist() -> String {
     // path regardless of what the operator's shell had in HF_HOME.
     if let Some(home) = dirs::home_dir() {
         let hf_home = home.join(".cache").join("huggingface");
-        let escaped = xml_escape(&hf_home.display().to_string());
-        pairs.push(format!(
-            "        <key>HF_HOME</key>\n        <string>{escaped}</string>"
-        ));
+        pairs.push(("HF_HOME".to_string(), hf_home.display().to_string()));
     }
 
     // Append operator tunables (TRUSTY_* vars) that are currently set.
     for key in PERSISTED_ENV_VARS {
         if let Ok(val) = std::env::var(key) {
-            let escaped = xml_escape(&val);
-            pairs.push(format!(
-                "        <key>{key}</key>\n        <string>{escaped}</string>"
-            ));
+            pairs.push((key.to_string(), val));
         }
     }
 
-    if pairs.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "    <key>EnvironmentVariables</key>\n    <dict>\n{}\n    </dict>\n",
-            pairs.join("\n")
-        )
-    }
+    pairs
 }
 
-/// Render the LaunchAgent plist body. Foreground mode (launchd owns lifecycle).
+/// Build the [`LaunchdConfig`] describing the trusty-search LaunchAgent.
+///
+/// Why: centralises the daemon's launchd description in one place so the
+/// canonical `trusty_common::launchd` renderer produces a correct plist.
+/// What: foreground `start --foreground` invocation, `KeepAlive::OnFailure`
+/// (a clean exit — e.g. the idempotent fast-path when a daemon is already
+/// running — is honoured, but a crash triggers a restart), a 30s throttle to
+/// avoid crash-loop hammering, and the embedded env vars from
+/// [`launchd_env_vars`].
+/// Test: covered indirectly by `service_install`.
 #[cfg(target_os = "macos")]
-fn launchd_plist_body(exe: &std::path::Path, log_dir: &std::path::Path) -> String {
-    let exe = exe.display();
-    let stdout = log_dir.join("stdout.log");
-    let stderr = log_dir.join("stderr.log");
-    let env_vars_section = launchd_env_vars_plist();
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>start</string>
-        <string>--foreground</string>
-    </array>
-{env_vars_section}    <key>RunAtLoad</key>
-    <true/>
-    <!-- KeepAlive=SuccessfulExit:false means launchd only restarts the daemon
-         on a non-zero exit. The `start` command exits 0 when a live daemon is
-         already running (idempotent fast-path); without this, launchd would
-         immediately re-spawn and crash-loop on the existing lockfile. -->
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>30</integer>
-    <key>StandardOutPath</key>
-    <string>{}</string>
-    <key>StandardErrorPath</key>
-    <string>{}</string>
-    <key>ProcessType</key>
-    <string>Interactive</string>
-</dict>
-</plist>
-"#,
-        stdout.display(),
-        stderr.display(),
-    )
+fn launchd_config(
+    exe: &std::path::Path,
+    log_dir: &std::path::Path,
+) -> trusty_common::launchd::LaunchdConfig {
+    use trusty_common::launchd::{KeepAlive, LaunchdConfig};
+
+    LaunchdConfig {
+        label: LAUNCHD_LABEL.to_string(),
+        program: exe.to_path_buf(),
+        program_args: vec!["start".to_string(), "--foreground".to_string()],
+        stdout_path: log_dir.join("stdout.log"),
+        stderr_path: log_dir.join("stderr.log"),
+        env_vars: launchd_env_vars(),
+        keep_alive: KeepAlive::OnFailure,
+        throttle_interval: Some(30),
+        working_directory: None,
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn service_install() -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
-    let plist_path = launchd_plist_path()?;
-    if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let log_dir = launchd_log_dir()?;
-    let body = launchd_plist_body(&exe, &log_dir);
-    std::fs::write(&plist_path, body)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", plist_path.display()))?;
+    let config = launchd_config(&exe, &log_dir);
+
+    // `install()` creates `~/Library/LaunchAgents` if missing and writes the
+    // rendered plist via the canonical `trusty_common::launchd` renderer.
+    config.install()?;
+    let plist_path = config.plist_path()?;
     println!(
         "{} Wrote LaunchAgent plist: {}",
         "✓".green(),
@@ -195,25 +150,13 @@ fn service_install() -> Result<()> {
     // Bootstrap into the GUI domain of the current user. `bootout` first
     // (ignoring errors) so a re-install replaces a previously-loaded agent
     // cleanly.
-    let uid = nix::unistd::getuid().as_raw();
-    let domain = format!("gui/{uid}");
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &domain])
-        .arg(&plist_path)
-        .status();
-    let status = std::process::Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&plist_path)
-        .status()
-        .map_err(|e| anyhow::anyhow!("launchctl bootstrap failed: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("launchctl bootstrap exited with {status}");
-    }
+    let _ = config.bootout();
+    config.bootstrap()?;
     println!(
-        "{} Loaded {} into {} — daemon will start automatically.",
+        "{} Loaded {} into gui/{} — daemon will start automatically.",
         "✓".green(),
         LAUNCHD_LABEL,
-        domain
+        trusty_common::launchd::current_uid(),
     );
 
     // Issue #127: install log rotation for the launchd-managed stderr.log so
@@ -240,14 +183,14 @@ fn service_install() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_uninstall() -> Result<()> {
-    let plist_path = launchd_plist_path()?;
-    let uid = nix::unistd::getuid().as_raw();
-    let domain = format!("gui/{uid}");
+    // `bootout` / `plist_path` only need the label; the program / log paths
+    // are irrelevant when tearing the service down, so a minimal config
+    // suffices here.
+    let config = launchd_config(std::path::Path::new(""), std::path::Path::new(""));
+    let plist_path = config.plist_path()?;
+    let domain = format!("gui/{}", trusty_common::launchd::current_uid());
     if plist_path.exists() {
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &domain])
-            .arg(&plist_path)
-            .status();
+        let _ = config.bootout();
         std::fs::remove_file(&plist_path)
             .map_err(|e| anyhow::anyhow!("remove {}: {e}", plist_path.display()))?;
         println!(
@@ -282,7 +225,7 @@ fn service_uninstall() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_status() -> Result<()> {
-    let uid = nix::unistd::getuid().as_raw();
+    let uid = trusty_common::launchd::current_uid();
     let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
     let output = std::process::Command::new("launchctl")
         .args(["print", &target])
