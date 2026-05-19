@@ -34,6 +34,7 @@ pub mod dashboard;
 pub mod doctor;
 pub mod index;
 pub mod init;
+pub mod integrate;
 pub mod list;
 pub mod migrate;
 pub mod query;

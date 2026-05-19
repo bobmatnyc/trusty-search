@@ -456,6 +456,45 @@ enum Commands {
         fix: bool,
     },
 
+    /// Wire trusty-search into an editor as an MCP server
+    ///
+    /// Writes/updates the editor's MCP config (global + project) and, for
+    /// Cursor, generates a `.cursor/rules/trusty-search.mdc` rules file that
+    /// teaches the AI when to use the search tools. All writes are backed up
+    /// first and applied atomically. Re-running is idempotent.
+    ///
+    /// Examples:
+    ///   trusty-search integrate cursor
+    ///   trusty-search integrate cursor --dry-run
+    ///   trusty-search integrate cursor --global-only
+    ///   trusty-search integrate cursor --project-only --no-rules
+    #[command(display_order = 27)]
+    Integrate {
+        /// Editor to integrate with: "cursor"
+        #[arg(value_name = "TARGET")]
+        target: commands::integrate::IntegrateTarget,
+
+        /// Print all changes without writing any file
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Only update the global MCP config; skip project files
+        #[arg(long, conflicts_with = "project_only")]
+        global_only: bool,
+
+        /// Only update project files (MCP config + rules); skip the global config
+        #[arg(long, conflicts_with = "global_only")]
+        project_only: bool,
+
+        /// Skip writing the `.cursor/rules/trusty-search.mdc` rules file
+        #[arg(long)]
+        no_rules: bool,
+
+        /// Overwrite an existing rules file instead of skipping it
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Generate shell completion script
     ///
     /// Examples:
@@ -625,6 +664,24 @@ async fn run() -> Result<()> {
 
         Commands::Doctor { fix } => {
             commands::doctor::handle_doctor(fix).await?;
+        }
+
+        Commands::Integrate {
+            target,
+            dry_run,
+            global_only,
+            project_only,
+            no_rules,
+            force,
+        } => {
+            commands::integrate::handle_integrate(
+                target,
+                dry_run,
+                global_only,
+                project_only,
+                no_rules,
+                force,
+            )?;
         }
 
         Commands::Completions { shell } => {
